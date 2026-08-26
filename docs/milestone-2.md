@@ -20,9 +20,11 @@ does not fit its byte limit, it returns the bounded prefix with `complete` set t
 `false`.
 
 `query_database` accepts exactly one DuckDB-parsed `SELECT`, `WITH`, or `VALUES`
-statement. The connection is read-only and external access is disabled. Writes,
-multiple statements, external paths, and external reader or scanner functions are
-rejected before execution.
+statement, including statements surrounded by SQL comments. The connection is
+read-only and external access is disabled. Before execution, DuckDB binds the query
+inside a host-generated parameterized row-limit wrapper. The host inspects that bound
+plan and rejects writes, multiple statements, external scans, host metadata access,
+side-effecting functions, and macros that expand to those operations.
 
 The host enforces elapsed time, DuckDB memory, row-count, materialized-result byte,
 artifact, per-tool response, and cumulative model-visible response limits.
@@ -43,7 +45,9 @@ Every other accepted result is written in full as Parquet. The model receives:
 
 The implementation converts only the bounded preview to transcript JSON. It does not
 convert the complete retained table into Python row lists or place it in model
-messages.
+messages. When a value cannot be represented as finite JSON, such as a non-finite
+floating-point value, the complete table is still retained as Parquet and the preview
+is omitted.
 
 If the complete table exceeds query or artifact limits, the call fails with guidance
 to filter or aggregate further. No partial artifact is published and no truncated
@@ -51,12 +55,16 @@ table is represented as complete.
 
 ## Artifact boundary
 
-Artifact handles are sequential within one run. Publication copies bytes to a private
-temporary file, flushes them, publishes without overwriting, and records byte size,
-SHA-256 digest, media type, managed relative path, and producing tool call.
+Artifact handles are sequential within one run. Publication copies bytes to private
+temporary files, flushes them, and publishes without overwriting. A multi-output
+Python call publishes its complete batch or rolls the complete batch back. Only after
+publication succeeds does the store record byte size, SHA-256 digest, media type,
+managed relative path, and producing tool call.
 
-Every artifact is checked against its retained size and digest before consumption.
-Tabular artifacts use Parquet. Final-answer artifacts use finite UTF-8 JSON.
+Every consumer opens a retained artifact once, verifies the size and digest from that
+descriptor, and consumes or copies the bytes from the same descriptor. Tabular
+artifacts use Parquet. Declared Parquet output validation reads every data page, not
+only footer metadata. Final-answer artifacts use finite UTF-8 JSON.
 
 ## Python seam
 
@@ -74,8 +82,8 @@ The executor receives:
 - the exact expected output file names
 
 The host accepts only the declared regular `.json` and `.parquet` files, then publishes
-them through the same artifact boundary. Milestone 3 will implement this protocol with
-Docker and a run-private database copy.
+the complete declared output set transactionally through the same artifact boundary.
+Milestone 3 will implement this protocol with Docker and a run-private database copy.
 
 ## Final output
 
@@ -91,8 +99,10 @@ schema-invalid answer artifacts receive bounded retry feedback.
 The milestone suite covers real DuckDB catalog inspection, query safety, source
 preservation, inline transport, automatic Parquet transport, full retained row
 content, bounded previews, query rejection without partial publication, artifact
-integrity, managed Python inputs and outputs, direct and artifact-backed final output,
-cumulative tool-result limits, terminal-record safety, and all Milestone 1 behavior.
+integrity and replacement races, transactional multi-output rollback, complete
+Parquet validation, managed Python inputs and outputs, direct and artifact-backed final
+output, per-result and cumulative retry-feedback limits, terminal-record safety, and
+all Milestone 1 behavior.
 
 Docker, writable database copies, rollback, Databricks MLflow, live providers, a CLI,
 and a conversational demo remain outside this milestone.

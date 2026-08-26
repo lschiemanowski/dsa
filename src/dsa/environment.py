@@ -8,6 +8,7 @@ import math
 import os
 import re
 import shutil
+import stat
 import tempfile
 from base64 import b64encode
 from collections.abc import Mapping, Sequence
@@ -39,13 +40,20 @@ _OUTPUT_MEDIA_TYPES = {
     ".parquet": _PARQUET_MEDIA_TYPE,
 }
 _SAFE_OUTPUT_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
-_UNSAFE_SQL_FUNCTION = re.compile(
-    r"\b(?:read_[a-z0-9_]+|write_[a-z0-9_]+|[a-z0-9_]+_scan|glob|"
-    r"sniff_csv|parquet_file_metadata|duckdb_external_file_cache|duckdb_secrets|"
-    r"duckdb_temporary_files|which_secret|httpfs|nextval|setval|setseed)\s*\(",
-    re.IGNORECASE,
+_ALLOWED_BOUND_TABLE_FUNCTIONS = frozenset(
+    {
+        "generate_series",
+        "json_each",
+        "json_tree",
+        "range",
+        "repeat",
+        "repeat_row",
+        "unnest",
+    }
 )
-_FROM_PATH = re.compile(r"\b(?:from|join)\s+['\"]", re.IGNORECASE)
+_FORBIDDEN_BOUND_SCALAR_FUNCTIONS = frozenset(
+    {"current_setting", "getvariable", "setvariable"}
+)
 
 
 class ArtifactError(Exception):
@@ -111,20 +119,81 @@ class _ArtifactStore:
         with self._lock:
             return tuple(self._records)
 
-    def resolve(self, handle: str) -> tuple[ArtifactRecord, Path]:
+    def _record_for(self, handle: str) -> ArtifactRecord:
         with self._lock:
             record = next((item for item in self._records if item.handle == handle), None)
         if record is None:
             raise ArtifactError("artifact_unknown", "No same-run artifact has that handle")
-        path = self._run_directory / record.relative_path
-        if path.is_symlink() or not path.is_file():
-            raise ArtifactError("artifact_unavailable", "The retained artifact is unavailable")
-        if path.stat().st_size != record.size_bytes or _file_sha256(path) != record.sha256:
-            raise ArtifactError(
-                "artifact_integrity",
-                "The retained artifact no longer matches its integrity record",
+        return record
+
+    def read_verified_bytes(
+        self,
+        handle: str,
+        *,
+        max_bytes: int,
+        expected_media_type: str | None = None,
+        media_type_error: tuple[str, str] | None = None,
+    ) -> tuple[ArtifactRecord, bytes]:
+        record = self._record_for(handle)
+        if expected_media_type is not None and record.media_type != expected_media_type:
+            code, message = media_type_error or (
+                "artifact_media_type",
+                "The retained artifact has an unsupported media type",
             )
-        return record, path
+            raise ArtifactError(code, message)
+        if record.size_bytes > max_bytes:
+            raise ArtifactError(
+                "artifact_size_limit",
+                "The retained artifact exceeds the consumption byte limit",
+            )
+        descriptor = self._open_verified_descriptor(record)
+        digest = sha256()
+        content = bytearray()
+        with os.fdopen(descriptor, "rb") as source:
+            while chunk := source.read(1024 * 1024):
+                content.extend(chunk)
+                digest.update(chunk)
+                if len(content) > max_bytes:
+                    raise ArtifactError(
+                        "artifact_size_limit",
+                        "The retained artifact exceeds the consumption byte limit",
+                    )
+        self._verify_consumed(record, len(content), digest.hexdigest())
+        return record, bytes(content)
+
+    def copy_verified(self, handle: str, directory: Path) -> tuple[ArtifactRecord, Path]:
+        record = self._record_for(handle)
+        destination = directory / Path(record.relative_path).name
+        source_descriptor = self._open_verified_descriptor(record)
+        digest = sha256()
+        copied = 0
+        destination_descriptor: int | None = None
+        try:
+            destination_descriptor = os.open(
+                destination,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o400,
+            )
+            with os.fdopen(destination_descriptor, "wb") as target:
+                destination_descriptor = None
+                with os.fdopen(source_descriptor, "rb") as source:
+                    source_descriptor = -1
+                    while chunk := source.read(1024 * 1024):
+                        copied += len(chunk)
+                        digest.update(chunk)
+                        target.write(chunk)
+                target.flush()
+                os.fsync(target.fileno())
+            self._verify_consumed(record, copied, digest.hexdigest())
+            return record, destination
+        except BaseException:
+            destination.unlink(missing_ok=True)
+            raise
+        finally:
+            if source_descriptor >= 0:
+                os.close(source_descriptor)
+            if destination_descriptor is not None:
+                os.close(destination_descriptor)
 
     def publish_file(
         self,
@@ -133,109 +202,174 @@ class _ArtifactStore:
         media_type: str,
         producer_tool_call_id: str,
     ) -> ArtifactRecord:
-        extension = _MEDIA_EXTENSIONS.get(media_type)
-        if extension is None:
-            raise ArtifactError("artifact_media_type", "The artifact media type is unsupported")
-        if source.is_symlink() or not source.is_file():
-            raise ArtifactError("artifact_source", "The artifact source must be a regular file")
+        return self.publish_files(
+            [(source, media_type)],
+            producer_tool_call_id=producer_tool_call_id,
+        )[0]
+
+    def publish_files(
+        self,
+        sources: Sequence[tuple[Path, str]],
+        *,
+        producer_tool_call_id: str,
+    ) -> tuple[ArtifactRecord, ...]:
+        if not sources:
+            raise ArtifactError("artifact_batch_empty", "An artifact batch must not be empty")
         if not producer_tool_call_id or len(producer_tool_call_id) > 256:
             raise ArtifactError("artifact_producer", "The artifact producer identity is invalid")
 
         with self._lock:
-            source_size = source.stat().st_size
+            source_sizes: list[int] = []
+            extensions: list[str] = []
+            for source, media_type in sources:
+                extension = _MEDIA_EXTENSIONS.get(media_type)
+                if extension is None:
+                    raise ArtifactError(
+                        "artifact_media_type",
+                        "The artifact media type is unsupported",
+                    )
+                if source.is_symlink() or not source.is_file():
+                    raise ArtifactError(
+                        "artifact_source",
+                        "The artifact source must be a regular file",
+                    )
+                source_sizes.append(source.stat().st_size)
+                extensions.append(extension)
             total_size = sum(item.size_bytes for item in self._records)
-            if len(self._records) >= self._policy.max_artifact_count:
+            if len(self._records) + len(sources) > self._policy.max_artifact_count:
                 raise ArtifactError(
                     "artifact_count_limit",
                     "The run artifact count limit was reached",
                 )
-            if source_size > self._policy.max_artifact_bytes:
+            if any(size > self._policy.max_artifact_bytes for size in source_sizes):
                 raise ArtifactError(
                     "artifact_size_limit",
                     "The complete result is too large to retain. Aggregate or filter it further",
                 )
-            if total_size + source_size > self._policy.max_total_artifact_bytes:
+            if total_size + sum(source_sizes) > self._policy.max_total_artifact_bytes:
                 raise ArtifactError(
                     "artifact_total_limit",
                     "The run artifact byte limit was reached. Reuse or reduce existing results",
                 )
 
-            handle = f"a{len(self._records) + 1}"
             directory = self.directory
-            destination = directory / f"{handle}{extension}"
-            temporary = directory / f".artifact.{uuid4().hex}.tmp"
-            digest = sha256()
-            copied = 0
+            prepared: list[tuple[Path, Path, ArtifactRecord]] = []
+            linked: list[Path] = []
+            published = False
             try:
-                source_descriptor = os.open(
-                    source,
-                    os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
-                )
-                try:
-                    destination_descriptor = os.open(
-                        temporary,
-                        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-                        0o600,
+                for offset, ((source, media_type), extension, expected_size) in enumerate(
+                    zip(sources, extensions, source_sizes, strict=True),
+                    start=1,
+                ):
+                    handle = f"a{len(self._records) + offset}"
+                    destination = directory / f"{handle}{extension}"
+                    temporary = directory / f".artifact.{uuid4().hex}.tmp"
+                    digest, copied = self._copy_artifact_source(source, temporary)
+                    if copied != expected_size:
+                        raise ArtifactError(
+                            "artifact_source_changed",
+                            "The artifact source changed while it was retained",
+                        )
+                    record = ArtifactRecord(
+                        handle=handle,
+                        relative_path=destination.relative_to(self._run_directory).as_posix(),
+                        media_type=media_type,
+                        size_bytes=copied,
+                        sha256=digest,
+                        producer_tool_call_id=producer_tool_call_id,
                     )
-                    with os.fdopen(destination_descriptor, "wb") as target:
-                        with os.fdopen(source_descriptor, "rb") as origin:
-                            source_descriptor = -1
-                            while chunk := origin.read(1024 * 1024):
-                                copied += len(chunk)
-                                if copied > self._policy.max_artifact_bytes:
-                                    raise ArtifactError(
-                                        "artifact_size_limit",
-                                        "The complete result is too large to retain. "
-                                        "Aggregate or filter it further",
-                                    )
-                                digest.update(chunk)
-                                target.write(chunk)
-                        target.flush()
-                        os.fsync(target.fileno())
-                finally:
-                    if source_descriptor >= 0:
-                        os.close(source_descriptor)
-                if copied != source_size:
-                    raise ArtifactError(
-                        "artifact_source_changed",
-                        "The artifact source changed while it was retained",
-                    )
-                os.link(temporary, destination)
-                temporary.unlink()
+                    prepared.append((temporary, destination, record))
+                for temporary, destination, _record in prepared:
+                    os.link(temporary, destination)
+                    linked.append(destination)
                 _fsync_directory(directory)
-            except BaseException:
-                temporary.unlink(missing_ok=True)
+                published = True
+            except ArtifactError:
                 raise
+            except OSError as error:
+                raise ArtifactError(
+                    "artifact_publication_failed",
+                    "The artifact batch could not be published",
+                ) from error
+            finally:
+                for temporary, _destination, _record in prepared:
+                    temporary.unlink(missing_ok=True)
+                if not published:
+                    for destination in linked:
+                        destination.unlink(missing_ok=True)
+                    if directory.exists():
+                        _fsync_directory(directory)
+            records = tuple(record for _temporary, _destination, record in prepared)
+            self._records.extend(records)
+            return records
 
-            record = ArtifactRecord(
-                handle=handle,
-                relative_path=destination.relative_to(self._run_directory).as_posix(),
-                media_type=media_type,
-                size_bytes=copied,
-                sha256=digest.hexdigest(),
-                producer_tool_call_id=producer_tool_call_id,
+    def _copy_artifact_source(self, source: Path, temporary: Path) -> tuple[str, int]:
+        source_descriptor = os.open(
+            source,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+        )
+        destination_descriptor: int | None = None
+        digest = sha256()
+        copied = 0
+        try:
+            destination_descriptor = os.open(
+                temporary,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
             )
-            self._records.append(record)
-            return record
+            with os.fdopen(destination_descriptor, "wb") as target:
+                destination_descriptor = None
+                with os.fdopen(source_descriptor, "rb") as origin:
+                    source_descriptor = -1
+                    while chunk := origin.read(1024 * 1024):
+                        copied += len(chunk)
+                        if copied > self._policy.max_artifact_bytes:
+                            raise ArtifactError(
+                                "artifact_size_limit",
+                                "The complete result is too large to retain. "
+                                "Aggregate or filter it further",
+                            )
+                        digest.update(chunk)
+                        target.write(chunk)
+                target.flush()
+                os.fsync(target.fileno())
+            return digest.hexdigest(), copied
+        except BaseException:
+            temporary.unlink(missing_ok=True)
+            raise
+        finally:
+            if source_descriptor >= 0:
+                os.close(source_descriptor)
+            if destination_descriptor is not None:
+                os.close(destination_descriptor)
 
-    def check_batch_capacity(self, sizes: Sequence[int]) -> None:
-        with self._lock:
-            if len(self._records) + len(sizes) > self._policy.max_artifact_count:
-                raise ArtifactError(
-                    "artifact_count_limit",
-                    "The run artifact count limit was reached",
-                )
-            if any(size > self._policy.max_artifact_bytes for size in sizes):
-                raise ArtifactError(
-                    "artifact_size_limit",
-                    "A complete output is too large to retain",
-                )
-            retained = sum(item.size_bytes for item in self._records)
-            if retained + sum(sizes) > self._policy.max_total_artifact_bytes:
-                raise ArtifactError(
-                    "artifact_total_limit",
-                    "The run artifact byte limit was reached",
-                )
+    def _open_verified_descriptor(self, record: ArtifactRecord) -> int:
+        path = self._run_directory / record.relative_path
+        descriptor: int | None = None
+        try:
+            descriptor = os.open(
+                path,
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            )
+            metadata = os.fstat(descriptor)
+            if not stat.S_ISREG(metadata.st_mode):
+                raise OSError("artifact is not a regular file")
+            return descriptor
+        except OSError as error:
+            if descriptor is not None:
+                os.close(descriptor)
+            raise ArtifactError(
+                "artifact_unavailable",
+                "The retained artifact is unavailable",
+            ) from error
+
+    @staticmethod
+    def _verify_consumed(record: ArtifactRecord, size: int, digest: str) -> None:
+        if size != record.size_bytes or digest != record.sha256:
+            raise ArtifactError(
+                "artifact_integrity",
+                "The retained artifact no longer matches its integrity record",
+            )
 
 
 class AnalysisEnvironment:
@@ -306,8 +440,10 @@ class AnalysisEnvironment:
 
         columns = list(materialization.columns)
         row_count = materialization.table.num_rows
-        try:
-            if row_count <= self.policy.max_preview_rows:
+        preview_count = min(self.policy.max_preview_rows, row_count)
+        preview_rows: list[list[JsonValue]] = []
+        if row_count <= self.policy.max_preview_rows:
+            try:
                 inline = {
                     "ok": True,
                     "transport": "inline",
@@ -319,13 +455,16 @@ class AnalysisEnvironment:
                 encoded_inline = _canonical_json(inline)
                 if len(encoded_inline.encode("utf-8")) <= self.policy.max_tool_result_bytes:
                     return encoded_inline
-            preview_count = min(self.policy.max_preview_rows, row_count)
-            preview_rows = _table_rows(materialization.table.slice(0, preview_count))
-        except (TypeError, ValueError):
-            return self._tool_error(
-                "query_result_value",
-                "DuckDB returned a value without a supported lossless JSON representation",
-            )
+            except (TypeError, ValueError):
+                preview_count = 0
+        if preview_count:
+            try:
+                preview_rows = _table_rows(
+                    materialization.table.slice(0, preview_count)
+                )
+            except (TypeError, ValueError):
+                preview_count = 0
+                preview_rows = []
 
         temporary = self.run_directory / f".query.{uuid4().hex}.parquet"
         try:
@@ -377,29 +516,14 @@ class AnalysisEnvironment:
         issue = _python_request_issue(source, inputs, expected_outputs)
         if issue is not None:
             return self._tool_error(*issue)
-        try:
-            resolved_inputs = [self._artifacts.resolve(handle) for handle in inputs]
-        except ArtifactError as error:
-            return self._tool_error(error.code, error.message)
-
         staging = Path(tempfile.mkdtemp(prefix=".python-", dir=self.run_directory))
         inputs_directory = staging / "inputs"
         inputs_directory.mkdir(mode=0o700)
         output_directory = staging / "outputs"
         output_directory.mkdir(mode=0o700)
         try:
-            for record, retained_path in resolved_inputs:
-                input_path = inputs_directory / Path(record.relative_path).name
-                shutil.copyfile(retained_path, input_path)
-                input_path.chmod(0o400)
-                if (
-                    input_path.stat().st_size != record.size_bytes
-                    or _file_sha256(input_path) != record.sha256
-                ):
-                    raise ArtifactError(
-                        "artifact_integrity",
-                        "An artifact changed while its managed Python input was prepared",
-                    )
+            for handle in inputs:
+                self._artifacts.copy_verified(handle, inputs_directory)
             request = PythonExecutionRequest(
                 source=source,
                 database_path=self.database_path,
@@ -441,19 +565,13 @@ class AnalysisEnvironment:
                     self.policy.max_artifact_bytes,
                     self.policy.max_tool_result_bytes,
                 )
-            self._artifacts.check_batch_capacity(
-                [path.stat().st_size for path in output_paths]
+            records = self._artifacts.publish_files(
+                [
+                    (path, _OUTPUT_MEDIA_TYPES[Path(name).suffix])
+                    for name, path in zip(expected_outputs, output_paths, strict=True)
+                ],
+                producer_tool_call_id=tool_call_id,
             )
-            records: list[ArtifactRecord] = []
-            for name, path in zip(expected_outputs, output_paths, strict=True):
-                media_type = _OUTPUT_MEDIA_TYPES[Path(name).suffix]
-                records.append(
-                    self._artifacts.publish_file(
-                        path,
-                        media_type=media_type,
-                        producer_tool_call_id=tool_call_id,
-                    )
-                )
             return self._python_result(execution, records)
         except ArtifactError as error:
             return self._tool_error(error.code, error.message)
@@ -461,12 +579,15 @@ class AnalysisEnvironment:
             shutil.rmtree(staging)
 
     def load_json_artifact(self, handle: str) -> JsonValue:
-        record, path = self._artifacts.resolve(handle)
-        if record.media_type != _JSON_MEDIA_TYPE:
-            raise ArtifactError(
+        record, content = self._artifacts.read_verified_bytes(
+            handle,
+            max_bytes=self.policy.max_tool_result_bytes,
+            expected_media_type=_JSON_MEDIA_TYPE,
+            media_type_error=(
                 "answer_artifact_media_type",
                 "The final answer artifact must be JSON",
-            )
+            ),
+        )
         if record.size_bytes > self.policy.max_tool_result_bytes:
             raise ArtifactError(
                 "answer_artifact_size_limit",
@@ -476,7 +597,7 @@ class AnalysisEnvironment:
             return cast(
                 JsonValue,
                 json.loads(
-                    path.read_bytes(),
+                    content,
                     parse_constant=lambda value: (_ for _ in ()).throw(ValueError(value)),
                 ),
             )
@@ -552,12 +673,12 @@ class AnalysisEnvironment:
         timed_out = Event()
         timer = _interrupt_after(connection, self.policy.max_query_seconds, timed_out)
         try:
-            clean_sql = sql.strip().removesuffix(";").rstrip()
             bounded_sql = (
-                f"select * from ({clean_sql}) as __dsa_query "
+                "select * from query(?) as __dsa_query "
                 f"limit {self.policy.max_query_rows + 1}"
             )
-            cursor = connection.execute(bounded_sql)
+            _validate_bound_query(connection, bounded_sql, sql)
+            cursor = connection.execute(bounded_sql, [sql])
             columns: tuple[dict[str, JsonValue], ...] = tuple(
                 {"name": item[0], "type": str(item[1])}
                 for item in cursor.description
@@ -647,14 +768,68 @@ def _query_issue(sql: str) -> tuple[str, str] | None:
         return "query_invalid", "SQL must be valid DuckDB syntax"
     if len(statements) != 1:
         return "query_statement_count", "Submit exactly one SQL statement"
-    first_word = sql.lstrip().split(None, 1)[0].lower().rstrip(";")
-    if first_word not in {"select", "with", "values"}:
-        return "query_not_read_only", "Only SELECT, WITH, or VALUES queries are allowed"
     if statements[0].type != duckdb.StatementType.SELECT:
         return "query_not_read_only", "Only read-only tabular queries are allowed"
-    if _UNSAFE_SQL_FUNCTION.search(sql) is not None or _FROM_PATH.search(sql) is not None:
-        return "query_external_access", "Queries may read only from the supplied database"
     return None
+
+
+def _validate_bound_query(
+    connection: duckdb.DuckDBPyConnection,
+    bounded_sql: str,
+    submitted_sql: str,
+) -> None:
+    try:
+        row = connection.execute(
+            f"explain (format json) {bounded_sql}",
+            [submitted_sql],
+        ).fetchone()
+    except duckdb.PermissionException as error:
+        raise ArtifactError(
+            "query_external_access",
+            "Queries may read only from the supplied database",
+        ) from error
+    if row is None or not isinstance(row[1], str):
+        raise ArtifactError("query_plan_unavailable", "DuckDB could not bind the query plan")
+    plan = cast(JsonValue, json.loads(row[1]))
+    table_functions = _bound_table_functions(plan)
+    if table_functions - _ALLOWED_BOUND_TABLE_FUNCTIONS:
+        raise ArtifactError(
+            "query_external_access",
+            "Queries may scan only supplied database relations and pure generated tables",
+        )
+    side_effect_rows = connection.execute(
+        "select distinct function_name from duckdb_functions() "
+        "where has_side_effects order by function_name"
+    ).fetchall()
+    forbidden_scalars = _FORBIDDEN_BOUND_SCALAR_FUNCTIONS | {
+        cast(str, item[0]).lower() for item in side_effect_rows
+    }
+    plan_text = _canonical_json(plan).lower()
+    if any(
+        re.search(rf"(?<![a-z0-9_]){re.escape(name)}\s*\(", plan_text)
+        for name in forbidden_scalars
+    ):
+        raise ArtifactError(
+            "query_external_access",
+            "Queries may not call host metadata or side-effecting functions",
+        )
+
+
+def _bound_table_functions(value: JsonValue) -> set[str]:
+    functions: set[str] = set()
+    if isinstance(value, dict):
+        mapping = cast(dict[str, JsonValue], value)
+        extra = mapping.get("extra_info")
+        if isinstance(extra, dict):
+            function = cast(dict[str, JsonValue], extra).get("Function")
+            if isinstance(function, str):
+                functions.add(function.lower())
+        for child in mapping.values():
+            functions.update(_bound_table_functions(child))
+    elif isinstance(value, list):
+        for child in cast(list[JsonValue], value):
+            functions.update(_bound_table_functions(child))
+    return functions
 
 
 def _python_request_issue(
@@ -842,22 +1017,18 @@ def _validate_executor_output(path: Path, max_bytes: int, max_json_bytes: int) -
                 parse_constant=lambda value: (_ for _ in ()).throw(ValueError(value)),
             )
         else:
-            parquet.ParquetFile(  # pyright: ignore[reportUnknownMemberType]
+            parquet_file = parquet.ParquetFile(  # pyright: ignore[reportUnknownMemberType]
                 path
             )
+            for _batch in parquet_file.iter_batches(  # pyright: ignore[reportUnknownMemberType]
+                batch_size=8_192
+            ):
+                pass
     except Exception as error:
         raise ArtifactError(
             "python_output_invalid",
             "Python output content does not match its declared file type",
         ) from error
-
-
-def _file_sha256(path: Path) -> str:
-    digest = sha256()
-    with path.open("rb") as source:
-        while chunk := source.read(1024 * 1024):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def _fsync_directory(directory: Path) -> None:

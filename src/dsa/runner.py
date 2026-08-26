@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Sequence
 from copy import deepcopy
 from dataclasses import asdict
 from datetime import UTC, datetime
@@ -218,7 +218,12 @@ async def run_analysis(
             validation_failures += 1
             if validation_failures >= canonical_request.policy.max_validation_attempts:
                 raise _ValidationAttemptsExceeded
-            raise ModelRetry(_validation_feedback(errors))
+            raise ModelRetry(
+                _validation_feedback(
+                    errors,
+                    canonical_request.policy.max_tool_result_bytes,
+                )
+            )
         try:
             json.dumps(answer, allow_nan=False)
         except (TypeError, ValueError) as error:
@@ -226,8 +231,21 @@ async def run_analysis(
             if validation_failures >= canonical_request.policy.max_validation_attempts:
                 raise _ValidationAttemptsExceeded from error
             raise ModelRetry(
-                '{"error":"answer_schema_validation_failed",'
-                '"issues":[{"keyword":"json","message":"answer must be finite JSON"}]}'
+                _bounded_retry_feedback(
+                    [
+                        {
+                            "error": "answer_schema_validation_failed",
+                            "issues": [
+                                {
+                                    "keyword": "json",
+                                    "message": "answer must be finite JSON",
+                                }
+                            ],
+                        },
+                        {"error": "answer_schema_validation_failed"},
+                    ],
+                    canonical_request.policy.max_tool_result_bytes,
+                )
             ) from error
         return proposal
 
@@ -241,11 +259,12 @@ async def run_analysis(
             if validation_failures >= canonical_request.policy.max_validation_attempts:
                 raise _ValidationAttemptsExceeded from error
             raise ModelRetry(
-                json.dumps(
-                    {"error": error.code, "message": error.message},
-                    ensure_ascii=False,
-                    sort_keys=True,
-                    separators=(",", ":"),
+                _bounded_retry_feedback(
+                    [
+                        {"error": error.code, "message": error.message},
+                        {"error": error.code},
+                    ],
+                    canonical_request.policy.max_tool_result_bytes,
                 )
             ) from error
         return {"value": answer} if wrapped else answer
@@ -362,10 +381,15 @@ async def run_analysis(
                     next_node = await running.next(next_node)
                     messages, usage = _snapshot_run(running)
                     messages = _include_pending_model_request(messages, next_node)
-                    if (
-                        _model_visible_tool_result_bytes(messages)
-                        > canonical_request.policy.max_total_tool_result_bytes
+                    result_sizes = _model_visible_tool_result_sizes(messages)
+                    if any(
+                        size > canonical_request.policy.max_tool_result_bytes
+                        for size in result_sizes
                     ):
+                        raise ToolResultLimitExceeded(
+                            "a model-visible tool result exceeded its per-result limit"
+                        )
+                    if sum(result_sizes) > canonical_request.policy.max_total_tool_result_bytes:
                         raise ToolResultLimitExceeded(
                             "cumulative model-visible tool results exceeded the run limit"
                         )
@@ -575,8 +599,11 @@ def _validation_error_key(error: JsonSchemaValidationError) -> tuple[str, str]:
     return ("/".join(map(str, error.absolute_path)), "/".join(map(str, error.absolute_schema_path)))
 
 
-def _validation_feedback(errors: list[JsonSchemaValidationError]) -> str:
-    issues = [
+def _validation_feedback(
+    errors: list[JsonSchemaValidationError],
+    max_bytes: int,
+) -> str:
+    issues: list[dict[str, JsonValue]] = [
         {
             "result_path": list(error.absolute_path),
             "schema_path": list(error.absolute_schema_path),
@@ -585,12 +612,41 @@ def _validation_feedback(errors: list[JsonSchemaValidationError]) -> str:
         }
         for error in errors
     ]
-    return json.dumps(
-        {"error": "answer_schema_validation_failed", "issues": issues},
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
+    reduced_issues: list[dict[str, JsonValue]] = [
+        {
+            "result_path": issue["result_path"],
+            "keyword": issue["keyword"],
+        }
+        for issue in issues
+    ]
+    return _bounded_retry_feedback(
+        [
+            {"error": "answer_schema_validation_failed", "issues": issues},
+            {
+                "error": "answer_schema_validation_failed",
+                "issues": reduced_issues,
+            },
+            {"error": "answer_schema_validation_failed"},
+        ],
+        max_bytes,
     )
+
+
+def _bounded_retry_feedback(
+    candidates: Sequence[object],
+    max_bytes: int,
+) -> str:
+    for candidate in candidates:
+        encoded = json.dumps(
+            candidate,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        if len(encoded.encode("utf-8")) <= max_bytes:
+            return encoded
+    raise ToolResultLimitExceeded("retry feedback exceeds the per-result byte limit")
 
 
 def _validate_run_id(run_id: str) -> None:
@@ -615,10 +671,10 @@ def _tool_call_id(context: RunContext[None]) -> str:
     return tool_call_id
 
 
-def _model_visible_tool_result_bytes(
+def _model_visible_tool_result_sizes(
     messages: tuple[dict[str, JsonValue], ...],
-) -> int:
-    total = 0
+) -> list[int]:
+    sizes: list[int] = []
     for message in messages:
         parts = message.get("parts")
         if not isinstance(parts, list):
@@ -631,9 +687,10 @@ def _model_visible_tool_result_bytes(
                 continue
             content = part.get("content")
             if isinstance(content, str):
-                total += len(content.encode("utf-8"))
+                sizes.append(len(content.encode("utf-8")))
             else:
-                total += len(
+                sizes.append(
+                    len(
                     json.dumps(
                         content,
                         ensure_ascii=False,
@@ -641,8 +698,9 @@ def _model_visible_tool_result_bytes(
                         sort_keys=True,
                         separators=(",", ":"),
                     ).encode("utf-8")
+                    )
                 )
-    return total
+    return sizes
 
 
 def _include_pending_model_request(

@@ -21,10 +21,11 @@ the deterministic run boundary:
 - native Pydantic AI messages and usage in one terminal record
 - atomic private record retention with one SHA-256 digest
 - deterministic schema inspection through read-only DuckDB
-- one bounded read-only tabular SQL statement per query tool call
+- one DuckDB-bound, plan-checked read-only tabular SQL statement per query tool call
 - complete small query results inline
 - automatic full-result Parquet retention with at most five preview rows
-- run-private artifact handles, metadata, digests, and integrity checks
+- run-private artifact handles with same-descriptor integrity checks
+- transactional publication for complete multi-output Python batches
 - an injected Python executor protocol using managed input and output paths
 - direct final answers or same-run retained JSON final answers
 

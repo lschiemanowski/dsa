@@ -11,7 +11,7 @@ from typing import Any, cast
 import duckdb
 import pyarrow.parquet as parquet
 import pytest
-from pydantic import ValidationError
+from pydantic import JsonValue, ValidationError
 from pydantic_ai import ModelAPIError, ModelHTTPError
 from pydantic_ai.messages import ModelResponse, ToolCallPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
@@ -654,3 +654,56 @@ async def test_schema_invalid_json_artifact_retries_then_accepts_direct_answer(
     assert isinstance(completion.outcome, RunSuccess)
     assert completion.outcome.answer == {"count": 12}
     assert "answer_schema_validation_failed" in json.dumps(completion.record.messages)
+
+
+async def test_validation_retry_feedback_obeys_per_result_byte_limit(
+    tmp_path: Path,
+) -> None:
+    request = valid_request(
+        tmp_path,
+        max_tool_result_bytes=128,
+        max_validation_attempts=2,
+    )
+    request = RunRequest.model_validate(
+        {
+            **request.model_dump(),
+            "answer_schema": {
+                "$schema": DRAFT_2020_12,
+                "type": "string",
+                "maxLength": 5,
+            },
+        }
+    )
+    calls = 0
+
+    async def respond(_messages: list[Any], _info: AgentInfo) -> ModelResponse:
+        nonlocal calls
+        calls += 1
+        value = "x" * 1_000 if calls == 1 else "valid"
+        return ModelResponse(
+            parts=[ToolCallPart("final_answer", {"value": value}, f"answer-{calls}")]
+        )
+
+    completion = await run_analysis(
+        request,
+        runs_directory=tmp_path / "runs",
+        model=FunctionModel(respond, model_name="test"),
+        identity_factory=lambda: "run-bounded-retry",
+        clock=clock(),
+    )
+
+    assert calls == 2
+    assert isinstance(completion.outcome, RunSuccess)
+    assert completion.outcome.answer == "valid"
+    for message in completion.record.messages:
+        parts = message.get("parts")
+        if not isinstance(parts, list):
+            continue
+        for raw_part in parts:
+            if not isinstance(raw_part, dict):
+                continue
+            part = cast(dict[str, JsonValue], raw_part)
+            if part.get("part_kind") == "retry-prompt":
+                content = part.get("content")
+                assert isinstance(content, str)
+                assert len(content.encode("utf-8")) <= 128

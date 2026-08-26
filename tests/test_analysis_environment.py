@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import json
+import math
+import os
+from collections.abc import Iterator
 from hashlib import sha256
 from pathlib import Path
 
 import duckdb
+import pyarrow as pa
 import pyarrow.parquet as parquet
 import pytest
 
@@ -31,6 +35,10 @@ def database_fixture(tmp_path: Path) -> Path:
         connection.execute(
             "create view analytics.event_count as "
             "select count(*) as count from analytics.events"
+        )
+        connection.execute("create macro unsafe_log() as write_log('audit')")
+        connection.execute(
+            "create macro unsafe_settings() as table select * from duckdb_settings()"
         )
     finally:
         connection.close()
@@ -122,11 +130,41 @@ async def test_query_rejects_writes_multiple_statements_and_external_sources(
             tool_call_id="query-secret-catalog",
         )
     )
+    commented_write = json.loads(
+        await runtime.query_database(
+            "select write_log/**/('hello')",
+            tool_call_id="query-commented-write",
+        )
+    )
+    settings = json.loads(
+        await runtime.query_database(
+            "select * from duckdb_settings()",
+            tool_call_id="query-settings",
+        )
+    )
+    macro_write = json.loads(
+        await runtime.query_database(
+            "select unsafe_log()",
+            tool_call_id="query-macro-write",
+        )
+    )
+    macro_settings = json.loads(
+        await runtime.query_database(
+            "select * from unsafe_settings()",
+            tool_call_id="query-macro-settings",
+        )
+    )
 
     assert write["error"]["code"] == "query_not_read_only"
     assert multiple["error"]["code"] == "query_statement_count"
     assert external["error"]["code"] == "query_external_access"
     assert secret_catalog["error"]["code"] == "query_external_access"
+    assert commented_write["error"]["code"] == "query_external_access"
+    assert settings["error"]["code"] == "query_external_access"
+    assert macro_write["error"]["code"] == "query_external_access"
+    assert macro_settings["error"]["code"] == "query_external_access"
+    assert "stored_secrets" not in json.dumps(secret_catalog)
+    assert "temp_directory" not in json.dumps(settings)
     assert sha256(runtime.database_path.read_bytes()).hexdigest() == before
     assert runtime.artifact_records == ()
 
@@ -153,6 +191,28 @@ async def test_small_complete_query_result_stays_inline(tmp_path: Path) -> None:
         "rows": [[0, "event-0"], [1, "event-1"]],
     }
     assert runtime.artifact_records == ()
+
+
+async def test_leading_and_trailing_comments_remain_valid_single_queries(
+    tmp_path: Path,
+) -> None:
+    runtime = environment(tmp_path)
+
+    leading = json.loads(
+        await runtime.query_database(
+            "/* orientation */ select 1 as value",
+            tool_call_id="query-leading-comment",
+        )
+    )
+    trailing = json.loads(
+        await runtime.query_database(
+            "select 2 as value -- trailing comment",
+            tool_call_id="query-trailing-comment",
+        )
+    )
+
+    assert leading["rows"] == [[1]]
+    assert trailing["rows"] == [[2]]
 
 
 async def test_inline_query_uses_lossless_tagged_json_values(tmp_path: Path) -> None:
@@ -210,6 +270,29 @@ async def test_larger_result_is_automatically_retained_in_full_as_parquet(
     )
     assert table.num_rows == 12
     assert table.column("event_id").to_pylist() == list(range(12))
+
+
+async def test_nonfinite_inline_value_is_retained_as_parquet_without_preview(
+    tmp_path: Path,
+) -> None:
+    runtime = environment(tmp_path)
+
+    result = json.loads(
+        await runtime.query_database(
+            "select 'NaN'::double as value",
+            tool_call_id="query-nan",
+        )
+    )
+
+    assert result["ok"] is True
+    assert result["transport"] == "artifact"
+    assert result["row_count"] == 1
+    assert result["preview_rows"] == []
+    record = runtime.artifact_records[0]
+    table = parquet.read_table(  # pyright: ignore[reportUnknownMemberType]
+        runtime.run_directory / record.relative_path
+    )
+    assert math.isnan(table.column("value")[0].as_py())
 
 
 async def test_query_over_materialization_limit_fails_without_partial_artifact(
@@ -293,17 +376,23 @@ async def test_injected_python_executor_consumes_managed_parquet_and_publishes_j
 async def test_artifact_integrity_is_checked_before_consumption(tmp_path: Path) -> None:
     executor = FakePythonExecutor()
     runtime = environment(tmp_path, python_executor=executor)
+    await runtime.query_database(
+        "select * from analytics.events order by event_id",
+        tool_call_id="query-before-integrity",
+    )
     result = json.loads(
-        await runtime.query_database(
-            "select * from analytics.events order by event_id",
-            tool_call_id="query-integrity",
+        await runtime.run_python(
+            "# produce a JSON answer",
+            inputs=["a1"],
+            expected_outputs=["answer.json"],
+            tool_call_id="python-integrity",
         )
     )
-    record = runtime.artifact_records[0]
+    record = runtime.artifact_records[1]
     (runtime.run_directory / record.relative_path).write_bytes(b"tampered")
 
     with pytest.raises(ArtifactError) as captured:
-        runtime.load_json_artifact(result["artifact_handle"])
+        runtime.load_json_artifact(result["outputs"][0]["handle"])
 
     assert captured.value.code == "artifact_integrity"
 
@@ -335,3 +424,121 @@ async def test_invalid_python_output_is_not_published(tmp_path: Path) -> None:
     assert result["ok"] is False
     assert result["error"]["code"] == "python_output_invalid"
     assert [record.handle for record in runtime.artifact_records] == ["a1"]
+
+
+class TwoOutputExecutor:
+    async def execute(self, request: PythonExecutionRequest) -> PythonExecutionResult:
+        (request.output_directory / "first.json").write_text("{\"value\":1}", encoding="utf-8")
+        (request.output_directory / "second.json").write_text("{\"value\":2}", encoding="utf-8")
+        return PythonExecutionResult()
+
+
+async def test_multi_output_publication_rolls_back_the_complete_batch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = environment(tmp_path, python_executor=TwoOutputExecutor())
+    original_link = os.link
+    calls = 0
+
+    def fail_second_link(source: Path, destination: Path) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("simulated second publication failure")
+        original_link(source, destination)
+
+    monkeypatch.setattr("dsa.environment.os.link", fail_second_link)
+
+    result = json.loads(
+        await runtime.run_python(
+            "# produce two declared outputs",
+            inputs=[],
+            expected_outputs=["first.json", "second.json"],
+            tool_call_id="python-two-outputs",
+        )
+    )
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == "artifact_publication_failed"
+    assert runtime.artifact_records == ()
+    artifacts = runtime.run_directory / "artifacts"
+    assert not artifacts.exists() or list(artifacts.iterdir()) == []
+
+
+class JsonAnswerExecutor:
+    async def execute(self, request: PythonExecutionRequest) -> PythonExecutionResult:
+        (request.output_directory / "answer.json").write_text(
+            '{"count": 12}', encoding="utf-8"
+        )
+        return PythonExecutionResult()
+
+
+async def test_json_consumer_uses_the_same_bytes_it_verified(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = environment(tmp_path, python_executor=JsonAnswerExecutor())
+    await runtime.run_python(
+        "# produce JSON answer",
+        inputs=[],
+        expected_outputs=["answer.json"],
+        tool_call_id="python-json-answer",
+    )
+    record = runtime.artifact_records[0]
+    retained = runtime.run_directory / record.relative_path
+    original_fdopen = os.fdopen
+    replaced = False
+
+    def replace_after_open(descriptor: int, mode: str):
+        nonlocal replaced
+        if mode == "rb" and not replaced:
+            replacement = retained.with_name("replacement.json")
+            replacement.write_text('{"count": 99}', encoding="utf-8")
+            os.replace(replacement, retained)
+            replaced = True
+        return original_fdopen(descriptor, mode)
+
+    monkeypatch.setattr("dsa.environment.os.fdopen", replace_after_open)
+
+    assert runtime.load_json_artifact("a1") == {"count": 12}
+    assert replaced is True
+
+
+class ParquetOutputExecutor:
+    async def execute(self, request: PythonExecutionRequest) -> PythonExecutionResult:
+        parquet.write_table(  # pyright: ignore[reportUnknownMemberType]
+            pa.table({"value": [1, 2, 3]}),  # pyright: ignore[reportUnknownMemberType]
+            request.output_directory / "result.parquet",
+        )
+        return PythonExecutionResult()
+
+
+async def test_parquet_output_validation_reads_data_pages(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = environment(tmp_path, python_executor=ParquetOutputExecutor())
+
+    class CorruptParquet:
+        def iter_batches(self, *args: object, **kwargs: object) -> Iterator[object]:
+            del args, kwargs
+            raise OSError("corrupt data page")
+
+    def parquet_factory(_path: object) -> CorruptParquet:
+        return CorruptParquet()
+
+    monkeypatch.setattr("dsa.environment.parquet.ParquetFile", parquet_factory)
+
+    result = json.loads(
+        await runtime.run_python(
+            "# produce Parquet output",
+            inputs=[],
+            expected_outputs=["result.parquet"],
+            tool_call_id="python-parquet-output",
+        )
+    )
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == "python_output_invalid"
+    assert runtime.artifact_records == ()
