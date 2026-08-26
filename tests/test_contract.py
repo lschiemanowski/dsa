@@ -176,3 +176,5 @@ def test_policy_is_flat_positive_and_caps_inline_previews() -> None:
         RunPolicy(max_model_requests=0)
     with pytest.raises(ValidationError):
         RunPolicy(max_preview_rows=6)
+    with pytest.raises(ValidationError):
+        RunPolicy(max_total_tool_result_bytes=0)

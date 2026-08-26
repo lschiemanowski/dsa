@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Sequence
 from copy import deepcopy
 from dataclasses import asdict
 from datetime import UTC, datetime
@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Protocol, cast
 from uuid import uuid4
 
+import duckdb
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import ValidationError as JsonSchemaValidationError
 from pydantic import JsonValue
@@ -20,8 +21,12 @@ from pydantic_ai import (
     Agent,
     ModelAPIError,
     ModelHTTPError,
+    ModelRequestNode,
     ModelRetry,
+    RunContext,
     StructuredDict,
+    Tool,
+    ToolOutput,
     UnexpectedModelBehavior,
     UsageLimitExceeded,
 )
@@ -32,7 +37,14 @@ from pydantic_ai.usage import RunUsage, UsageLimits
 from pydantic_graph import End
 
 from dsa.contract import ContractModel, RunRequest
+from dsa.environment import (
+    AnalysisEnvironment,
+    ArtifactError,
+    PythonExecutor,
+    ToolResultLimitExceeded,
+)
 from dsa.record import (
+    ArtifactRecord,
     Failure,
     RetainedTerminalRecord,
     RunFailure,
@@ -43,13 +55,20 @@ from dsa.record import (
 )
 
 _INSTRUCTIONS = """You are executing one completely specified data science task.
-Return only the requested answer through the provided structured output boundary.
+Use the database tools to inspect schema and run bounded read-only SQL.
+Small complete query results are inline. Larger complete results are retained automatically.
+Artifact previews are incomplete orientation only. Use their managed paths from Python.
+Return only the requested answer through a provided structured output boundary.
 The answer must satisfy the caller's JSON Schema exactly.
 """
 
 
 class _AnswerValidator(Protocol):
     def iter_errors(self, instance: JsonValue) -> Iterable[JsonSchemaValidationError]: ...
+
+
+class _ValidationAttemptsExceeded(Exception):
+    pass
 
 
 class RunCompletion(ContractModel):
@@ -68,6 +87,7 @@ async def run_analysis(
     *,
     runs_directory: Path,
     model: Model | str | None = None,
+    python_executor: PythonExecutor | None = None,
     identity_factory: Callable[[], str] | None = None,
     clock: Callable[[], datetime] | None = None,
 ) -> RunCompletion:
@@ -103,10 +123,80 @@ async def run_analysis(
             _aware_time(now()),
             (),
             {},
+            (),
             outcome,
             run_directory,
         )
 
+    environment = AnalysisEnvironment(
+        database_path=canonical_request.database_path,
+        run_directory=run_directory,
+        policy=canonical_request.policy,
+        python_executor=python_executor,
+    )
+    try:
+        await environment.check_database()
+    except asyncio.CancelledError as error:
+        outcome = RunFailure(
+            failure=Failure(
+                stage="cancelled",
+                code="cancelled_by_caller",
+                message="The caller cancelled the analysis run",
+            )
+        )
+        completion = _retain_completion(
+            canonical_request,
+            run_id,
+            started_at,
+            _aware_time(now()),
+            (),
+            {},
+            (),
+            outcome,
+            run_directory,
+        )
+        retained_error = cast(Any, error)
+        retained_error.terminal_record = completion.record
+        retained_error.retained_record = completion.retained_record
+        raise
+    except duckdb.Error:
+        outcome = RunFailure(
+            failure=Failure(
+                stage="analysis_environment",
+                code="source_database_invalid",
+                message="The source database could not be opened as a read-only DuckDB database",
+            )
+        )
+        return _retain_completion(
+            canonical_request,
+            run_id,
+            started_at,
+            _aware_time(now()),
+            (),
+            {},
+            (),
+            outcome,
+            run_directory,
+        )
+    except TimeoutError:
+        outcome = RunFailure(
+            failure=Failure(
+                stage="analysis_environment",
+                code="source_database_timeout",
+                message="Opening the source database exceeded its elapsed-time limit",
+            )
+        )
+        return _retain_completion(
+            canonical_request,
+            run_id,
+            started_at,
+            _aware_time(now()),
+            (),
+            {},
+            (),
+            outcome,
+            run_directory,
+        )
     messages: tuple[dict[str, JsonValue], ...] = ()
     usage: dict[str, JsonValue] = {}
     validation_failures = 0
@@ -117,7 +207,7 @@ async def run_analysis(
     framework_schema = _framework_schema(caller_schema, wrapped)
     validator = cast(_AnswerValidator, Draft202012Validator(caller_schema))
 
-    async def validate_answer(proposal: dict[str, Any]) -> dict[str, Any]:
+    async def validate_answer(proposal: Any) -> Any:
         nonlocal validation_failures
         answer = proposal.get("value") if wrapped else proposal
         errors = sorted(
@@ -126,30 +216,152 @@ async def run_analysis(
         )
         if errors:
             validation_failures += 1
-            raise ModelRetry(_validation_feedback(errors))
+            if validation_failures >= canonical_request.policy.max_validation_attempts:
+                raise _ValidationAttemptsExceeded
+            raise ModelRetry(
+                _validation_feedback(
+                    errors,
+                    canonical_request.policy.max_tool_result_bytes,
+                )
+            )
         try:
             json.dumps(answer, allow_nan=False)
         except (TypeError, ValueError) as error:
             validation_failures += 1
+            if validation_failures >= canonical_request.policy.max_validation_attempts:
+                raise _ValidationAttemptsExceeded from error
             raise ModelRetry(
-                '{"error":"answer_schema_validation_failed",'
-                '"issues":[{"keyword":"json","message":"answer must be finite JSON"}]}'
+                _bounded_retry_feedback(
+                    [
+                        {
+                            "error": "answer_schema_validation_failed",
+                            "issues": [
+                                {
+                                    "keyword": "json",
+                                    "message": "answer must be finite JSON",
+                                }
+                            ],
+                        },
+                        {"error": "answer_schema_validation_failed"},
+                    ],
+                    canonical_request.policy.max_tool_result_bytes,
+                )
             ) from error
         return proposal
 
+    def answer_from_artifact(handle: str) -> JsonValue:
+        """Submit a retained same-run JSON artifact as the final answer."""
+        nonlocal validation_failures
+        try:
+            answer = environment.load_json_artifact(handle)
+        except ArtifactError as error:
+            validation_failures += 1
+            if validation_failures >= canonical_request.policy.max_validation_attempts:
+                raise _ValidationAttemptsExceeded from error
+            raise ModelRetry(
+                _bounded_retry_feedback(
+                    [
+                        {"error": error.code, "message": error.message},
+                        {"error": error.code},
+                    ],
+                    canonical_request.policy.max_tool_result_bytes,
+                )
+            ) from error
+        return {"value": answer} if wrapped else answer
+
+    async def inspect_database(
+        context: RunContext[None],
+        relation: str | None = None,
+    ) -> str:
+        """List canonical quoted relations, or inspect one returned relation name."""
+        return await environment.inspect_database(
+            relation,
+            tool_call_id=_tool_call_id(context),
+        )
+
+    async def query_database(context: RunContext[None], sql: str) -> str:
+        """Run one bounded read-only DuckDB query with automatic artifact routing."""
+        return await environment.query_database(sql, tool_call_id=_tool_call_id(context))
+
+    async def run_python(
+        context: RunContext[None],
+        source: str,
+        inputs: list[str],
+        expected_outputs: list[str],
+    ) -> str:
+        """Run Python in the configured executor using managed artifact paths."""
+        return await environment.run_python(
+            source,
+            inputs,
+            expected_outputs,
+            tool_call_id=_tool_call_id(context),
+        )
+
     try:
         selected_model: Model | str = model or canonical_request.model.name
+        tools: list[Tool[None]] = [
+            Tool(
+                inspect_database,
+                takes_ctx=True,
+                name="inspect_database",
+                description=(
+                    "List sorted canonical quoted database relation names when relation is "
+                    "omitted, or return ordered column names and DuckDB types for one exact "
+                    "returned relation name. This returns schema only, never row data."
+                ),
+                sequential=True,
+            ),
+            Tool(
+                query_database,
+                takes_ctx=True,
+                name="query_database",
+                description=(
+                    "Execute exactly one read-only SELECT, WITH, or VALUES statement. "
+                    "Small complete tables are returned inline. Larger complete tables are "
+                    "retained as Parquet with a managed path and at most five preview rows. "
+                    "A preview is never the complete table."
+                ),
+                sequential=True,
+            ),
+        ]
+        if python_executor is not None:
+            tools.append(
+                Tool(
+                    run_python,
+                    takes_ctx=True,
+                    name="run_python",
+                    description=(
+                        "Execute source only through the configured isolated executor. "
+                        "Name retained artifact handles in inputs and read them from "
+                        "DSAGENT_INPUTS. Write exactly the declared .json or .parquet files "
+                        "to DSAGENT_OUTPUTS."
+                    ),
+                    sequential=True,
+                )
+            )
         agent = Agent(
             selected_model,
-            output_type=StructuredDict(
-                framework_schema,
-                name="final_answer",
-                description="Submit the exact caller-requested answer.",
-            ),
+            output_type=[
+                ToolOutput(
+                    StructuredDict(
+                        framework_schema,
+                        name="final_answer",
+                        description="Submit the exact caller-requested answer.",
+                    ),
+                    name="final_answer",
+                    description="Submit the exact caller-requested answer directly.",
+                ),
+                ToolOutput(
+                    answer_from_artifact,
+                    name="answer_from_artifact",
+                    description="Submit a same-run retained JSON artifact as the final answer.",
+                ),
+            ],
             instructions=_INSTRUCTIONS,
             name="dsa",
             retries={"output": canonical_request.policy.max_validation_attempts - 1},
             end_strategy="early",
+            tools=tools,
         )
         agent.output_validator(validate_answer)
         limits = UsageLimits(
@@ -168,6 +380,19 @@ async def run_analysis(
                 while not isinstance(next_node, End):
                     next_node = await running.next(next_node)
                     messages, usage = _snapshot_run(running)
+                    messages = _include_pending_model_request(messages, next_node)
+                    result_sizes = _model_visible_tool_result_sizes(messages)
+                    if any(
+                        size > canonical_request.policy.max_tool_result_bytes
+                        for size in result_sizes
+                    ):
+                        raise ToolResultLimitExceeded(
+                            "a model-visible tool result exceeded its per-result limit"
+                        )
+                    if sum(result_sizes) > canonical_request.policy.max_total_tool_result_bytes:
+                        raise ToolResultLimitExceeded(
+                            "cumulative model-visible tool results exceeded the run limit"
+                        )
                 messages, usage = _snapshot_run(running)
                 if running.result is None:
                     raise RuntimeError("Pydantic AI completed without a result")
@@ -176,7 +401,9 @@ async def run_analysis(
                 outcome: RunOutcome = RunSuccess(answer=cast(JsonValue, answer))
     except asyncio.CancelledError as error:
         if running is not None:
-            messages, usage = _snapshot_run(running)
+            snapshot_messages, usage = _snapshot_run(running)
+            if len(snapshot_messages) > len(messages):
+                messages = snapshot_messages
         outcome = RunFailure(
             failure=Failure(
                 stage="cancelled",
@@ -191,6 +418,7 @@ async def run_analysis(
             _aware_time(now()),
             messages,
             usage,
+            environment.artifact_records,
             outcome,
             run_directory,
         )
@@ -200,7 +428,9 @@ async def run_analysis(
         raise
     except Exception as error:
         if running is not None:
-            messages, usage = _snapshot_run(running)
+            snapshot_messages, usage = _snapshot_run(running)
+            if len(snapshot_messages) > len(messages):
+                messages = snapshot_messages
         outcome = _failure_outcome(error, validation_failures)
 
     return _retain_completion(
@@ -210,6 +440,7 @@ async def run_analysis(
         _aware_time(now()),
         messages,
         usage,
+        environment.artifact_records,
         outcome,
         run_directory,
     )
@@ -249,6 +480,23 @@ def _snapshot_run(running: Any) -> tuple[tuple[dict[str, JsonValue], ...], dict[
 
 
 def _failure_outcome(error: Exception, validation_failures: int) -> RunFailure:
+    if isinstance(error, _ValidationAttemptsExceeded):
+        return RunFailure(
+            failure=Failure(
+                stage="answer_validation",
+                code="attempts_exhausted",
+                message="The model did not produce an answer satisfying the caller schema",
+                diagnostics={"attempts": validation_failures},
+            )
+        )
+    if isinstance(error, ToolResultLimitExceeded):
+        return RunFailure(
+            failure=Failure(
+                stage="orchestration",
+                code="tool_result_limit_exceeded",
+                message="The run exceeded a host-enforced model-visible tool result limit",
+            )
+        )
     if isinstance(error, ModelHTTPError):
         return RunFailure(
             failure=Failure(
@@ -329,6 +577,7 @@ def _retain_completion(
     finished_at: datetime,
     messages: tuple[dict[str, JsonValue], ...],
     usage: dict[str, JsonValue],
+    artifacts: tuple[ArtifactRecord, ...],
     outcome: RunOutcome,
     run_directory: Path,
 ) -> RunCompletion:
@@ -339,6 +588,7 @@ def _retain_completion(
         request=request,
         messages=messages,
         usage=usage,
+        artifacts=artifacts,
         outcome=outcome,
     )
     retained = write_terminal_record(record, run_directory)
@@ -349,8 +599,11 @@ def _validation_error_key(error: JsonSchemaValidationError) -> tuple[str, str]:
     return ("/".join(map(str, error.absolute_path)), "/".join(map(str, error.absolute_schema_path)))
 
 
-def _validation_feedback(errors: list[JsonSchemaValidationError]) -> str:
-    issues = [
+def _validation_feedback(
+    errors: list[JsonSchemaValidationError],
+    max_bytes: int,
+) -> str:
+    issues: list[dict[str, JsonValue]] = [
         {
             "result_path": list(error.absolute_path),
             "schema_path": list(error.absolute_schema_path),
@@ -359,12 +612,41 @@ def _validation_feedback(errors: list[JsonSchemaValidationError]) -> str:
         }
         for error in errors
     ]
-    return json.dumps(
-        {"error": "answer_schema_validation_failed", "issues": issues},
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
+    reduced_issues: list[dict[str, JsonValue]] = [
+        {
+            "result_path": issue["result_path"],
+            "keyword": issue["keyword"],
+        }
+        for issue in issues
+    ]
+    return _bounded_retry_feedback(
+        [
+            {"error": "answer_schema_validation_failed", "issues": issues},
+            {
+                "error": "answer_schema_validation_failed",
+                "issues": reduced_issues,
+            },
+            {"error": "answer_schema_validation_failed"},
+        ],
+        max_bytes,
     )
+
+
+def _bounded_retry_feedback(
+    candidates: Sequence[object],
+    max_bytes: int,
+) -> str:
+    for candidate in candidates:
+        encoded = json.dumps(
+            candidate,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        if len(encoded.encode("utf-8")) <= max_bytes:
+            return encoded
+    raise ToolResultLimitExceeded("retry feedback exceeds the per-result byte limit")
 
 
 def _validate_run_id(run_id: str) -> None:
@@ -380,3 +662,55 @@ def _aware_time(value: datetime) -> datetime:
 
 def _bounded_text(value: str, limit: int = 2_000) -> str:
     return value if len(value) <= limit else value[:limit] + "…"
+
+
+def _tool_call_id(context: RunContext[None]) -> str:
+    tool_call_id = context.tool_call_id
+    if tool_call_id is None:
+        raise RuntimeError("Pydantic AI invoked a tool without a tool call identity")
+    return tool_call_id
+
+
+def _model_visible_tool_result_sizes(
+    messages: tuple[dict[str, JsonValue], ...],
+) -> list[int]:
+    sizes: list[int] = []
+    for message in messages:
+        parts = message.get("parts")
+        if not isinstance(parts, list):
+            continue
+        for part in parts:
+            if not isinstance(part, dict) or part.get("part_kind") not in {
+                "tool-return",
+                "retry-prompt",
+            }:
+                continue
+            content = part.get("content")
+            if isinstance(content, str):
+                sizes.append(len(content.encode("utf-8")))
+            else:
+                sizes.append(
+                    len(
+                    json.dumps(
+                        content,
+                        ensure_ascii=False,
+                        allow_nan=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                    )
+                )
+    return sizes
+
+
+def _include_pending_model_request(
+    messages: tuple[dict[str, JsonValue], ...],
+    next_node: Any,
+) -> tuple[dict[str, JsonValue], ...]:
+    if not isinstance(next_node, ModelRequestNode):
+        return messages
+    dumped = ModelMessagesTypeAdapter.dump_python([next_node.request], mode="json")
+    pending = cast(dict[str, JsonValue], dumped[0])
+    if messages and messages[-1] == pending:
+        return messages
+    return (*messages, pending)

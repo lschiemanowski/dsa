@@ -8,21 +8,25 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
 
+import duckdb
+import pyarrow.parquet as parquet
 import pytest
-from pydantic import ValidationError
+from pydantic import JsonValue, ValidationError
 from pydantic_ai import ModelAPIError, ModelHTTPError
 from pydantic_ai.messages import ModelResponse, ToolCallPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.models.test import TestModel
 
 from dsa import RunFailure, RunRequest, RunSuccess, run_analysis
+from dsa.environment import PythonExecutionRequest, PythonExecutionResult
 
 from .test_contract import DRAFT_2020_12, request_value
 
 
 def valid_request(tmp_path: Path, **policy: int) -> RunRequest:
     database = tmp_path / "source.duckdb"
-    database.write_bytes(b"fixture")
+    connection = duckdb.connect(str(database))
+    connection.close()
     raw = request_value(database)
     raw_model = raw["model"]
     assert isinstance(raw_model, dict)
@@ -114,6 +118,28 @@ async def test_valid_structured_answer_succeeds_and_retains_native_messages(
     retained = json.loads(completion.retained_record.path.read_bytes())
     assert retained["outcome"] == {"status": "succeeded", "answer": {"count": 3}}
     assert retained["messages"] == list(completion.record.messages)
+
+
+async def test_python_tool_is_absent_without_an_injected_executor(tmp_path: Path) -> None:
+    async def respond(_messages: list[Any], info: AgentInfo) -> ModelResponse:
+        assert [tool.name for tool in info.function_tools] == [
+            "inspect_database",
+            "query_database",
+        ]
+        return ModelResponse(
+            parts=[ToolCallPart("final_answer", {"count": 3}, "answer")]
+        )
+
+    completion = await run_analysis(
+        valid_request(tmp_path),
+        runs_directory=tmp_path / "runs",
+        model=FunctionModel(respond, model_name="test"),
+        identity_factory=lambda: "run-no-python-executor",
+        clock=clock(),
+    )
+
+    assert isinstance(completion.outcome, RunSuccess)
+    assert completion.outcome.answer == {"count": 3}
 
 
 async def test_framework_output_schema_does_not_mutate_caller_schema(tmp_path: Path) -> None:
@@ -340,6 +366,33 @@ async def test_missing_source_is_terminal_analysis_environment_failure_without_m
     assert completion.retained_record.path.is_file()
 
 
+async def test_non_duckdb_source_is_terminal_environment_failure_without_model(
+    tmp_path: Path,
+) -> None:
+    called = False
+
+    async def respond(_messages: list[Any], _info: AgentInfo) -> ModelResponse:
+        nonlocal called
+        called = True
+        return ModelResponse(parts=[])
+
+    request = valid_request(tmp_path)
+    request.database_path.write_bytes(b"not a DuckDB database")
+
+    completion = await run_analysis(
+        request,
+        runs_directory=tmp_path / "runs",
+        model=FunctionModel(respond, model_name="test"),
+        identity_factory=lambda: "run-invalid-database",
+        clock=clock(),
+    )
+
+    assert called is False
+    assert isinstance(completion.outcome, RunFailure)
+    assert completion.outcome.failure.stage == "analysis_environment"
+    assert completion.outcome.failure.code == "source_database_invalid"
+
+
 async def test_non_object_caller_schema_is_unwrapped_at_the_public_boundary(
     tmp_path: Path,
 ) -> None:
@@ -396,3 +449,261 @@ async def test_cancellation_retains_terminal_record_and_propagates(tmp_path: Pat
     assert isinstance(record.outcome, RunFailure)
     assert record.outcome.failure.stage == "cancelled"
     assert error.retained_record.path.is_file()
+
+
+def valid_database_request(tmp_path: Path, **policy: int) -> RunRequest:
+    database = tmp_path / "analysis.duckdb"
+    connection = duckdb.connect(str(database))
+    try:
+        connection.execute(
+            "create table events as "
+            "select i::integer as event_id, ('event-' || i)::varchar as label "
+            "from range(12) values(i)"
+        )
+    finally:
+        connection.close()
+    raw = request_value(database)
+    raw_model = raw["model"]
+    assert isinstance(raw_model, dict)
+    raw_model["name"] = "test"
+    raw["policy"] = policy
+    return RunRequest.model_validate(raw)
+
+
+class EpisodePythonExecutor:
+    async def execute(self, request: PythonExecutionRequest) -> PythonExecutionResult:
+        table = parquet.read_table(  # pyright: ignore[reportUnknownMemberType]
+            request.inputs_directory / "a1.parquet"
+        )
+        (request.output_directory / "answer.json").write_text(
+            json.dumps({"count": table.num_rows}), encoding="utf-8"
+        )
+        return PythonExecutionResult(stdout="", stderr="")
+
+
+async def test_episode_uses_database_artifact_python_locator_and_json_final_output(
+    tmp_path: Path,
+) -> None:
+    calls = 0
+
+    async def respond(_messages: list[Any], info: AgentInfo) -> ModelResponse:
+        nonlocal calls
+        calls += 1
+        assert [tool.name for tool in info.function_tools] == [
+            "inspect_database",
+            "query_database",
+            "run_python",
+        ]
+        assert [tool.name for tool in info.output_tools] == [
+            "final_answer",
+            "answer_from_artifact",
+        ]
+        if calls == 1:
+            return ModelResponse(
+                parts=[ToolCallPart("inspect_database", {}, "inspect-1")]
+            )
+        if calls == 2:
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        "query_database",
+                        {"sql": "select * from events order by event_id"},
+                        "query-1",
+                    )
+                ]
+            )
+        if calls == 3:
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        "run_python",
+                        {
+                            "source": "# consume DSAGENT_INPUTS/a1.parquet",
+                            "inputs": ["a1"],
+                            "expected_outputs": ["answer.json"],
+                        },
+                        "python-1",
+                    )
+                ]
+            )
+        return ModelResponse(
+            parts=[
+                ToolCallPart(
+                    "answer_from_artifact",
+                    {"handle": "a2"},
+                    "answer-artifact-1",
+                )
+            ]
+        )
+
+    completion = await run_analysis(
+        valid_database_request(tmp_path),
+        runs_directory=tmp_path / "runs",
+        model=FunctionModel(respond, model_name="test"),
+        python_executor=EpisodePythonExecutor(),
+        identity_factory=lambda: "run-artifact-answer",
+        clock=clock(),
+    )
+
+    assert calls == 4
+    assert isinstance(completion.outcome, RunSuccess)
+    assert completion.outcome.answer == {"count": 12}
+    assert [artifact.handle for artifact in completion.record.artifacts] == ["a1", "a2"]
+    assert [artifact.producer_tool_call_id for artifact in completion.record.artifacts] == [
+        "query-1",
+        "python-1",
+    ]
+    terminal = completion.retained_record.path.read_text()
+    assert "event-0" in terminal
+    assert "event-11" not in terminal
+    retained = json.loads(terminal)
+    assert retained["outcome"]["answer"] == {"count": 12}
+    assert len(retained["artifacts"]) == 2
+
+
+async def test_cumulative_model_visible_tool_result_budget_is_terminal(
+    tmp_path: Path,
+) -> None:
+    calls = 0
+
+    async def respond(_messages: list[Any], _info: AgentInfo) -> ModelResponse:
+        nonlocal calls
+        calls += 1
+        return ModelResponse(
+            parts=[ToolCallPart("inspect_database", {}, "inspect-budget")]
+        )
+
+    completion = await run_analysis(
+        valid_database_request(tmp_path, max_total_tool_result_bytes=20),
+        runs_directory=tmp_path / "runs",
+        model=FunctionModel(respond, model_name="test"),
+        identity_factory=lambda: "run-tool-budget",
+        clock=clock(),
+    )
+
+    assert calls == 1
+    assert isinstance(completion.outcome, RunFailure)
+    assert completion.outcome.failure.stage == "orchestration"
+    assert completion.outcome.failure.code == "tool_result_limit_exceeded"
+
+
+class InvalidAnswerExecutor:
+    async def execute(self, request: PythonExecutionRequest) -> PythonExecutionResult:
+        (request.output_directory / "answer.json").write_text(
+            json.dumps({"count": -1}), encoding="utf-8"
+        )
+        return PythonExecutionResult()
+
+
+async def test_schema_invalid_json_artifact_retries_then_accepts_direct_answer(
+    tmp_path: Path,
+) -> None:
+    calls = 0
+
+    async def respond(_messages: list[Any], _info: AgentInfo) -> ModelResponse:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        "query_database",
+                        {"sql": "select * from events order by event_id"},
+                        "query-invalid-final",
+                    )
+                ]
+            )
+        if calls == 2:
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        "run_python",
+                        {
+                            "source": "# write an answer artifact",
+                            "inputs": ["a1"],
+                            "expected_outputs": ["answer.json"],
+                        },
+                        "python-invalid-final",
+                    )
+                ]
+            )
+        if calls == 3:
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        "answer_from_artifact",
+                        {"handle": "a2"},
+                        "invalid-artifact-answer",
+                    )
+                ]
+            )
+        return ModelResponse(
+            parts=[ToolCallPart("final_answer", {"count": 12}, "direct-recovery")]
+        )
+
+    completion = await run_analysis(
+        valid_database_request(tmp_path, max_validation_attempts=2),
+        runs_directory=tmp_path / "runs",
+        model=FunctionModel(respond, model_name="test"),
+        python_executor=InvalidAnswerExecutor(),
+        identity_factory=lambda: "run-invalid-artifact-retry",
+        clock=clock(),
+    )
+
+    assert calls == 4
+    assert isinstance(completion.outcome, RunSuccess)
+    assert completion.outcome.answer == {"count": 12}
+    assert "answer_schema_validation_failed" in json.dumps(completion.record.messages)
+
+
+async def test_validation_retry_feedback_obeys_per_result_byte_limit(
+    tmp_path: Path,
+) -> None:
+    request = valid_request(
+        tmp_path,
+        max_tool_result_bytes=128,
+        max_validation_attempts=2,
+    )
+    request = RunRequest.model_validate(
+        {
+            **request.model_dump(),
+            "answer_schema": {
+                "$schema": DRAFT_2020_12,
+                "type": "string",
+                "maxLength": 5,
+            },
+        }
+    )
+    calls = 0
+
+    async def respond(_messages: list[Any], _info: AgentInfo) -> ModelResponse:
+        nonlocal calls
+        calls += 1
+        value = "x" * 1_000 if calls == 1 else "valid"
+        return ModelResponse(
+            parts=[ToolCallPart("final_answer", {"value": value}, f"answer-{calls}")]
+        )
+
+    completion = await run_analysis(
+        request,
+        runs_directory=tmp_path / "runs",
+        model=FunctionModel(respond, model_name="test"),
+        identity_factory=lambda: "run-bounded-retry",
+        clock=clock(),
+    )
+
+    assert calls == 2
+    assert isinstance(completion.outcome, RunSuccess)
+    assert completion.outcome.answer == "valid"
+    for message in completion.record.messages:
+        parts = message.get("parts")
+        if not isinstance(parts, list):
+            continue
+        for raw_part in parts:
+            if not isinstance(raw_part, dict):
+                continue
+            part = cast(dict[str, JsonValue], raw_part)
+            if part.get("part_kind") == "retry-prompt":
+                content = part.get("content")
+                assert isinstance(content, str)
+                assert len(content.encode("utf-8")) <= 128

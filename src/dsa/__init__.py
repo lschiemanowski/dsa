@@ -1,6 +1,7 @@
 """Public contract for the data science agent."""
 
 from dsa.contract import ModelConfiguration, RunPolicy, RunRequest
+from dsa.environment import PythonExecutionRequest, PythonExecutionResult, PythonExecutor
 from dsa.record import (
     ArtifactRecord,
     Failure,
@@ -16,6 +17,9 @@ __all__ = [
     "ArtifactRecord",
     "Failure",
     "ModelConfiguration",
+    "PythonExecutionRequest",
+    "PythonExecutionResult",
+    "PythonExecutor",
     "RetainedTerminalRecord",
     "RunCompletion",
     "RunFailure",

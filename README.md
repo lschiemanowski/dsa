@@ -10,7 +10,8 @@ conversational task-definition system.
 
 ## Current milestone
 
-Milestone 1 establishes the deterministic run boundary:
+Milestone 2 adds bounded database investigation and automatic artifact routing to
+the deterministic run boundary:
 
 - strict, serializable request and policy models
 - JSON Schema Draft 2020-12 validation
@@ -19,10 +20,20 @@ Milestone 1 establishes the deterministic run boundary:
 - typed terminal success and failure outcomes
 - native Pydantic AI messages and usage in one terminal record
 - atomic private record retention with one SHA-256 digest
+- deterministic schema inspection with unambiguous quoted DuckDB relation names
+- one structured-identity and bound-plan checked SQL statement per query tool call
+- complete small query results inline
+- automatic full-result Parquet retention with at most five preview rows
+- run-private artifact handles with same-descriptor integrity checks
+- transactional publication for complete multi-output Python batches
+- an injected Python executor protocol using managed input and output paths
+- direct final answers or same-run retained JSON final answers
 
-Database inspection, SQL, artifact externalization, Docker, and Databricks
-MLflow arrive in later milestones. The current code verifies that the supplied
-database is an available file but does not open it yet.
+Model-authored Python is never executed on the host by this milestone. The
+`run_python` tool is registered only when the host injects an executor. Milestone 3
+will provide the production Docker executor, run-private database copies, and
+transactional mutation behavior. Databricks Free Edition MLflow integration remains
+a later milestone. A local MLflow server is not part of the design.
 
 ## Public boundary
 
@@ -52,6 +63,12 @@ request = RunRequest(
 Credentials, provider endpoints, and evaluator expectations are deliberately
 excluded from this request and from the terminal record. Provider credentials
 remain runtime environment configuration.
+
+Query transport is host-selected. A response marked `inline` is complete. A response
+marked `artifact` identifies a complete retained Parquet table and includes only a
+bounded orientation preview. The preview is not an analytical substitute for the
+artifact. Python receives selected artifacts through `DSAGENT_INPUTS` rather than
+through copied transcript content.
 
 Once a valid run starts, it produces exactly one terminal outcome. Success
 contains the answer validated against the caller's schema. Failure contains a
