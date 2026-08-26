@@ -12,6 +12,7 @@ import pytest
 from pydantic import ValidationError
 
 from dsa import (
+    ArtifactRecord,
     Failure,
     RetainedTerminalRecord,
     RunFailure,
@@ -63,6 +64,38 @@ def test_terminal_record_contains_exactly_one_answer_or_failure(tmp_path: Path) 
     assert failure["outcome"]["status"] == "failed"
     assert "answer" not in failure["outcome"]
     assert failure["outcome"]["failure"]["stage"] == "answer_validation"
+
+
+def test_terminal_record_retains_artifact_metadata_without_artifact_bytes(
+    tmp_path: Path,
+) -> None:
+    record = terminal_record(tmp_path).model_copy(
+        update={
+            "artifacts": (
+                ArtifactRecord(
+                    handle="a1",
+                    relative_path="artifacts/a1.parquet",
+                    media_type="application/vnd.apache.parquet",
+                    size_bytes=1024,
+                    sha256="a" * 64,
+                    producer_tool_call_id="query-1",
+                ),
+            )
+        }
+    )
+
+    dumped = record.model_dump(mode="json")
+
+    assert dumped["artifacts"] == [
+        {
+            "handle": "a1",
+            "relative_path": "artifacts/a1.parquet",
+            "media_type": "application/vnd.apache.parquet",
+            "size_bytes": 1024,
+            "sha256": "a" * 64,
+            "producer_tool_call_id": "query-1",
+        }
+    ]
 
 
 def test_terminal_record_independently_rejects_invalid_success_answer(tmp_path: Path) -> None:

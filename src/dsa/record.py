@@ -58,13 +58,29 @@ RunOutcome = Annotated[RunSuccess | RunFailure, Field(discriminator="status")]
 
 
 class ArtifactRecord(ContractModel):
-    """One retained artifact. Milestone 1 records an empty manifest."""
+    """Integrity metadata for one run-private retained artifact."""
 
-    handle: str
+    handle: str = Field(pattern=r"a[1-9][0-9]*")
     relative_path: str
     media_type: str
     size_bytes: Annotated[int, Field(ge=0)]
-    sha256: str
+    sha256: str = Field(pattern=r"[0-9a-f]{64}")
+    producer_tool_call_id: str = Field(min_length=1, max_length=256)
+
+    @model_validator(mode="after")
+    def validate_managed_path(self) -> ArtifactRecord:
+        path = Path(self.relative_path)
+        if path.is_absolute() or len(path.parts) != 2 or path.parts[0] != "artifacts":
+            raise ValueError("artifact path must remain inside the managed artifact directory")
+        if path.name.split(".", 1)[0] != self.handle:
+            raise ValueError("artifact path must be named by its handle")
+        expected_suffix = {
+            "application/json": ".json",
+            "application/vnd.apache.parquet": ".parquet",
+        }.get(self.media_type)
+        if expected_suffix is None or path.suffix != expected_suffix:
+            raise ValueError("artifact path must match its supported media type")
+        return self
 
 
 class TerminalRecord(ContractModel):
@@ -96,6 +112,9 @@ class TerminalRecord(ContractModel):
             errors = list(validator.iter_errors(self.outcome.answer))
             if errors:
                 raise ValueError("successful terminal answer violates the caller schema")
+        expected_handles = [f"a{index}" for index in range(1, len(self.artifacts) + 1)]
+        if [artifact.handle for artifact in self.artifacts] != expected_handles:
+            raise ValueError("artifact handles must be unique and sequential")
         return self
 
 

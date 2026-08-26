@@ -76,10 +76,12 @@ class RunPolicy(ContractModel):
     max_tool_calls: PositiveInt = 40
     max_validation_attempts: PositiveInt = 3
     max_tool_result_bytes: PositiveInt = 32 * 1024
+    max_total_tool_result_bytes: PositiveInt = 256 * 1024
     max_preview_rows: Annotated[int, Field(ge=0, le=5)] = 5
     max_inspection_seconds: PositiveInt = 30
     max_inspection_result_bytes: PositiveInt = 64 * 1024
     max_query_seconds: PositiveInt = 120
+    max_query_memory_bytes: PositiveInt = 512 * 1024 * 1024
     max_query_rows: PositiveInt = 1_000_000
     max_query_result_bytes: PositiveInt = 64 * 1024 * 1024
     max_python_seconds: PositiveInt = 300
