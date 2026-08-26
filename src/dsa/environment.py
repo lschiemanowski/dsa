@@ -54,6 +54,12 @@ _ALLOWED_BOUND_TABLE_FUNCTIONS = frozenset(
 _FORBIDDEN_BOUND_SCALAR_FUNCTIONS = frozenset(
     {"current_setting", "getvariable", "setvariable"}
 )
+_VIEW_DEFINITION = re.compile(
+    r'^\s*CREATE\s+VIEW\s+(?:"(?:[^"]|"")*"|[A-Z_][A-Z0-9_$]*)'
+    r'(?:\s*\.\s*(?:"(?:[^"]|"")*"|[A-Z_][A-Z0-9_$]*))?'
+    r'(?:\s*\((?:[^()"]|"(?:[^"]|"")*")*\))?\s+AS\s+(SELECT\b.*)\s*;\s*$',
+    re.IGNORECASE | re.DOTALL,
+)
 
 
 class ArtifactError(Exception):
@@ -634,35 +640,25 @@ class AnalysisEnvironment:
                         for schema, name, kind in rows
                     ],
                 }
-            relation_rows = connection.execute(
-                "select table_schema, table_name from information_schema.tables "
-                "where table_schema not in ('information_schema', 'pg_catalog') "
-                "order by table_schema, table_name"
-            ).fetchall()
-            selected = next(
-                (
-                    (schema, name)
-                    for schema, name in relation_rows
-                    if _qualified_relation(schema, name) == relation
-                ),
-                None,
-            )
-            if selected is None and relation.count(".") == 1:
-                legacy_schema, legacy_name = relation.split(".", maxsplit=1)
-                selected = next(
-                    (
-                        (schema, name)
-                        for schema, name in relation_rows
-                        if schema == legacy_schema and name == legacy_name
-                    ),
-                    None,
-                )
+            selected = _parse_qualified_relation(relation)
             if selected is None:
                 return _error_value(
                     "relation_not_found",
                     "Use an exact relation name returned by catalog inspection",
                 )
             schema, name = selected
+            matched = connection.execute(
+                "select table_schema, table_name from information_schema.tables "
+                "where table_schema = ? and table_name = ? "
+                "and table_schema not in ('information_schema', 'pg_catalog') limit 1",
+                [schema, name],
+            ).fetchone()
+            if matched is None:
+                return _error_value(
+                    "relation_not_found",
+                    "Use an exact relation name returned by catalog inspection",
+                )
+            schema, name = matched
             rows = connection.execute(
                 "select column_name, data_type, is_nullable "
                 "from information_schema.columns "
@@ -808,6 +804,7 @@ def _validate_bound_query(
     bounded_sql: str,
     submitted_sql: str,
 ) -> None:
+    _validate_function_identities(connection, submitted_sql)
     try:
         connection.execute("pragma disable_optimizer")
         try:
@@ -831,22 +828,183 @@ def _validate_bound_query(
             "query_external_access",
             "Queries may scan only supplied database relations and pure generated tables",
         )
-    side_effect_rows = connection.execute(
-        "select distinct function_name from duckdb_functions() "
-        "where has_side_effects order by function_name"
-    ).fetchall()
-    forbidden_scalars = _FORBIDDEN_BOUND_SCALAR_FUNCTIONS | {
-        cast(str, item[0]).lower() for item in side_effect_rows
-    }
-    plan_text = _canonical_json(plan).lower()
-    if any(
-        re.search(rf"(?<![a-z0-9_]){re.escape(name)}\s*\(", plan_text)
-        for name in forbidden_scalars
-    ):
+
+
+def _validate_function_identities(
+    connection: duckdb.DuckDBPyConnection,
+    submitted_sql: str,
+) -> None:
+    pending_asts = [_serialized_sql_ast(connection, submitted_sql)]
+    expanded_macros: set[tuple[str, str, str]] = set()
+    expanded_views: set[tuple[str, str]] = set()
+    while pending_asts:
+        ast = pending_asts.pop()
+        for requested_schema, name in _function_identities(ast):
+            function_conditions = ["lower(function_name) = ?"]
+            function_parameters = [name]
+            if requested_schema:
+                function_conditions.append("lower(schema_name) = ?")
+                function_parameters.append(requested_schema)
+            side_effect_row = connection.execute(
+                "select coalesce(bool_or(has_side_effects), false) "
+                "from duckdb_functions() where " + " and ".join(function_conditions),
+                function_parameters,
+            ).fetchone()
+            if name in _FORBIDDEN_BOUND_SCALAR_FUNCTIONS or (
+                side_effect_row is not None and side_effect_row[0] is True
+            ):
+                raise ArtifactError(
+                    "query_external_access",
+                    "Queries may not call host metadata or side-effecting functions",
+                )
+            macro_conditions = [
+                *function_conditions,
+                "function_type in ('macro', 'table_macro')",
+            ]
+            macro_rows = connection.execute(
+                "select lower(schema_name), function_type, macro_definition "
+                "from duckdb_functions() where "
+                + " and ".join(macro_conditions)
+                + " order by database_name, schema_name, function_oid limit 101",
+                function_parameters,
+            ).fetchall()
+            if len(macro_rows) > 100:
+                raise ArtifactError(
+                    "query_policy_complexity",
+                    "The query references too many same-named macros to validate safely",
+                )
+            for schema, function_type, definition in macro_rows:
+                identity = (cast(str, schema), name, cast(str, function_type))
+                if identity in expanded_macros:
+                    continue
+                _check_policy_expansion(len(expanded_macros) + len(expanded_views), definition)
+                expanded_macros.add(identity)
+                macro_sql = (
+                    definition if function_type == "table_macro" else f"select {definition}"
+                )
+                pending_asts.append(_serialized_sql_ast(connection, macro_sql))
+
+        cte_names = _cte_names(ast)
+        for requested_schema, name in _relation_identities(ast):
+            if not requested_schema and name in cte_names:
+                continue
+            conditions = ["lower(table_name) = ?"]
+            parameters = [name]
+            if requested_schema:
+                conditions.append("lower(table_schema) = ?")
+                parameters.append(requested_schema)
+            view_rows = connection.execute(
+                "select lower(table_schema), lower(table_name), view_definition "
+                "from information_schema.views where "
+                + " and ".join(conditions)
+                + " order by table_schema, table_name limit 101",
+                parameters,
+            ).fetchall()
+            if len(view_rows) > 100:
+                raise ArtifactError(
+                    "query_policy_complexity",
+                    "The query references too many same-named views to validate safely",
+                )
+            for schema, view_name, definition in view_rows:
+                identity = (cast(str, schema), cast(str, view_name))
+                if identity in expanded_views:
+                    continue
+                _check_policy_expansion(len(expanded_macros) + len(expanded_views), definition)
+                view_sql = _view_select_sql(cast(str, definition))
+                if view_sql is None:
+                    raise ArtifactError(
+                        "query_policy_unavailable",
+                        "DuckDB could not serialize a referenced view for policy validation",
+                    )
+                expanded_views.add(identity)
+                pending_asts.append(_serialized_sql_ast(connection, view_sql))
+
+
+def _check_policy_expansion(count: int, definition: object) -> None:
+    if count >= 100 or not isinstance(definition, str):
         raise ArtifactError(
-            "query_external_access",
-            "Queries may not call host metadata or side-effecting functions",
+            "query_policy_complexity",
+            "The query expansion is too complex to validate safely",
         )
+
+
+def _serialized_sql_ast(
+    connection: duckdb.DuckDBPyConnection,
+    sql: str,
+) -> JsonValue:
+    row = connection.execute("select json_serialize_sql(?)", [sql]).fetchone()
+    if row is None or not isinstance(row[0], str):
+        raise ArtifactError(
+            "query_policy_unavailable",
+            "DuckDB could not serialize the query for policy validation",
+        )
+    parsed = cast(JsonValue, json.loads(row[0]))
+    if not isinstance(parsed, dict) or parsed.get("error") is not False:
+        raise ArtifactError(
+            "query_policy_unavailable",
+            "DuckDB could not serialize the query for policy validation",
+        )
+    return parsed
+
+
+def _function_identities(value: JsonValue) -> set[tuple[str, str]]:
+    identities: set[tuple[str, str]] = set()
+    if isinstance(value, dict):
+        mapping = cast(dict[str, JsonValue], value)
+        if mapping.get("class") == "FUNCTION":
+            name = mapping.get("function_name")
+            schema = mapping.get("schema")
+            if isinstance(name, str) and isinstance(schema, str):
+                identities.add((schema.lower(), name.lower()))
+        for child in mapping.values():
+            identities.update(_function_identities(child))
+    elif isinstance(value, list):
+        for child in cast(list[JsonValue], value):
+            identities.update(_function_identities(child))
+    return identities
+
+
+def _relation_identities(value: JsonValue) -> set[tuple[str, str]]:
+    identities: set[tuple[str, str]] = set()
+    if isinstance(value, dict):
+        mapping = cast(dict[str, JsonValue], value)
+        if mapping.get("type") == "BASE_TABLE":
+            name = mapping.get("table_name")
+            schema = mapping.get("schema_name")
+            if isinstance(name, str) and isinstance(schema, str):
+                identities.add((schema.lower(), name.lower()))
+        for child in mapping.values():
+            identities.update(_relation_identities(child))
+    elif isinstance(value, list):
+        for child in cast(list[JsonValue], value):
+            identities.update(_relation_identities(child))
+    return identities
+
+
+def _cte_names(value: JsonValue) -> set[str]:
+    names: set[str] = set()
+    if isinstance(value, dict):
+        mapping = cast(dict[str, JsonValue], value)
+        cte_map = mapping.get("cte_map")
+        if isinstance(cte_map, dict):
+            entries = cast(dict[str, JsonValue], cte_map).get("map")
+            if isinstance(entries, list):
+                for entry in cast(list[JsonValue], entries):
+                    if isinstance(entry, dict):
+                        key = cast(dict[str, JsonValue], entry).get("key")
+                        if isinstance(key, str):
+                            names.add(key.lower())
+        for child in mapping.values():
+            names.update(_cte_names(child))
+    elif isinstance(value, list):
+        for child in cast(list[JsonValue], value):
+            names.update(_cte_names(child))
+    return names
+
+
+def _view_select_sql(definition: str) -> str | None:
+    match = _VIEW_DEFINITION.fullmatch(definition)
+    return match.group(1) if match is not None else None
 
 
 def _bound_table_functions(value: JsonValue) -> set[str]:
@@ -872,6 +1030,46 @@ def _qualified_relation(schema: str, name: str) -> str:
 
 def _quote_identifier(value: str) -> str:
     return '"' + value.replace('"', '""') + '"'
+
+
+def _parse_qualified_relation(value: str) -> tuple[str, str] | None:
+    if not value.startswith('"'):
+        if value.count(".") != 1:
+            return None
+        schema, name = value.split(".", maxsplit=1)
+        return (schema, name) if schema and name else None
+
+    def parse_identifier(offset: int) -> tuple[str, int] | None:
+        if offset >= len(value) or value[offset] != '"':
+            return None
+        offset += 1
+        characters: list[str] = []
+        while offset < len(value):
+            character = value[offset]
+            if character != '"':
+                characters.append(character)
+                offset += 1
+                continue
+            if offset + 1 < len(value) and value[offset + 1] == '"':
+                characters.append('"')
+                offset += 2
+                continue
+            return "".join(characters), offset + 1
+        return None
+
+    parsed_schema = parse_identifier(0)
+    if parsed_schema is None:
+        return None
+    schema, offset = parsed_schema
+    if offset >= len(value) or value[offset] != ".":
+        return None
+    parsed_name = parse_identifier(offset + 1)
+    if parsed_name is None:
+        return None
+    name, offset = parsed_name
+    if offset != len(value) or not schema or not name:
+        return None
+    return schema, name
 
 
 def _python_request_issue(

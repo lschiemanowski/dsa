@@ -25,10 +25,14 @@ does not fit its byte limit, it returns the bounded prefix with `complete` set t
 statement, including statements surrounded by SQL comments. The connection is
 read-only and external access is disabled. Before execution, DuckDB binds the query
 inside a host-generated parameterized row-limit wrapper with optimization disabled.
-The host inspects that pre-optimization bound plan, where scalar function identities
-remain visible, and rejects writes, multiple statements, external scans, host metadata
-access, side-effecting functions, and macros that expand to those operations. Normal
-optimization is restored before an accepted query executes.
+The host validates scalar identities from DuckDB's structured serialized SQL tree,
+recursively applying the same check to referenced macro and view definitions. This
+preserves function calls independently of projection aliases and distinguishes calls
+from string literals. The pre-optimization bound plan separately enforces the table
+scan allowlist. Together these checks reject writes, multiple statements, external
+scans, host metadata access, side-effecting functions, and stored definitions that
+expand to those operations. Normal optimization is restored before an accepted query
+executes.
 
 The host enforces elapsed time, DuckDB memory, row-count, materialized-result byte,
 artifact, per-tool response, and cumulative model-visible response limits.
@@ -107,8 +111,9 @@ preservation, inline transport, automatic Parquet transport, full retained row
 content, bounded previews, query rejection without partial publication, artifact
 integrity and replacement races, transactional multi-output rollback, complete
 Parquet validation, executor-output replacement races, ambiguous quoted relation names,
-constant-folded and macro-expanded forbidden SQL calls, managed Python inputs and
-outputs, direct and artifact-backed final output, per-result and cumulative
+constant-folded, aliased, macro-expanded, and view-contained forbidden SQL calls,
+function-like string literals, bounded targeted catalog lookup, managed Python inputs
+and outputs, direct and artifact-backed final output, per-result and cumulative
 retry-feedback limits, terminal-record safety, and all Milestone 1 behavior.
 
 Docker, writable database copies, rollback, Databricks MLflow, live providers, a CLI,

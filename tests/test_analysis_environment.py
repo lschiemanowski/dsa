@@ -46,6 +46,10 @@ def database_fixture(tmp_path: Path) -> Path:
             "create macro unsafe_secret_directory() "
             "as current_setting('secret_directory')"
         )
+        connection.execute(
+            "create view analytics.unsafe_secret_view as "
+            "select current_setting('secret_directory') as benign"
+        )
     finally:
         connection.close()
     return path
@@ -81,6 +85,7 @@ async def test_inspection_is_sorted_schema_qualified_and_schema_only(tmp_path: P
         "relations": [
             {"name": '"analytics"."event_count"', "type": "VIEW"},
             {"name": '"analytics"."events"', "type": "BASE TABLE"},
+            {"name": '"analytics"."unsafe_secret_view"', "type": "VIEW"},
         ],
     }
     assert relation == {
@@ -172,6 +177,49 @@ async def test_query_rejects_writes_multiple_statements_and_external_sources(
             tool_call_id="query-macro-secret-directory",
         )
     )
+    aliased_write = json.loads(
+        await runtime.query_database(
+            "select write_log('hello') as benign",
+            tool_call_id="query-aliased-write",
+        )
+    )
+    aliased_secret_directory = json.loads(
+        await runtime.query_database(
+            "select current_setting('secret_directory') as benign",
+            tool_call_id="query-aliased-secret-directory",
+        )
+    )
+    aliased_macro_write = json.loads(
+        await runtime.query_database(
+            "select unsafe_log() as benign",
+            tool_call_id="query-aliased-macro-write",
+        )
+    )
+    harmless_literal = json.loads(
+        await runtime.query_database(
+            "select 1 as value where 'write_log(' = 'write_log('",
+            tool_call_id="query-harmless-function-literal",
+        )
+    )
+    unsafe_view = json.loads(
+        await runtime.query_database(
+            "select * from analytics.unsafe_secret_view",
+            tool_call_id="query-unsafe-view",
+        )
+    )
+    safe_cte_shadow = json.loads(
+        await runtime.query_database(
+            "with unsafe_secret_view as (select 1 as value) "
+            "select value from unsafe_secret_view",
+            tool_call_id="query-safe-cte-shadow",
+        )
+    )
+    safe_view = json.loads(
+        await runtime.query_database(
+            "select count from analytics.event_count",
+            tool_call_id="query-safe-view",
+        )
+    )
 
     assert write["error"]["code"] == "query_not_read_only"
     assert multiple["error"]["code"] == "query_statement_count"
@@ -183,9 +231,17 @@ async def test_query_rejects_writes_multiple_statements_and_external_sources(
     assert macro_settings["error"]["code"] == "query_external_access"
     assert secret_directory["error"]["code"] == "query_external_access"
     assert macro_secret_directory["error"]["code"] == "query_external_access"
+    assert aliased_write["error"]["code"] == "query_external_access"
+    assert aliased_secret_directory["error"]["code"] == "query_external_access"
+    assert aliased_macro_write["error"]["code"] == "query_external_access"
+    assert harmless_literal["rows"] == [[1]]
+    assert unsafe_view["error"]["code"] == "query_external_access"
+    assert safe_cte_shadow["rows"] == [[1]]
+    assert safe_view["rows"] == [[12]]
     assert "stored_secrets" not in json.dumps(secret_catalog)
     assert "stored_secrets" not in json.dumps(secret_directory)
     assert "stored_secrets" not in json.dumps(macro_secret_directory)
+    assert "stored_secrets" not in json.dumps(unsafe_view)
     assert "temp_directory" not in json.dumps(settings)
     assert sha256(runtime.database_path.read_bytes()).hexdigest() == before
     assert runtime.artifact_records == ()
@@ -199,6 +255,8 @@ async def test_catalog_preserves_ambiguous_identifier_boundaries(tmp_path: Path)
         connection.execute('create table "a.b".t(dotted_schema integer)')
         connection.execute("create schema a")
         connection.execute('create table a."b.t"(dotted_relation varchar)')
+        connection.execute('create schema "q""uote"')
+        connection.execute('create table "q""uote"."n""ame"(quoted_identifier boolean)')
     finally:
         connection.close()
     run_directory = tmp_path / "run"
@@ -217,11 +275,91 @@ async def test_catalog_preserves_ambiguous_identifier_boundaries(tmp_path: Path)
     dotted_relation = json.loads(
         await runtime.inspect_database('"a"."b.t"', tool_call_id="inspect-dotted-relation")
     )
+    quoted_identifier = json.loads(
+        await runtime.inspect_database(
+            '"q""uote"."n""ame"',
+            tool_call_id="inspect-quoted-identifier",
+        )
+    )
 
     assert '"a.b"."t"' in names
     assert '"a"."b.t"' in names
+    assert '"q""uote"."n""ame"' in names
     assert dotted_schema["columns"][0]["name"] == "dotted_schema"
     assert dotted_relation["columns"][0]["name"] == "dotted_relation"
+    assert quoted_identifier["columns"][0]["name"] == "quoted_identifier"
+
+
+async def test_targeted_inspection_does_not_materialize_the_catalog(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Cursor:
+        def __init__(
+            self,
+            *,
+            row: tuple[str, str] | None = None,
+            rows: list[tuple[str, str, str]] | None = None,
+            forbid_fetchall: bool = False,
+        ) -> None:
+            self.row = row
+            self.rows = rows or []
+            self.forbid_fetchall = forbid_fetchall
+
+        def fetchone(self) -> tuple[str, str] | None:
+            return self.row
+
+        def fetchall(self) -> list[tuple[str, str, str]]:
+            if self.forbid_fetchall:
+                raise AssertionError("targeted inspection materialized the catalog")
+            return self.rows
+
+    class Connection:
+        def execute(
+            self,
+            sql: str,
+            parameters: list[str] | None = None,
+        ) -> Cursor:
+            if "select table_schema, table_name" in sql:
+                assert parameters == ["analytics", "events"]
+                assert "limit 1" in sql.lower()
+                return Cursor(row=("analytics", "events"), forbid_fetchall=True)
+            assert "information_schema.columns" in sql
+            assert parameters == ["analytics", "events"]
+            return Cursor(rows=[("event_id", "INTEGER", "YES")])
+
+        def interrupt(self) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+    connection = Connection()
+
+    def open_connection(_path: Path, _memory_bytes: int) -> Connection:
+        return connection
+
+    monkeypatch.setattr(
+        environment_module,
+        "_open_connection",
+        open_connection,
+    )
+    run_directory = tmp_path / "run"
+    run_directory.mkdir()
+    runtime = AnalysisEnvironment(
+        database_path=tmp_path / "unused.duckdb",
+        run_directory=run_directory,
+        policy=RunPolicy(),
+    )
+
+    result = json.loads(
+        await runtime.inspect_database('"analytics"."events"', tool_call_id="inspect-one")
+    )
+
+    assert result["relation"] == '"analytics"."events"'
+    assert result["columns"] == [
+        {"name": "event_id", "type": "INTEGER", "nullable": True}
+    ]
 
 
 async def test_small_complete_query_result_stays_inline(tmp_path: Path) -> None:
