@@ -112,6 +112,45 @@ async def test_framework_output_schema_does_not_mutate_caller_schema(tmp_path: P
     ] == expected_schema
 
 
+async def test_typed_request_is_snapshotted_before_model_execution(tmp_path: Path) -> None:
+    request = valid_request(tmp_path, max_validation_attempts=1)
+    expected_request = request.model_dump(mode="json")
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def respond(_messages: list[Any], info: AgentInfo) -> ModelResponse:
+        entered.set()
+        await release.wait()
+        return ModelResponse(
+            parts=[ToolCallPart(info.output_tools[0].name, {"count": 3}, "answer")]
+        )
+
+    task = asyncio.create_task(
+        run_analysis(
+            request,
+            runs_directory=tmp_path / "runs",
+            model=FunctionModel(respond, model_name="test"),
+            identity_factory=lambda: "run-request-snapshot",
+            clock=clock(),
+        )
+    )
+    await entered.wait()
+    properties = request.answer_schema["properties"]
+    assert isinstance(properties, dict)
+    count_schema = properties["count"]
+    assert isinstance(count_schema, dict)
+    count_schema["type"] = "string"
+    request.model.settings["temperature"] = 1
+    release.set()
+
+    completion = await task
+
+    assert isinstance(completion.outcome, RunSuccess)
+    assert completion.outcome.answer == {"count": 3}
+    assert completion.record.request.model_dump(mode="json") == expected_request
+    assert json.loads(completion.retained_record.path.read_bytes())["request"] == expected_request
+
+
 async def test_schema_validation_feedback_retries_then_accepts_exact_answer(
     tmp_path: Path,
 ) -> None:
