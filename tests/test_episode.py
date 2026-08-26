@@ -3,13 +3,14 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import Callable
+from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
 
 import pytest
 from pydantic import ValidationError
-from pydantic_ai import ModelHTTPError
+from pydantic_ai import ModelAPIError, ModelHTTPError
 from pydantic_ai.messages import ModelResponse, ToolCallPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.models.test import TestModel
@@ -90,6 +91,25 @@ async def test_valid_structured_answer_succeeds_and_retains_native_messages(
     retained = json.loads(completion.retained_record.path.read_bytes())
     assert retained["outcome"] == {"status": "succeeded", "answer": {"count": 3}}
     assert retained["messages"] == list(completion.record.messages)
+
+
+async def test_framework_output_schema_does_not_mutate_caller_schema(tmp_path: Path) -> None:
+    request = valid_request(tmp_path)
+    expected_schema = deepcopy(request.answer_schema)
+
+    completion = await run_analysis(
+        request,
+        runs_directory=tmp_path / "runs",
+        model=TestModel(call_tools=[], custom_output_args={"count": 3}),
+        identity_factory=lambda: "run-schema-snapshot",
+        clock=clock(),
+    )
+
+    assert request.answer_schema == expected_schema
+    assert completion.record.request.answer_schema == expected_schema
+    assert json.loads(completion.retained_record.path.read_bytes())["request"][
+        "answer_schema"
+    ] == expected_schema
 
 
 async def test_schema_validation_feedback_retries_then_accepts_exact_answer(
@@ -173,6 +193,30 @@ async def test_provider_failure_preserves_specific_safe_diagnostics(tmp_path: Pa
     assert failure.code == "model_http_error"
     assert failure.diagnostics["status_code"] == 503
     assert failure.diagnostics["model_name"] == "test"
+
+
+async def test_provider_failure_does_not_retain_raw_api_error_text(tmp_path: Path) -> None:
+    private_detail = "https://private.invalid/api?token=do-not-retain"
+
+    async def respond(_messages: list[Any], _info: AgentInfo) -> ModelResponse:
+        raise ModelAPIError("test", f"request failed at {private_detail}")
+
+    completion = await run_analysis(
+        valid_request(tmp_path),
+        runs_directory=tmp_path / "runs",
+        model=FunctionModel(respond, model_name="test"),
+        identity_factory=lambda: "run-api-failure",
+        clock=clock(),
+    )
+
+    assert isinstance(completion.outcome, RunFailure)
+    failure = completion.outcome.failure
+    assert failure.code == "model_api_error"
+    assert failure.diagnostics == {
+        "model_name": "test",
+        "exception_type": "ModelAPIError",
+    }
+    assert private_detail not in completion.retained_record.path.read_text()
 
 
 async def test_provider_failure_after_invalid_answer_is_not_misclassified(

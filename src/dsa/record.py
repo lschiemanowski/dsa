@@ -137,7 +137,8 @@ def write_terminal_record(
             handle.write(content)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temporary, destination)
+        os.link(temporary, destination)
+        temporary.unlink()
         _fsync_directory(run_directory)
     except BaseException:
         if descriptor is not None:

@@ -8,6 +8,7 @@ dependencies = [
     "jsonschema>=4.25,<5",
     "pydantic>=2.12,<3",
     "pydantic-ai-slim[openai]>=1.107,<2",
+    "referencing>=0.37,<1",
 ]
 
 [dependency-groups]

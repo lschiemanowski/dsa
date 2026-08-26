@@ -2,15 +2,18 @@ from __future__ import annotations
 
 import json
 import stat
+from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
+from threading import Barrier
 
 import pytest
 from pydantic import ValidationError
 
 from dsa import (
     Failure,
+    RetainedTerminalRecord,
     RunFailure,
     RunRequest,
     RunSuccess,
@@ -112,22 +115,65 @@ def test_equivalent_record_mappings_have_identical_retained_bytes(tmp_path: Path
     assert first_retained.path.read_bytes() == second_retained.path.read_bytes()
 
 
-def test_failed_atomic_replace_leaves_no_terminal_or_temporary_file(
+def test_failed_atomic_publication_leaves_no_terminal_or_temporary_file(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     run_directory = tmp_path / "run-001"
     run_directory.mkdir()
 
-    def fail_replace(source: Path, destination: Path) -> None:
-        raise OSError("simulated replacement failure")
+    def fail_link(source: Path, destination: Path) -> None:
+        raise OSError("simulated publication failure")
 
-    monkeypatch.setattr("dsa.record.os.replace", fail_replace)
+    monkeypatch.setattr("dsa.record.os.link", fail_link)
 
     with pytest.raises(OSError, match="simulated"):
         write_terminal_record(terminal_record(tmp_path), run_directory)
 
     assert list(run_directory.iterdir()) == []
+
+
+def test_concurrent_writers_publish_exactly_one_matching_record(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_directory = tmp_path / "run-001"
+    run_directory.mkdir()
+    destination = run_directory / "terminal.json"
+    first = terminal_record(tmp_path)
+    second = first.model_copy(update={"usage": {"requests": 2}})
+    exists_barrier = Barrier(2)
+    original_exists = Path.exists
+
+    def synchronized_exists(path: Path) -> bool:
+        result = original_exists(path)
+        if path == destination:
+            exists_barrier.wait()
+        return result
+
+    monkeypatch.setattr(Path, "exists", synchronized_exists)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures: list[Future[RetainedTerminalRecord]] = [
+            executor.submit(write_terminal_record, record, run_directory)
+            for record in (first, second)
+        ]
+
+    retained: list[RetainedTerminalRecord] = []
+    errors: list[BaseException] = []
+    for future in futures:
+        try:
+            retained.append(future.result())
+        except BaseException as error:
+            errors.append(error)
+
+    assert len(retained) == 1
+    assert len(errors) == 1
+    assert isinstance(errors[0], FileExistsError)
+    content = destination.read_bytes()
+    assert retained[0].sha256 == sha256(content).hexdigest()
+    assert retained[0].byte_length == len(content)
+    assert list(run_directory.iterdir()) == [destination]
 
 
 @pytest.mark.parametrize("run_id", ["../escape", "contains/slash", "", " two"])

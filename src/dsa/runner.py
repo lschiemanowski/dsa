@@ -6,6 +6,7 @@ import asyncio
 import json
 import re
 from collections.abc import Callable, Iterable
+from copy import deepcopy
 from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
@@ -214,10 +215,10 @@ def _framework_schema(
     wrapped: bool,
 ) -> dict[str, Any]:
     if not wrapped:
-        return caller_schema
+        return deepcopy(caller_schema)
     return {
         "type": "object",
-        "properties": {"value": caller_schema},
+        "properties": {"value": deepcopy(caller_schema)},
         "required": ["value"],
         "additionalProperties": False,
     }
@@ -265,7 +266,6 @@ def _failure_outcome(error: Exception, validation_failures: int) -> RunFailure:
                 diagnostics={
                     "model_name": error.model_name,
                     "exception_type": type(error).__name__,
-                    "detail": _bounded_text(str(error)),
                 },
             )
         )

@@ -11,6 +11,7 @@ from jsonschema import Draft202012Validator
 from jsonschema.exceptions import SchemaError
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_validator, model_validator
 from pydantic_core import PydanticCustomError
+from referencing.jsonschema import DRAFT202012
 
 DRAFT_2020_12 = "https://json-schema.org/draft/2020-12/schema"
 PositiveInt = Annotated[int, Field(gt=0)]
@@ -138,22 +139,18 @@ class RunRequest(ContractModel):
         return deepcopy(value)
 
 
-def _first_external_reference(value: JsonValue) -> str | None:
-    if isinstance(value, dict):
-        mapping = cast(dict[str, JsonValue], value)
-        reference = mapping.get("$ref")
-        if isinstance(reference, str) and not reference.startswith("#"):
-            return reference
-        for child in mapping.values():
-            nested = _first_external_reference(child)
-            if nested is not None:
-                return nested
-    elif isinstance(value, list):
-        sequence = cast(list[JsonValue], value)
-        for child in sequence:
-            nested = _first_external_reference(child)
-            if nested is not None:
-                return nested
+def _first_external_reference(value: dict[str, JsonValue]) -> str | None:
+    resources = [DRAFT202012.create_resource(value)]
+    while resources:
+        resource = resources.pop()
+        contents = resource.contents
+        if isinstance(contents, dict):
+            mapping = cast(dict[str, JsonValue], contents)
+            for keyword in ("$ref", "$dynamicRef"):
+                reference = mapping.get(keyword)
+                if isinstance(reference, str) and not reference.startswith("#"):
+                    return reference
+        resources.extend(resource.subresources())
     return None
 
 

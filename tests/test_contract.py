@@ -128,6 +128,25 @@ def test_answer_contract_allows_local_refs_but_rejects_external_refs(tmp_path: P
         RunRequest.model_validate(external)
 
 
+def test_answer_contract_inspects_references_only_in_schema_locations(tmp_path: Path) -> None:
+    literal = request_value(tmp_path / "source.duckdb")
+    literal["answer_schema"] = {
+        "$schema": DRAFT_2020_12,
+        "const": {"$ref": "https://example.invalid/literal-value"},
+    }
+    dynamic = request_value(tmp_path / "source.duckdb")
+    dynamic["answer_schema"] = {
+        "$schema": DRAFT_2020_12,
+        "$dynamicRef": "https://example.invalid/schema.json#node",
+    }
+
+    assert RunRequest.model_validate(literal).answer_schema["const"] == {
+        "$ref": "https://example.invalid/literal-value"
+    }
+    with pytest.raises(ValidationError, match="external references"):
+        RunRequest.model_validate(dynamic)
+
+
 @pytest.mark.parametrize(
     "settings",
     [
