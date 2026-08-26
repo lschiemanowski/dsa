@@ -50,6 +50,14 @@ def database_fixture(tmp_path: Path) -> Path:
             "create view analytics.unsafe_secret_view as "
             "select current_setting('secret_directory') as benign"
         )
+        connection.execute(
+            "create view unsafe_v as "
+            "select current_setting('secret_directory') as benign"
+        )
+        connection.execute(
+            "create view analytics.safe_with_view as "
+            "with q as (select 7 as value) select value from q"
+        )
     finally:
         connection.close()
     return path
@@ -85,7 +93,9 @@ async def test_inspection_is_sorted_schema_qualified_and_schema_only(tmp_path: P
         "relations": [
             {"name": '"analytics"."event_count"', "type": "VIEW"},
             {"name": '"analytics"."events"', "type": "BASE TABLE"},
+            {"name": '"analytics"."safe_with_view"', "type": "VIEW"},
             {"name": '"analytics"."unsafe_secret_view"', "type": "VIEW"},
+            {"name": '"main"."unsafe_v"', "type": "VIEW"},
         ],
     }
     assert relation == {
@@ -220,6 +230,19 @@ async def test_query_rejects_writes_multiple_statements_and_external_sources(
             tool_call_id="query-safe-view",
         )
     )
+    nested_cte_name = json.loads(
+        await runtime.query_database(
+            "select * from unsafe_v where exists ("
+            "with unsafe_v as (select 1 as value) select 1)",
+            tool_call_id="query-nested-cte-name",
+        )
+    )
+    safe_with_view = json.loads(
+        await runtime.query_database(
+            "select value from analytics.safe_with_view",
+            tool_call_id="query-safe-with-view",
+        )
+    )
 
     assert write["error"]["code"] == "query_not_read_only"
     assert multiple["error"]["code"] == "query_statement_count"
@@ -238,10 +261,13 @@ async def test_query_rejects_writes_multiple_statements_and_external_sources(
     assert unsafe_view["error"]["code"] == "query_external_access"
     assert safe_cte_shadow["rows"] == [[1]]
     assert safe_view["rows"] == [[12]]
+    assert nested_cte_name["error"]["code"] == "query_external_access"
+    assert safe_with_view["rows"] == [[7]]
     assert "stored_secrets" not in json.dumps(secret_catalog)
     assert "stored_secrets" not in json.dumps(secret_directory)
     assert "stored_secrets" not in json.dumps(macro_secret_directory)
     assert "stored_secrets" not in json.dumps(unsafe_view)
+    assert "stored_secrets" not in json.dumps(nested_cte_name)
     assert "temp_directory" not in json.dumps(settings)
     assert sha256(runtime.database_path.read_bytes()).hexdigest() == before
     assert runtime.artifact_records == ()
@@ -305,9 +331,13 @@ async def test_targeted_inspection_does_not_materialize_the_catalog(
             self.row = row
             self.rows = rows or []
             self.forbid_fetchall = forbid_fetchall
+            self.row_consumed = False
 
-        def fetchone(self) -> tuple[str, str] | None:
-            return self.row
+        def fetchone(self) -> tuple[str, ...] | None:
+            if self.row is not None and not self.row_consumed:
+                self.row_consumed = True
+                return self.row
+            return self.rows.pop(0) if self.rows else None
 
         def fetchall(self) -> list[tuple[str, str, str]]:
             if self.forbid_fetchall:
@@ -360,6 +390,57 @@ async def test_targeted_inspection_does_not_materialize_the_catalog(
     assert result["columns"] == [
         {"name": "event_id", "type": "INTEGER", "nullable": True}
     ]
+
+
+async def test_catalog_inspection_stops_reading_at_its_byte_limit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Cursor:
+        def __init__(self) -> None:
+            self.reads = 0
+
+        def fetchone(self) -> tuple[str, str, str] | None:
+            self.reads += 1
+            return ("analytics", f"relation_{self.reads:04d}", "BASE TABLE")
+
+        def fetchall(self) -> list[tuple[str, str, str]]:
+            raise AssertionError("catalog inspection materialized every relation")
+
+    class Connection:
+        def __init__(self) -> None:
+            self.cursor = Cursor()
+
+        def execute(self, sql: str) -> Cursor:
+            assert "information_schema.tables" in sql
+            return self.cursor
+
+        def interrupt(self) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+    connection = Connection()
+
+    def open_connection(_path: Path, _memory_bytes: int) -> Connection:
+        return connection
+
+    monkeypatch.setattr(environment_module, "_open_connection", open_connection)
+    run_directory = tmp_path / "run"
+    run_directory.mkdir()
+    runtime = AnalysisEnvironment(
+        database_path=tmp_path / "unused.duckdb",
+        run_directory=run_directory,
+        policy=RunPolicy(max_inspection_result_bytes=160),
+    )
+
+    result = json.loads(await runtime.inspect_database(None, tool_call_id="inspect-bounded"))
+
+    assert result["ok"] is True
+    assert result["complete"] is False
+    assert 0 < len(result["relations"]) < connection.cursor.reads
+    assert connection.cursor.reads < 10
 
 
 async def test_small_complete_query_result_stays_inline(tmp_path: Path) -> None:

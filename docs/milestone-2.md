@@ -18,21 +18,25 @@ called without a relation. Each relation is represented as a canonical quoted Du
 identifier such as `"analytics"."events"`, preserving dots and quotes inside either
 identifier component. Passing that exact returned name yields ordered column names,
 DuckDB types, and nullability. It never returns rows. When the catalog or column list
-does not fit its byte limit, it returns the bounded prefix with `complete` set to
-`false`.
+does not fit its byte limit, the host stops reading the sorted cursor and returns the
+bounded prefix with `complete` set to `false`. Neither catalog nor column inspection
+materializes metadata beyond the model-visible byte budget.
 
 `query_database` accepts exactly one DuckDB-parsed `SELECT`, `WITH`, or `VALUES`
 statement, including statements surrounded by SQL comments. The connection is
 read-only and external access is disabled. Before execution, DuckDB binds the query
 inside a host-generated parameterized row-limit wrapper with optimization disabled.
 The host validates scalar identities from DuckDB's structured serialized SQL tree,
-recursively applying the same check to referenced macro and view definitions. This
-preserves function calls independently of projection aliases and distinguishes calls
-from string literals. The pre-optimization bound plan separately enforces the table
-scan allowlist. Together these checks reject writes, multiple statements, external
-scans, host metadata access, side-effecting functions, and stored definitions that
-expand to those operations. Normal optimization is restored before an accepted query
-executes.
+recursively applying the same check to referenced macro and view definitions. Relation
+references are resolved against their actual lexical CTE scope, including ordered and
+recursive definitions, so nested names cannot suppress unrelated view validation.
+Stored view bodies beginning with either `SELECT` or `WITH` pass through the same
+structured parser. This preserves function calls independently of projection aliases
+and distinguishes calls from string literals. The pre-optimization bound plan
+separately enforces the table scan allowlist. Together these checks reject writes,
+multiple statements, external scans, host metadata access, side-effecting functions,
+and stored definitions that expand to those operations. Normal optimization is
+restored before an accepted query executes.
 
 The host enforces elapsed time, DuckDB memory, row-count, materialized-result byte,
 artifact, per-tool response, and cumulative model-visible response limits.
@@ -112,8 +116,9 @@ content, bounded previews, query rejection without partial publication, artifact
 integrity and replacement races, transactional multi-output rollback, complete
 Parquet validation, executor-output replacement races, ambiguous quoted relation names,
 constant-folded, aliased, macro-expanded, and view-contained forbidden SQL calls,
-function-like string literals, bounded targeted catalog lookup, managed Python inputs
-and outputs, direct and artifact-backed final output, per-result and cumulative
+function-like string literals, lexical nested CTEs, `WITH`-based stored views, streamed
+catalog and column limits, bounded targeted catalog lookup, managed Python inputs and
+outputs, direct and artifact-backed final output, per-result and cumulative
 retry-feedback limits, terminal-record safety, and all Milestone 1 behavior.
 
 Docker, writable database copies, rollback, Databricks MLflow, live providers, a CLI,

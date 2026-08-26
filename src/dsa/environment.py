@@ -57,7 +57,7 @@ _FORBIDDEN_BOUND_SCALAR_FUNCTIONS = frozenset(
 _VIEW_DEFINITION = re.compile(
     r'^\s*CREATE\s+VIEW\s+(?:"(?:[^"]|"")*"|[A-Z_][A-Z0-9_$]*)'
     r'(?:\s*\.\s*(?:"(?:[^"]|"")*"|[A-Z_][A-Z0-9_$]*))?'
-    r'(?:\s*\((?:[^()"]|"(?:[^"]|"")*")*\))?\s+AS\s+(SELECT\b.*)\s*;\s*$',
+    r'(?:\s*\((?:[^()"]|"(?:[^"]|"")*")*\))?\s+AS\s+(.+)\s*;\s*$',
     re.IGNORECASE | re.DOTALL,
 )
 
@@ -626,20 +626,13 @@ class AnalysisEnvironment:
         timer = _interrupt_after(connection, self.policy.max_inspection_seconds, timed_out)
         try:
             if relation is None:
-                rows = connection.execute(
+                cursor = connection.execute(
                     "select table_schema, table_name, table_type "
                     "from information_schema.tables "
                     "where table_schema not in ('information_schema', 'pg_catalog') "
                     "order by table_schema, table_name"
-                ).fetchall()
-                return {
-                    "ok": True,
-                    "complete": True,
-                    "relations": [
-                        {"name": _qualified_relation(schema, name), "type": kind}
-                        for schema, name, kind in rows
-                    ],
-                }
+                )
+                return _stream_catalog(cursor, self._inspection_result_limit())
             selected = _parse_qualified_relation(relation)
             if selected is None:
                 return _error_value(
@@ -659,26 +652,17 @@ class AnalysisEnvironment:
                     "Use an exact relation name returned by catalog inspection",
                 )
             schema, name = matched
-            rows = connection.execute(
+            cursor = connection.execute(
                 "select column_name, data_type, is_nullable "
                 "from information_schema.columns "
                 "where table_schema = ? and table_name = ? order by ordinal_position",
                 [schema, name],
-            ).fetchall()
-            if not rows:
-                return _error_value(
-                    "relation_not_found",
-                    "No relation with that schema-qualified name was found",
-                )
-            return {
-                "ok": True,
-                "complete": True,
-                "relation": _qualified_relation(schema, name),
-                "columns": [
-                    {"name": column, "type": kind, "nullable": nullable == "YES"}
-                    for column, kind, nullable in rows
-                ],
-            }
+            )
+            return _stream_columns(
+                cursor,
+                _qualified_relation(schema, name),
+                self._inspection_result_limit(),
+            )
         except duckdb.Error as error:
             if timed_out.is_set():
                 raise TimeoutError from error
@@ -686,6 +670,12 @@ class AnalysisEnvironment:
         finally:
             timer.cancel()
             connection.close()
+
+    def _inspection_result_limit(self) -> int:
+        return min(
+            self.policy.max_inspection_result_bytes,
+            self.policy.max_tool_result_bytes,
+        )
 
     def _check_database_sync(self) -> None:
         connection = _open_connection(self.database_path, self.policy.max_query_memory_bytes)
@@ -884,10 +874,7 @@ def _validate_function_identities(
                 )
                 pending_asts.append(_serialized_sql_ast(connection, macro_sql))
 
-        cte_names = _cte_names(ast)
-        for requested_schema, name in _relation_identities(ast):
-            if not requested_schema and name in cte_names:
-                continue
+        for requested_schema, name in _persistent_relation_identities(ast):
             conditions = ["lower(table_name) = ?"]
             parameters = [name]
             if requested_schema:
@@ -964,42 +951,71 @@ def _function_identities(value: JsonValue) -> set[tuple[str, str]]:
     return identities
 
 
-def _relation_identities(value: JsonValue) -> set[tuple[str, str]]:
+def _persistent_relation_identities(
+    value: JsonValue,
+    inherited_ctes: frozenset[str] = frozenset(),
+) -> set[tuple[str, str]]:
     identities: set[tuple[str, str]] = set()
     if isinstance(value, dict):
         mapping = cast(dict[str, JsonValue], value)
+        local_ctes = set(inherited_ctes)
+        cte_map = mapping.get("cte_map")
+        entries: list[JsonValue] = []
+        if isinstance(cte_map, dict):
+            raw_entries = cast(dict[str, JsonValue], cte_map).get("map")
+            if isinstance(raw_entries, list):
+                entries = cast(list[JsonValue], raw_entries)
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            entry_mapping = cast(dict[str, JsonValue], entry)
+            key = entry_mapping.get("key")
+            definition = entry_mapping.get("value")
+            if not isinstance(key, str) or not isinstance(definition, dict):
+                continue
+            definition_mapping = cast(dict[str, JsonValue], definition)
+            query = definition_mapping.get("query")
+            definition_ctes = set(local_ctes)
+            if _is_recursive_cte_query(query, key):
+                definition_ctes.add(key.lower())
+            if query is not None:
+                identities.update(
+                    _persistent_relation_identities(query, frozenset(definition_ctes))
+                )
+            local_ctes.add(key.lower())
         if mapping.get("type") == "BASE_TABLE":
             name = mapping.get("table_name")
             schema = mapping.get("schema_name")
-            if isinstance(name, str) and isinstance(schema, str):
+            if (
+                isinstance(name, str)
+                and isinstance(schema, str)
+                and (schema or name.lower() not in local_ctes)
+            ):
                 identities.add((schema.lower(), name.lower()))
-        for child in mapping.values():
-            identities.update(_relation_identities(child))
+        for key, child in mapping.items():
+            if key != "cte_map":
+                identities.update(
+                    _persistent_relation_identities(child, frozenset(local_ctes))
+                )
     elif isinstance(value, list):
         for child in cast(list[JsonValue], value):
-            identities.update(_relation_identities(child))
+            identities.update(_persistent_relation_identities(child, inherited_ctes))
     return identities
 
 
-def _cte_names(value: JsonValue) -> set[str]:
-    names: set[str] = set()
-    if isinstance(value, dict):
-        mapping = cast(dict[str, JsonValue], value)
-        cte_map = mapping.get("cte_map")
-        if isinstance(cte_map, dict):
-            entries = cast(dict[str, JsonValue], cte_map).get("map")
-            if isinstance(entries, list):
-                for entry in cast(list[JsonValue], entries):
-                    if isinstance(entry, dict):
-                        key = cast(dict[str, JsonValue], entry).get("key")
-                        if isinstance(key, str):
-                            names.add(key.lower())
-        for child in mapping.values():
-            names.update(_cte_names(child))
-    elif isinstance(value, list):
-        for child in cast(list[JsonValue], value):
-            names.update(_cte_names(child))
-    return names
+def _is_recursive_cte_query(value: JsonValue | None, name: str) -> bool:
+    if not isinstance(value, dict):
+        return False
+    node = cast(dict[str, JsonValue], value).get("node")
+    if not isinstance(node, dict):
+        return False
+    node_mapping = cast(dict[str, JsonValue], node)
+    cte_name = node_mapping.get("cte_name")
+    return (
+        node_mapping.get("type") == "RECURSIVE_CTE_NODE"
+        and isinstance(cte_name, str)
+        and cte_name.lower() == name.lower()
+    )
 
 
 def _view_select_sql(definition: str) -> str | None:
@@ -1178,6 +1194,68 @@ def _json_cell(value: Any, seen: set[int]) -> JsonValue:
         finally:
             seen.remove(identity)
     raise TypeError(f"unsupported query result type: {type(value).__name__}")
+
+
+def _stream_catalog(cursor: Any, limit: int) -> dict[str, JsonValue]:
+    relations: list[JsonValue] = []
+    while True:
+        row = cursor.fetchone()
+        if row is None:
+            return {
+                "ok": True,
+                "complete": True,
+                "relations": relations,
+            }
+        schema, name, kind = cast(tuple[str, str, str], row)
+        item: dict[str, JsonValue] = {
+            "name": _qualified_relation(schema, name),
+            "type": kind,
+        }
+        candidate: dict[str, JsonValue] = {
+            "ok": True,
+            "complete": False,
+            "relations": [*relations, item],
+        }
+        if len(_canonical_json(candidate).encode("utf-8")) > limit:
+            return {
+                "ok": True,
+                "complete": False,
+                "relations": relations,
+            }
+        relations.append(item)
+
+
+def _stream_columns(cursor: Any, relation: str, limit: int) -> dict[str, JsonValue]:
+    columns: list[JsonValue] = []
+    while True:
+        row = cursor.fetchone()
+        if row is None:
+            return {
+                "ok": True,
+                "complete": True,
+                "relation": relation,
+                "columns": columns,
+            }
+        name, kind, nullable = cast(tuple[str, str, str], row)
+        item: dict[str, JsonValue] = {
+            "name": name,
+            "type": kind,
+            "nullable": nullable == "YES",
+        }
+        candidate: dict[str, JsonValue] = {
+            "ok": True,
+            "complete": False,
+            "relation": relation,
+            "columns": [*columns, item],
+        }
+        if len(_canonical_json(candidate).encode("utf-8")) > limit:
+            return {
+                "ok": True,
+                "complete": False,
+                "relation": relation,
+                "columns": columns,
+            }
+        columns.append(item)
 
 
 def _bound_inspection_result(
