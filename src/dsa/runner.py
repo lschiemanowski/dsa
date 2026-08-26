@@ -273,7 +273,7 @@ async def run_analysis(
         context: RunContext[None],
         relation: str | None = None,
     ) -> str:
-        """List relations, or inspect columns for one schema-qualified relation."""
+        """List canonical quoted relations, or inspect one returned relation name."""
         return await environment.inspect_database(
             relation,
             tool_call_id=_tool_call_id(context),
@@ -305,9 +305,9 @@ async def run_analysis(
                 takes_ctx=True,
                 name="inspect_database",
                 description=(
-                    "List sorted schema-qualified database relations when relation is omitted, "
-                    "or return ordered column names and DuckDB types for one relation. "
-                    "This returns schema only, never row data."
+                    "List sorted canonical quoted database relation names when relation is "
+                    "omitted, or return ordered column names and DuckDB types for one exact "
+                    "returned relation name. This returns schema only, never row data."
                 ),
                 sequential=True,
             ),

@@ -20,7 +20,7 @@ the deterministic run boundary:
 - typed terminal success and failure outcomes
 - native Pydantic AI messages and usage in one terminal record
 - atomic private record retention with one SHA-256 digest
-- deterministic schema inspection through read-only DuckDB
+- deterministic schema inspection with unambiguous quoted DuckDB relation names
 - one DuckDB-bound, plan-checked read-only tabular SQL statement per query tool call
 - complete small query results inline
 - automatic full-result Parquet retention with at most five preview rows

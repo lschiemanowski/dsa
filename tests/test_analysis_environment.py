@@ -3,15 +3,17 @@ from __future__ import annotations
 import json
 import math
 import os
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from hashlib import sha256
 from pathlib import Path
+from typing import cast
 
 import duckdb
 import pyarrow as pa
 import pyarrow.parquet as parquet
 import pytest
 
+import dsa.environment as environment_module
 from dsa import RunPolicy
 from dsa.environment import (
     AnalysisEnvironment,
@@ -39,6 +41,10 @@ def database_fixture(tmp_path: Path) -> Path:
         connection.execute("create macro unsafe_log() as write_log('audit')")
         connection.execute(
             "create macro unsafe_settings() as table select * from duckdb_settings()"
+        )
+        connection.execute(
+            "create macro unsafe_secret_directory() "
+            "as current_setting('secret_directory')"
         )
     finally:
         connection.close()
@@ -73,14 +79,14 @@ async def test_inspection_is_sorted_schema_qualified_and_schema_only(tmp_path: P
         "ok": True,
         "complete": True,
         "relations": [
-            {"name": "analytics.event_count", "type": "VIEW"},
-            {"name": "analytics.events", "type": "BASE TABLE"},
+            {"name": '"analytics"."event_count"', "type": "VIEW"},
+            {"name": '"analytics"."events"', "type": "BASE TABLE"},
         ],
     }
     assert relation == {
         "ok": True,
         "complete": True,
-        "relation": "analytics.events",
+        "relation": '"analytics"."events"',
         "columns": [
             {"name": "event_id", "type": "INTEGER", "nullable": True},
             {"name": "label", "type": "VARCHAR", "nullable": True},
@@ -154,6 +160,18 @@ async def test_query_rejects_writes_multiple_statements_and_external_sources(
             tool_call_id="query-macro-settings",
         )
     )
+    secret_directory = json.loads(
+        await runtime.query_database(
+            "select current_setting('secret_directory')",
+            tool_call_id="query-secret-directory",
+        )
+    )
+    macro_secret_directory = json.loads(
+        await runtime.query_database(
+            "select unsafe_secret_directory()",
+            tool_call_id="query-macro-secret-directory",
+        )
+    )
 
     assert write["error"]["code"] == "query_not_read_only"
     assert multiple["error"]["code"] == "query_statement_count"
@@ -163,10 +181,47 @@ async def test_query_rejects_writes_multiple_statements_and_external_sources(
     assert settings["error"]["code"] == "query_external_access"
     assert macro_write["error"]["code"] == "query_external_access"
     assert macro_settings["error"]["code"] == "query_external_access"
+    assert secret_directory["error"]["code"] == "query_external_access"
+    assert macro_secret_directory["error"]["code"] == "query_external_access"
     assert "stored_secrets" not in json.dumps(secret_catalog)
+    assert "stored_secrets" not in json.dumps(secret_directory)
+    assert "stored_secrets" not in json.dumps(macro_secret_directory)
     assert "temp_directory" not in json.dumps(settings)
     assert sha256(runtime.database_path.read_bytes()).hexdigest() == before
     assert runtime.artifact_records == ()
+
+
+async def test_catalog_preserves_ambiguous_identifier_boundaries(tmp_path: Path) -> None:
+    database = database_fixture(tmp_path)
+    connection = duckdb.connect(str(database))
+    try:
+        connection.execute('create schema "a.b"')
+        connection.execute('create table "a.b".t(dotted_schema integer)')
+        connection.execute("create schema a")
+        connection.execute('create table a."b.t"(dotted_relation varchar)')
+    finally:
+        connection.close()
+    run_directory = tmp_path / "run"
+    run_directory.mkdir()
+    runtime = AnalysisEnvironment(
+        database_path=database,
+        run_directory=run_directory,
+        policy=RunPolicy(),
+    )
+
+    catalog = json.loads(await runtime.inspect_database(None, tool_call_id="inspect-catalog"))
+    names = [relation["name"] for relation in catalog["relations"]]
+    dotted_schema = json.loads(
+        await runtime.inspect_database('"a.b"."t"', tool_call_id="inspect-dotted-schema")
+    )
+    dotted_relation = json.loads(
+        await runtime.inspect_database('"a"."b.t"', tool_call_id="inspect-dotted-relation")
+    )
+
+    assert '"a.b"."t"' in names
+    assert '"a"."b.t"' in names
+    assert dotted_schema["columns"][0]["name"] == "dotted_schema"
+    assert dotted_relation["columns"][0]["name"] == "dotted_relation"
 
 
 async def test_small_complete_query_result_stays_inline(tmp_path: Path) -> None:
@@ -472,6 +527,56 @@ class JsonAnswerExecutor:
             '{"count": 12}', encoding="utf-8"
         )
         return PythonExecutionResult()
+
+
+class ReplaceableJsonOutputExecutor:
+    def __init__(self) -> None:
+        self.output: Path | None = None
+
+    async def execute(self, request: PythonExecutionRequest) -> PythonExecutionResult:
+        self.output = request.output_directory / "answer.json"
+        self.output.write_text('{"value":1}', encoding="utf-8")
+        return PythonExecutionResult()
+
+
+async def test_python_publishes_the_exact_output_bytes_that_were_validated(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executor = ReplaceableJsonOutputExecutor()
+    runtime = environment(tmp_path, python_executor=executor)
+    original_validate = cast(
+        Callable[[Path, str, int, int], None],
+        vars(environment_module)["_validate_executor_output"],
+    )
+
+    def replace_executor_source_after_validation(
+        path: Path,
+        media_type: str,
+        max_bytes: int,
+        max_json_bytes: int,
+    ) -> None:
+        original_validate(path, media_type, max_bytes, max_json_bytes)
+        assert executor.output is not None
+        executor.output.write_text("not-json!!!", encoding="utf-8")
+
+    monkeypatch.setattr(
+        environment_module,
+        "_validate_executor_output",
+        replace_executor_source_after_validation,
+    )
+
+    result = json.loads(
+        await runtime.run_python(
+            "# produce one replaceable JSON output",
+            inputs=[],
+            expected_outputs=["answer.json"],
+            tool_call_id="python-replace-output",
+        )
+    )
+
+    assert result["ok"] is True
+    assert runtime.load_json_artifact(result["outputs"][0]["handle"]) == {"value": 1}
 
 
 async def test_json_consumer_uses_the_same_bytes_it_verified(

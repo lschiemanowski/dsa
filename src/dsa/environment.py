@@ -11,7 +11,7 @@ import shutil
 import stat
 import tempfile
 from base64 import b64encode
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, time
 from decimal import Decimal
@@ -212,6 +212,7 @@ class _ArtifactStore:
         sources: Sequence[tuple[Path, str]],
         *,
         producer_tool_call_id: str,
+        validator: Callable[[Path, str], None] | None = None,
     ) -> tuple[ArtifactRecord, ...]:
         if not sources:
             raise ArtifactError("artifact_batch_empty", "An artifact batch must not be empty")
@@ -265,11 +266,17 @@ class _ArtifactStore:
                     destination = directory / f"{handle}{extension}"
                     temporary = directory / f".artifact.{uuid4().hex}.tmp"
                     digest, copied = self._copy_artifact_source(source, temporary)
-                    if copied != expected_size:
-                        raise ArtifactError(
-                            "artifact_source_changed",
-                            "The artifact source changed while it was retained",
-                        )
+                    try:
+                        if copied != expected_size:
+                            raise ArtifactError(
+                                "artifact_source_changed",
+                                "The artifact source changed while it was retained",
+                            )
+                        if validator is not None:
+                            validator(temporary, media_type)
+                    except BaseException:
+                        temporary.unlink(missing_ok=True)
+                        raise
                     record = ArtifactRecord(
                         handle=handle,
                         relative_path=destination.relative_to(self._run_directory).as_posix(),
@@ -559,18 +566,18 @@ class AnalysisEnvironment:
                     "Python must create exactly the declared output files",
                 )
             output_paths = [output_directory / name for name in expected_outputs]
-            for path in output_paths:
-                _validate_executor_output(
-                    path,
-                    self.policy.max_artifact_bytes,
-                    self.policy.max_tool_result_bytes,
-                )
             records = self._artifacts.publish_files(
                 [
                     (path, _OUTPUT_MEDIA_TYPES[Path(name).suffix])
                     for name, path in zip(expected_outputs, output_paths, strict=True)
                 ],
                 producer_tool_call_id=tool_call_id,
+                validator=lambda path, media_type: _validate_executor_output(
+                    path,
+                    media_type,
+                    self.policy.max_artifact_bytes,
+                    self.policy.max_tool_result_bytes,
+                ),
             )
             return self._python_result(execution, records)
         except ArtifactError as error:
@@ -623,16 +630,39 @@ class AnalysisEnvironment:
                     "ok": True,
                     "complete": True,
                     "relations": [
-                        {"name": f"{schema}.{name}", "type": kind}
+                        {"name": _qualified_relation(schema, name), "type": kind}
                         for schema, name, kind in rows
                     ],
                 }
-            schema, separator, name = relation.partition(".")
-            if not separator or not schema.strip() or not name.strip():
-                return _error_value(
-                    "relation_not_qualified",
-                    "Specify the relation as schema.name",
+            relation_rows = connection.execute(
+                "select table_schema, table_name from information_schema.tables "
+                "where table_schema not in ('information_schema', 'pg_catalog') "
+                "order by table_schema, table_name"
+            ).fetchall()
+            selected = next(
+                (
+                    (schema, name)
+                    for schema, name in relation_rows
+                    if _qualified_relation(schema, name) == relation
+                ),
+                None,
+            )
+            if selected is None and relation.count(".") == 1:
+                legacy_schema, legacy_name = relation.split(".", maxsplit=1)
+                selected = next(
+                    (
+                        (schema, name)
+                        for schema, name in relation_rows
+                        if schema == legacy_schema and name == legacy_name
+                    ),
+                    None,
                 )
+            if selected is None:
+                return _error_value(
+                    "relation_not_found",
+                    "Use an exact relation name returned by catalog inspection",
+                )
+            schema, name = selected
             rows = connection.execute(
                 "select column_name, data_type, is_nullable "
                 "from information_schema.columns "
@@ -647,7 +677,7 @@ class AnalysisEnvironment:
             return {
                 "ok": True,
                 "complete": True,
-                "relation": relation,
+                "relation": _qualified_relation(schema, name),
                 "columns": [
                     {"name": column, "type": kind, "nullable": nullable == "YES"}
                     for column, kind, nullable in rows
@@ -779,10 +809,14 @@ def _validate_bound_query(
     submitted_sql: str,
 ) -> None:
     try:
-        row = connection.execute(
-            f"explain (format json) {bounded_sql}",
-            [submitted_sql],
-        ).fetchone()
+        connection.execute("pragma disable_optimizer")
+        try:
+            row = connection.execute(
+                f"explain (format json) {bounded_sql}",
+                [submitted_sql],
+            ).fetchone()
+        finally:
+            connection.execute("pragma enable_optimizer")
     except duckdb.PermissionException as error:
         raise ArtifactError(
             "query_external_access",
@@ -830,6 +864,14 @@ def _bound_table_functions(value: JsonValue) -> set[str]:
         for child in cast(list[JsonValue], value):
             functions.update(_bound_table_functions(child))
     return functions
+
+
+def _qualified_relation(schema: str, name: str) -> str:
+    return f"{_quote_identifier(schema)}.{_quote_identifier(name)}"
+
+
+def _quote_identifier(value: str) -> str:
+    return '"' + value.replace('"', '""') + '"'
 
 
 def _python_request_issue(
@@ -998,20 +1040,25 @@ def _bounded_utf8(value: str, limit: int) -> tuple[str, bool]:
     return encoded[:limit].decode("utf-8", errors="ignore"), True
 
 
-def _validate_executor_output(path: Path, max_bytes: int, max_json_bytes: int) -> None:
+def _validate_executor_output(
+    path: Path,
+    media_type: str,
+    max_bytes: int,
+    max_json_bytes: int,
+) -> None:
     if path.is_symlink() or not path.is_file():
         raise ArtifactError(
             "python_output_invalid",
             "Python outputs must be regular files",
         )
-    content_limit = min(max_bytes, max_json_bytes) if path.suffix == ".json" else max_bytes
+    content_limit = min(max_bytes, max_json_bytes) if media_type == _JSON_MEDIA_TYPE else max_bytes
     if path.stat().st_size > content_limit:
         raise ArtifactError(
             "artifact_size_limit",
             "A complete output is too large to retain",
         )
     try:
-        if path.suffix == ".json":
+        if media_type == _JSON_MEDIA_TYPE:
             json.loads(
                 path.read_bytes(),
                 parse_constant=lambda value: (_ for _ in ()).throw(ValueError(value)),

@@ -14,7 +14,9 @@ the terminal record references by metadata.
 ## Database tools
 
 `inspect_database` returns a sorted catalog of schema-qualified tables and views when
-called without a relation. When given `schema.name`, it returns ordered column names,
+called without a relation. Each relation is represented as a canonical quoted DuckDB
+identifier such as `"analytics"."events"`, preserving dots and quotes inside either
+identifier component. Passing that exact returned name yields ordered column names,
 DuckDB types, and nullability. It never returns rows. When the catalog or column list
 does not fit its byte limit, it returns the bounded prefix with `complete` set to
 `false`.
@@ -22,9 +24,11 @@ does not fit its byte limit, it returns the bounded prefix with `complete` set t
 `query_database` accepts exactly one DuckDB-parsed `SELECT`, `WITH`, or `VALUES`
 statement, including statements surrounded by SQL comments. The connection is
 read-only and external access is disabled. Before execution, DuckDB binds the query
-inside a host-generated parameterized row-limit wrapper. The host inspects that bound
-plan and rejects writes, multiple statements, external scans, host metadata access,
-side-effecting functions, and macros that expand to those operations.
+inside a host-generated parameterized row-limit wrapper with optimization disabled.
+The host inspects that pre-optimization bound plan, where scalar function identities
+remain visible, and rejects writes, multiple statements, external scans, host metadata
+access, side-effecting functions, and macros that expand to those operations. Normal
+optimization is restored before an accepted query executes.
 
 The host enforces elapsed time, DuckDB memory, row-count, materialized-result byte,
 artifact, per-tool response, and cumulative model-visible response limits.
@@ -83,7 +87,9 @@ The executor receives:
 
 The host accepts only the declared regular `.json` and `.parquet` files, then publishes
 the complete declared output set transactionally through the same artifact boundary.
-Milestone 3 will implement this protocol with Docker and a run-private database copy.
+Each executor output is first copied to host-private artifact staging. The staged bytes
+are fully validated, then those same staged inodes are published as one batch. Milestone
+3 will implement this protocol with Docker and a run-private database copy.
 
 ## Final output
 
@@ -100,9 +106,10 @@ The milestone suite covers real DuckDB catalog inspection, query safety, source
 preservation, inline transport, automatic Parquet transport, full retained row
 content, bounded previews, query rejection without partial publication, artifact
 integrity and replacement races, transactional multi-output rollback, complete
-Parquet validation, managed Python inputs and outputs, direct and artifact-backed final
-output, per-result and cumulative retry-feedback limits, terminal-record safety, and
-all Milestone 1 behavior.
+Parquet validation, executor-output replacement races, ambiguous quoted relation names,
+constant-folded and macro-expanded forbidden SQL calls, managed Python inputs and
+outputs, direct and artifact-backed final output, per-result and cumulative
+retry-feedback limits, terminal-record safety, and all Milestone 1 behavior.
 
 Docker, writable database copies, rollback, Databricks MLflow, live providers, a CLI,
 and a conversational demo remain outside this milestone.
