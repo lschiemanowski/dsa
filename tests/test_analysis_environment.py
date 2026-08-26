@@ -46,6 +46,7 @@ def database_fixture(tmp_path: Path) -> Path:
             "create macro unsafe_secret_directory() "
             "as current_setting('secret_directory')"
         )
+        connection.execute("create macro safe_values() as table select 9 as value")
         connection.execute(
             "create view analytics.unsafe_secret_view as "
             "select current_setting('secret_directory') as benign"
@@ -243,6 +244,31 @@ async def test_query_rejects_writes_multiple_statements_and_external_sources(
             tool_call_id="query-safe-with-view",
         )
     )
+    dynamic_secret_directory = json.loads(
+        await runtime.query_database(
+            "select * from query("
+            "'select current_setting(''secret_directory'') as benign')",
+            tool_call_id="query-dynamic-secret-directory",
+        )
+    )
+    dynamic_write = json.loads(
+        await runtime.query_database(
+            "select * from query('select write_log(''hello'') as benign')",
+            tool_call_id="query-dynamic-write",
+        )
+    )
+    dynamic_view = json.loads(
+        await runtime.query_database(
+            "select * from query_table('unsafe_v')",
+            tool_call_id="query-dynamic-view",
+        )
+    )
+    safe_table_macro = json.loads(
+        await runtime.query_database(
+            "select value from safe_values()",
+            tool_call_id="query-safe-table-macro",
+        )
+    )
 
     assert write["error"]["code"] == "query_not_read_only"
     assert multiple["error"]["code"] == "query_statement_count"
@@ -263,11 +289,17 @@ async def test_query_rejects_writes_multiple_statements_and_external_sources(
     assert safe_view["rows"] == [[12]]
     assert nested_cte_name["error"]["code"] == "query_external_access"
     assert safe_with_view["rows"] == [[7]]
+    assert dynamic_secret_directory["error"]["code"] == "query_external_access"
+    assert dynamic_write["error"]["code"] == "query_external_access"
+    assert dynamic_view["error"]["code"] == "query_external_access"
+    assert safe_table_macro["rows"] == [[9]]
     assert "stored_secrets" not in json.dumps(secret_catalog)
     assert "stored_secrets" not in json.dumps(secret_directory)
     assert "stored_secrets" not in json.dumps(macro_secret_directory)
     assert "stored_secrets" not in json.dumps(unsafe_view)
     assert "stored_secrets" not in json.dumps(nested_cte_name)
+    assert "stored_secrets" not in json.dumps(dynamic_secret_directory)
+    assert "stored_secrets" not in json.dumps(dynamic_view)
     assert "temp_directory" not in json.dumps(settings)
     assert sha256(runtime.database_path.read_bytes()).hexdigest() == before
     assert runtime.artifact_records == ()
@@ -487,6 +519,38 @@ async def test_leading_and_trailing_comments_remain_valid_single_queries(
 
     assert leading["rows"] == [[1]]
     assert trailing["rows"] == [[2]]
+
+
+async def test_query_requires_select_with_or_values_top_level_syntax(tmp_path: Path) -> None:
+    runtime = environment(tmp_path)
+
+    rejected = [
+        json.loads(await runtime.query_database(sql, tool_call_id=f"query-syntax-{index}"))
+        for index, sql in enumerate(
+            (
+                "describe select 1",
+                "summarize select 1",
+                "from analytics.events",
+            )
+        )
+    ]
+    accepted = [
+        json.loads(await runtime.query_database(sql, tool_call_id=f"query-form-{index}"))
+        for index, sql in enumerate(
+            (
+                "/* outer /* nested */ comment */ -- line\nselect 1",
+                "-- line\rwith q as (select 2 as value) select value from q",
+                "/* comment */ values (3)",
+            )
+        )
+    ]
+
+    assert [result["error"]["code"] for result in rejected] == [
+        "query_not_read_only",
+        "query_not_read_only",
+        "query_not_read_only",
+    ]
+    assert [result["rows"] for result in accepted] == [[[1]], [[2]], [[3]]]
 
 
 async def test_inline_query_uses_lossless_tagged_json_values(tmp_path: Path) -> None:

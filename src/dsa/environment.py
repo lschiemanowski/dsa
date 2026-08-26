@@ -784,9 +784,42 @@ def _query_issue(sql: str) -> tuple[str, str] | None:
         return "query_invalid", "SQL must be valid DuckDB syntax"
     if len(statements) != 1:
         return "query_statement_count", "Submit exactly one SQL statement"
-    if statements[0].type != duckdb.StatementType.SELECT:
-        return "query_not_read_only", "Only read-only tabular queries are allowed"
+    if (
+        statements[0].type != duckdb.StatementType.SELECT
+        or _first_sql_keyword(sql) not in {"SELECT", "WITH", "VALUES"}
+    ):
+        return "query_not_read_only", "Only SELECT, WITH, or VALUES queries are allowed"
     return None
+
+
+def _first_sql_keyword(sql: str) -> str | None:
+    offset = 0
+    while offset < len(sql):
+        while offset < len(sql) and sql[offset].isspace():
+            offset += 1
+        if sql.startswith("--", offset):
+            offset += 2
+            while offset < len(sql) and sql[offset] not in "\r\n":
+                offset += 1
+            continue
+        if sql.startswith("/*", offset):
+            offset += 2
+            depth = 1
+            while offset < len(sql) and depth:
+                if sql.startswith("/*", offset):
+                    depth += 1
+                    offset += 2
+                elif sql.startswith("*/", offset):
+                    depth -= 1
+                    offset += 2
+                else:
+                    offset += 1
+            if depth:
+                return None
+            continue
+        break
+    match = re.match(r"[A-Za-z_]+", sql[offset:])
+    return match.group(0).upper() if match is not None else None
 
 
 def _validate_bound_query(
@@ -829,6 +862,30 @@ def _validate_function_identities(
     expanded_views: set[tuple[str, str]] = set()
     while pending_asts:
         ast = pending_asts.pop()
+        for requested_schema, name in _table_function_identities(ast):
+            if name in _ALLOWED_BOUND_TABLE_FUNCTIONS:
+                continue
+            function_conditions = [
+                "lower(function_name) = ?",
+                "function_type in ('table', 'table_macro')",
+            ]
+            function_parameters = [name]
+            if requested_schema:
+                function_conditions.append("lower(schema_name) = ?")
+                function_parameters.append(requested_schema)
+            function_type_rows = connection.execute(
+                "select distinct function_type from duckdb_functions() where "
+                + " and ".join(function_conditions)
+                + " order by function_type limit 101",
+                function_parameters,
+            ).fetchall()
+            if not function_type_rows or any(
+                row[0] != "table_macro" for row in function_type_rows
+            ):
+                raise ArtifactError(
+                    "query_external_access",
+                    "Queries may use only pure generated tables and validated table macros",
+                )
         for requested_schema, name in _function_identities(ast):
             function_conditions = ["lower(function_name) = ?"]
             function_parameters = [name]
@@ -948,6 +1005,26 @@ def _function_identities(value: JsonValue) -> set[tuple[str, str]]:
     elif isinstance(value, list):
         for child in cast(list[JsonValue], value):
             identities.update(_function_identities(child))
+    return identities
+
+
+def _table_function_identities(value: JsonValue) -> set[tuple[str, str]]:
+    identities: set[tuple[str, str]] = set()
+    if isinstance(value, dict):
+        mapping = cast(dict[str, JsonValue], value)
+        if mapping.get("type") == "TABLE_FUNCTION":
+            function = mapping.get("function")
+            if isinstance(function, dict):
+                function_mapping = cast(dict[str, JsonValue], function)
+                name = function_mapping.get("function_name")
+                schema = function_mapping.get("schema")
+                if isinstance(name, str) and isinstance(schema, str):
+                    identities.add((schema.lower(), name.lower()))
+        for child in mapping.values():
+            identities.update(_table_function_identities(child))
+    elif isinstance(value, list):
+        for child in cast(list[JsonValue], value):
+            identities.update(_table_function_identities(child))
     return identities
 
 
