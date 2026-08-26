@@ -69,6 +69,29 @@ async def test_invalid_request_has_no_identity_model_call_or_filesystem_effect(
     assert not runs_directory.exists()
 
 
+async def test_mutated_typed_request_is_revalidated_before_side_effects(tmp_path: Path) -> None:
+    request = valid_request(tmp_path)
+    request.model.settings["api_key"] = "SECRET"
+    identity_called = False
+    runs_directory = tmp_path / "runs"
+
+    def identity() -> str:
+        nonlocal identity_called
+        identity_called = True
+        return "should-not-be-used"
+
+    with pytest.raises(ValidationError, match="credentials or endpoints"):
+        await run_analysis(
+            request,
+            runs_directory=runs_directory,
+            model=TestModel(call_tools=[], custom_output_args={"count": 3}),
+            identity_factory=identity,
+        )
+
+    assert identity_called is False
+    assert not runs_directory.exists()
+
+
 async def test_valid_structured_answer_succeeds_and_retains_native_messages(
     tmp_path: Path,
 ) -> None:

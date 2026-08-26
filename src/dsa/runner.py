@@ -72,7 +72,12 @@ async def run_analysis(
     clock: Callable[[], datetime] | None = None,
 ) -> RunCompletion:
     """Validate, execute and retain exactly one analysis run."""
-    canonical_request = RunRequest.model_validate(request).model_copy(deep=True)
+    request_data = (
+        request.model_dump(mode="python", round_trip=True)
+        if isinstance(request, RunRequest)
+        else request
+    )
+    canonical_request = RunRequest.model_validate(request_data).model_copy(deep=True)
     identity_source = identity_factory or (lambda: f"run-{uuid4().hex}")
     now = clock or (lambda: datetime.now(UTC))
     run_id = identity_source()
