@@ -1,5 +1,22 @@
 """Public contract for the data science agent."""
 
+from dsa.benchmark import (
+    BenchmarkCell,
+    BenchmarkCellReceipt,
+    BenchmarkDatasetBinding,
+    BenchmarkExecution,
+    BenchmarkModel,
+    BenchmarkPack,
+    BenchmarkPlan,
+    BenchmarkRuntime,
+    BenchmarkStudy,
+    PreparedBenchmark,
+    benchmark_plan,
+    expand_benchmark_study,
+    prepare_benchmark,
+    read_benchmark_cell_receipt,
+    run_prepared_benchmark,
+)
 from dsa.contract import ModelConfiguration, RunPolicy, RunRequest
 from dsa.docker import (
     DockerExecutorConfiguration,
@@ -41,6 +58,15 @@ from dsa.runner import RunCompletion, run_analysis
 
 __all__ = [
     "ArtifactRecord",
+    "BenchmarkCell",
+    "BenchmarkCellReceipt",
+    "BenchmarkDatasetBinding",
+    "BenchmarkExecution",
+    "BenchmarkModel",
+    "BenchmarkPack",
+    "BenchmarkPlan",
+    "BenchmarkRuntime",
+    "BenchmarkStudy",
     "DatabaseRecord",
     "DockerExecutorConfiguration",
     "DockerPythonExecutor",
@@ -55,6 +81,7 @@ __all__ = [
     "MlflowEvaluationResult",
     "MlflowReporting",
     "ModelConfiguration",
+    "PreparedBenchmark",
     "PythonExecutionError",
     "PythonExecutionRequest",
     "PythonExecutionResult",
@@ -66,9 +93,14 @@ __all__ = [
     "RunRequest",
     "RunSuccess",
     "TerminalRecord",
+    "benchmark_plan",
     "default_docker_configuration",
+    "expand_benchmark_study",
     "load_huggingface_evaluation_pack",
+    "prepare_benchmark",
+    "read_benchmark_cell_receipt",
     "run_analysis",
     "run_mlflow_evaluation",
+    "run_prepared_benchmark",
     "write_terminal_record",
 ]

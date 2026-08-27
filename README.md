@@ -10,8 +10,8 @@ conversational task-definition system.
 
 ## Current milestone
 
-Milestone 5 adds one content-pinned Hugging Face evaluation pack to the opt-in
-Databricks MLflow observability and native exact-scored evaluation path:
+Milestone 6A adds isolated, resumable benchmark orchestration over the content-pinned
+Hugging Face packs and native Databricks MLflow evaluation path:
 
 - strict, serializable request and policy models
 - JSON Schema Draft 2020-12 validation
@@ -40,7 +40,12 @@ Databricks MLflow observability and native exact-scored evaluation path:
 - native MLflow Evaluation Datasets with host-only expectations and exact JSON scorers
 - one immutable public Online Retail II pack containing twenty evaluation cases
 - exact Hugging Face repository revision, manifest, case-export, and database identities
-- runtime-only database paths, model configuration, and policy outside MLflow records
+- immutable content-addressed benchmark studies and deterministic matrix expansion
+- fresh subprocesses and private attempts for every pack-model-repetition cell
+- separate explicit MLflow case-worker and benchmark cell-worker bounds
+- atomic no-overwrite local receipts correlated to tagged Databricks evaluation runs
+- conservative explicit resume that never guesses about ambiguous remote work
+- runtime-only workspace paths, Databricks dataset names, and secrets outside study identity
 
 Model-authored Python is never executed on the host. The `run_python` tool is
 registered only when the host injects an executor. MLflow reporting uses Databricks
@@ -149,6 +154,25 @@ MLflow dataset inputs. Reference answers remain evaluator-only expectations. Hug
 cache paths, model configuration, run policy, and executor configuration remain host
 runtime bindings.
 
+Benchmark studies bind exact pack references, model configurations, policy, Docker image,
+concurrency, repetitions, and the exact agent Git revision. Runtime files bind only a new
+local workspace and one Databricks dataset name per pack. Both inputs must be canonical
+JSON. Preflight resolves every pack, checks the already-present immutable Docker image,
+requires Databricks configuration, and verifies the running Git revision before starting
+any cell. Tracked or untracked implementation changes under `src/dsa`, `pyproject.toml`,
+or `uv.lock` are rejected because they are not represented by that revision:
+
+```text
+dsa-benchmark plan --study study.json --runtime runtime.json
+dsa-benchmark run --study study.json --runtime runtime.json
+dsa-benchmark run --study study.json --runtime runtime.json --resume
+```
+
+`plan` performs the same complete preflight as `run` but makes no model call or MLflow
+write. `--resume` skips only a locally verified completed receipt. A partial attempt or
+unverifiable receipt is reported as ambiguous and preserved for operator inspection.
+The complete contract and lifecycle are recorded in `docs/milestone-6a.md`.
+
 `completion.reporting` is `disabled`, `reported`, or `failed`. A reporting failure does
 not change `completion.outcome` or the canonical local `terminal.json`. Enabled reporting
 uploads the native Pydantic AI trace, the exact terminal record, and artifact metadata;
@@ -189,6 +213,16 @@ Unity Catalog dataset name in `DSA_MLFLOW_DATASET_NAME`, and explicit opt-in:
 
 ```text
 DSA_DATABRICKS_TEST=1 uv run pytest -m databricks
+```
+
+The full benchmark-cell acceptance also needs the already-present Docker image and exact
+public pack access. It uses Pydantic AI's deterministic test model rather than a paid
+provider:
+
+```text
+DSA_BENCHMARK_DATABRICKS_TEST=1 \
+DSA_DOCKER_TEST_IMAGE=sha256:<64 hex digits> \
+uv run pytest tests/test_benchmark_databricks.py
 ```
 
 The exact public Hugging Face boundary has a separate opt-in acceptance test:

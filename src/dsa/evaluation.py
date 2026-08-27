@@ -6,7 +6,7 @@ import json
 import math
 import os
 from collections.abc import Callable, Generator
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from copy import deepcopy
 from hashlib import sha256
 from importlib import import_module
@@ -78,6 +78,11 @@ class _EvaluationApi(Protocol):
 
     def invalid_feedback(self, name: str, rationale: str) -> object: ...
 
+    def evaluation_context(
+        self,
+        tags: dict[str, str],
+    ) -> AbstractContextManager[object]: ...
+
     def evaluate(
         self,
         *,
@@ -100,6 +105,7 @@ def run_mlflow_evaluation(
     model_factory: ModelFactory | None = None,
     python_executor: PythonExecutor | None = None,
     api: _EvaluationApi | None = None,
+    run_tags: dict[str, str] | None = None,
 ) -> MlflowEvaluationResult:
     """Create a native dataset from a verified pack and run ordinary DSA analyses."""
     canonical_pack = _canonical_pack(pack)
@@ -112,6 +118,7 @@ def run_mlflow_evaluation(
         raise ValueError("dataset_name must not be blank")
     canonical_model = _canonical_model_configuration(model_configuration)
     canonical_policy = _canonical_policy(policy)
+    canonical_tags = _canonical_run_tags(run_tags)
     _verify_pack_database(canonical_pack)
     configuration_failure = _evaluation_configuration_failure()
     if configuration_failure is not None:
@@ -171,7 +178,12 @@ def run_mlflow_evaluation(
 
     scorers = _native_scorers(selected_api)
     try:
-        with _skip_mlflow_prediction_preflight():
+        evaluation_context = (
+            selected_api.evaluation_context(canonical_tags)
+            if canonical_tags
+            else nullcontext()
+        )
+        with evaluation_context, _skip_mlflow_prediction_preflight():
             raw_result = selected_api.evaluate(
                 data=dataset,
                 predict_fn=predict_fn,
@@ -328,6 +340,27 @@ def _evaluation_configuration_failure() -> str | None:
     return None
 
 
+def _canonical_run_tags(value: dict[str, str] | None) -> dict[str, str]:
+    if value is None:
+        return {}
+    tags: dict[str, str] = {}
+    safe_value_characters = frozenset(
+        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-"
+    )
+    for key in sorted(value):
+        selected = value[key]
+        if (
+            not key.startswith("dsa.benchmark.")
+            or len(key) > 128
+            or not selected
+            or len(selected) > 256
+            or any(character not in safe_value_characters for character in selected)
+        ):
+            raise ValueError("evaluation run tags must be safe benchmark identities")
+        tags[key] = selected
+    return tags
+
+
 @contextmanager
 def _skip_mlflow_prediction_preflight() -> Generator[None]:
     """Prevent MLflow from executing a side-effecting prediction as validation."""
@@ -410,6 +443,7 @@ def _native_scorers(api: _EvaluationApi) -> list[object]:
 
 class _MlflowEvaluationApi:
     def __init__(self) -> None:
+        self.mlflow: Any = import_module("mlflow")
         self.datasets: Any = import_module("mlflow.genai.datasets")
         self.genai: Any = import_module("mlflow.genai")
         self.scorers: Any = import_module("mlflow.genai.scorers")
@@ -427,6 +461,12 @@ class _MlflowEvaluationApi:
 
     def invalid_feedback(self, name: str, rationale: str) -> object:
         return self.feedback_type(name=name, value=None, rationale=rationale, valid=False)
+
+    def evaluation_context(
+        self,
+        tags: dict[str, str],
+    ) -> AbstractContextManager[object]:
+        return cast(AbstractContextManager[object], self.mlflow.start_run(tags=tags))
 
     def evaluate(
         self,
