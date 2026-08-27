@@ -42,6 +42,7 @@ def prepared_benchmark(
     cells: int = 1,
     cell_workers: int = 1,
     case_workers: int = 1,
+    max_tool_calls: int = 40,
 ) -> PreparedBenchmark:
     pack = evaluation_pack(tmp_path)
     selected_pack = cast(dict[str, object], study_value()["packs"][0])
@@ -58,6 +59,7 @@ def prepared_benchmark(
             "case_workers": case_workers,
             "cell_workers": cell_workers,
         },
+        policy={"max_tool_calls": max_tool_calls},
         repetitions=1,
     )
     study = BenchmarkStudy.model_validate(value)
@@ -404,6 +406,7 @@ class CleanupDockerRunner:
     def __init__(self, results: tuple[DockerCommandResult, ...]) -> None:
         self.results = list(results)
         self.calls: list[tuple[str, ...]] = []
+        self.output_limits: list[int] = []
 
     async def run(
         self,
@@ -413,8 +416,9 @@ class CleanupDockerRunner:
         timeout_seconds: float,
         output_limit: int,
     ) -> DockerCommandResult:
-        del input_bytes, timeout_seconds, output_limit
+        del input_bytes, timeout_seconds
         self.calls.append(tuple(arguments))
+        self.output_limits.append(output_limit)
         return self.results.pop(0)
 
     async def run_to_file(
@@ -447,7 +451,7 @@ def docker_result(
 async def test_parent_cleanup_removes_only_containers_with_the_attempt_label(
     tmp_path: Path,
 ) -> None:
-    prepared = prepared_benchmark(tmp_path)
+    prepared = prepared_benchmark(tmp_path, case_workers=2, max_tool_calls=1)
     invocation = BenchmarkCellInvocation.from_prepared(prepared, prepared.cells[0], 1)
     first_id = "a" * 12
     second_id = "b" * 64
@@ -461,6 +465,8 @@ async def test_parent_cleanup_removes_only_containers_with_the_attempt_label(
     removed = await remove_benchmark_cell_containers(invocation, runner=runner)
 
     assert removed is True
+    assert invocation.case_workers * invocation.policy.max_tool_calls == 2
+    assert runner.output_limits == [2 * 65, 2 * 65]
     assert runner.calls[0][-2:] == (
         "--filter",
         f"label=dsa.benchmark.cleanup={invocation.cleanup_token}",
@@ -472,6 +478,29 @@ async def test_parent_cleanup_removes_only_containers_with_the_attempt_label(
         first_id,
         second_id,
     )
+
+
+async def test_parent_cleanup_removes_a_large_valid_cell_in_bounded_batches(
+    tmp_path: Path,
+) -> None:
+    prepared = prepared_benchmark(tmp_path, case_workers=2, max_tool_calls=65)
+    invocation = BenchmarkCellInvocation.from_prepared(prepared, prepared.cells[0], 1)
+    container_ids = tuple(f"{index:012x}" for index in range(130))
+    runner = CleanupDockerRunner(
+        (
+            docker_result(stdout=("\n".join(container_ids) + "\n").encode()),
+            docker_result(),
+            docker_result(),
+        )
+    )
+
+    removed = await remove_benchmark_cell_containers(invocation, runner=runner)
+
+    assert removed is True
+    assert runner.output_limits == [130 * 65, 128 * 65, 2 * 65]
+    assert runner.calls[1][:3] == ("docker", "rm", "--force")
+    assert runner.calls[1][3:] == container_ids[:128]
+    assert runner.calls[2][3:] == container_ids[128:]
 
 
 async def test_parent_freezes_and_cleans_a_stuck_worker_before_killing_it(

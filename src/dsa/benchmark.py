@@ -108,6 +108,11 @@ class BenchmarkStudy(ContractModel):
     def cell_count_is_bounded(self) -> BenchmarkStudy:
         if len(self.packs) * len(self.models) * self.repetitions > 10_000:
             raise ValueError("benchmark study contains too many cells")
+        if (
+            self.execution.case_workers * self.policy.max_tool_calls
+            > _MAX_CELL_CONTAINERS
+        ):
+            raise ValueError("benchmark cell container concurrency is too large")
         return self
 
     @field_validator("packs")
@@ -205,6 +210,12 @@ class BenchmarkCellInvocation(ContractModel):
     workspace_root: Path
     attempt: Annotated[int, Field(gt=0)]
     cleanup_token: str = Field(pattern=r"^[0-9a-f]{32}$")
+
+    @model_validator(mode="after")
+    def cleanup_container_count_is_bounded(self) -> BenchmarkCellInvocation:
+        if self.case_workers * self.policy.max_tool_calls > _MAX_CELL_CONTAINERS:
+            raise ValueError("benchmark cell container concurrency is too large")
+        return self
 
     @property
     def cell_directory(self) -> Path:
@@ -360,6 +371,9 @@ _RECEIPT_BYTES = 64 * 1024 * 1024
 _DOCKER_IMAGE_ID = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _DOCKER_CONTAINER_ID = re.compile(r"[0-9a-f]{12,64}\Z")
 _BENCHMARK_CLEANUP_LABEL = "dsa.benchmark.cleanup"
+_MAX_CELL_CONTAINERS = 10_000
+_CONTAINER_ID_BYTES = 65
+_CONTAINER_REMOVE_BATCH = 128
 
 
 @dataclass(frozen=True)
@@ -888,6 +902,7 @@ async def remove_benchmark_cell_containers(
     """Force-remove the bounded set of containers labeled for one cell attempt."""
     configuration = default_docker_configuration(invocation.docker_image)
     selected_runner = runner or AsyncSubprocessDockerRunner()
+    container_bound = invocation.case_workers * invocation.policy.max_tool_calls
     try:
         listed = await selected_runner.run(
             (
@@ -901,7 +916,7 @@ async def remove_benchmark_cell_containers(
             ),
             input_bytes=None,
             timeout_seconds=configuration.control_timeout_seconds,
-            output_limit=8 * 1024,
+            output_limit=container_bound * _CONTAINER_ID_BYTES,
         )
     except OSError:
         return False
@@ -916,28 +931,34 @@ async def remove_benchmark_cell_containers(
         container_ids = tuple(line.decode("ascii") for line in listed.stdout.splitlines())
     except UnicodeDecodeError:
         return False
-    if len(container_ids) > invocation.policy.max_tool_calls or any(
+    if len(container_ids) > container_bound or any(
         _DOCKER_CONTAINER_ID.fullmatch(container_id) is None
         for container_id in container_ids
     ):
         return False
     if not container_ids:
         return True
-    try:
-        removed = await selected_runner.run(
-            (
-                configuration.docker_executable,
-                "rm",
-                "--force",
-                *container_ids,
-            ),
-            input_bytes=None,
-            timeout_seconds=configuration.control_timeout_seconds,
-            output_limit=8 * 1024,
-        )
-    except OSError:
-        return False
-    return not removed.timed_out and removed.returncode == 0
+    complete = True
+    for start in range(0, len(container_ids), _CONTAINER_REMOVE_BATCH):
+        batch = container_ids[start : start + _CONTAINER_REMOVE_BATCH]
+        try:
+            removed = await selected_runner.run(
+                (
+                    configuration.docker_executable,
+                    "rm",
+                    "--force",
+                    *batch,
+                ),
+                input_bytes=None,
+                timeout_seconds=configuration.control_timeout_seconds,
+                output_limit=len(batch) * _CONTAINER_ID_BYTES,
+            )
+        except OSError:
+            complete = False
+            continue
+        if removed.timed_out or removed.returncode != 0:
+            complete = False
+    return complete
 
 
 def execute_benchmark_cell(

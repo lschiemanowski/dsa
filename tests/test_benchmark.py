@@ -142,6 +142,20 @@ def test_study_bounds_the_expanded_cell_matrix() -> None:
         )
 
 
+def test_study_bounds_cell_wide_concurrent_container_cleanup() -> None:
+    with pytest.raises(ValidationError, match="container concurrency is too large"):
+        BenchmarkStudy.model_validate(
+            study_value(
+                policy={"max_tool_calls": 157},
+                execution={
+                    "docker_image": IMAGE,
+                    "case_workers": 64,
+                    "cell_workers": 1,
+                },
+            )
+        )
+
+
 def test_runtime_rejects_dataset_values_that_cannot_be_safely_retained(
     tmp_path: Path,
 ) -> None:
