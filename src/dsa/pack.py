@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import stat
 from copy import deepcopy
 from hashlib import sha256
 from importlib import import_module
@@ -226,6 +227,9 @@ class LoadedEvaluationPack(ContractModel):
 
     @model_validator(mode="after")
     def cases_match_manifest_identity(self) -> LoadedEvaluationPack:
+        manifest_bytes = _canonical_json(self.manifest.model_dump(mode="json")) + b"\n"
+        if sha256(manifest_bytes).hexdigest() != self.reference.manifest_sha256:
+            raise ValueError("evaluation pack manifest does not match its locator")
         identities = tuple(case.case_id for case in self.cases)
         if len(identities) != len(set(identities)):
             raise ValueError("evaluation pack case identities must be unique")
@@ -269,12 +273,15 @@ def load_huggingface_evaluation_pack(
         raise EvaluationPackError("pack_manifest_invalid")
 
     database_name = f"{selected_reference.path}/{manifest.database.path}"
-    database_path = _download(
+    downloaded_database_path = _download(
         selected_downloader,
         selected_reference,
         database_name,
     )
-    _verify_file(database_path, manifest.database)
+    database_path = _resolve_verified_database(
+        downloaded_database_path,
+        manifest.database,
+    )
 
     cases_name = f"{selected_reference.path}/{manifest.cases.path}"
     cases_path = _download(selected_downloader, selected_reference, cases_name)
@@ -345,10 +352,26 @@ def _read_bounded_file(path: Path, maximum: int) -> bytes:
     return value
 
 
-def _verify_file(path: Path, expected: PackFile) -> None:
+def _resolve_verified_database(path: Path, expected: PackFile) -> Path:
     try:
-        with path.open("rb") as source:
-            if os.fstat(source.fileno()).st_size != expected.size_bytes:
+        resolved = path.resolve(strict=True)
+    except (OSError, RuntimeError):
+        raise EvaluationPackError("pack_file_unavailable") from None
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(
+            resolved,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0),
+        )
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise EvaluationPackError("pack_file_unavailable")
+        with os.fdopen(descriptor, "rb") as source:
+            descriptor = None
+            if metadata.st_size != expected.size_bytes:
                 raise EvaluationPackError("pack_file_size_mismatch")
             digest = sha256()
             for chunk in iter(lambda: source.read(1024 * 1024), b""):
@@ -357,8 +380,12 @@ def _verify_file(path: Path, expected: PackFile) -> None:
         raise
     except OSError:
         raise EvaluationPackError("pack_file_unavailable") from None
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
     if digest.hexdigest() != expected.sha256:
         raise EvaluationPackError("pack_file_digest_mismatch")
+    return resolved
 
 
 def _verified_bounded_bytes(path: Path, expected: PackFile, maximum: int) -> bytes:

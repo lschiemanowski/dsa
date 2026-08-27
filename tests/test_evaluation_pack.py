@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from hashlib import sha256
 from pathlib import Path
 from typing import Any
@@ -156,6 +157,31 @@ def test_loader_requests_only_exact_pinned_pack_files_and_verifies_content(
         }
 
 
+def test_loader_resolves_and_reverifies_a_snapshot_database_symlink(
+    tmp_path: Path,
+) -> None:
+    """The retained database path satisfies the runner's no-follow boundary."""
+    reference, files = _write_pack(tmp_path)
+    published = files[
+        "online-retail-ii/1.0.0/database/online_retail_ii.duckdb"
+    ]
+    blob = tmp_path / "cache" / "blobs" / sha256(published.read_bytes()).hexdigest()
+    blob.parent.mkdir(parents=True)
+    published.replace(blob)
+    published.symlink_to(blob)
+
+    pack = load_huggingface_evaluation_pack(reference, downloader=Downloader(files))
+
+    assert pack.database_path == blob.resolve(strict=True)
+    assert pack.database_path.is_file()
+    assert not pack.database_path.is_symlink()
+    descriptor = os.open(
+        pack.database_path,
+        os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+    )
+    os.close(descriptor)
+
+
 @pytest.mark.parametrize(
     ("updates", "message"),
     [
@@ -206,6 +232,23 @@ def test_loaded_pack_cannot_be_rebound_to_different_case_content(tmp_path: Path)
             manifest=pack.manifest,
             database_path=pack.database_path,
             cases=(changed,),
+        )
+
+
+def test_loaded_pack_cannot_bind_a_different_manifest_to_a_trusted_locator(
+    tmp_path: Path,
+) -> None:
+    """Direct construction still binds canonical manifest bytes to the locator."""
+    reference, files = _write_pack(tmp_path)
+    pack = load_huggingface_evaluation_pack(reference, downloader=Downloader(files))
+    changed_manifest = pack.manifest.model_copy(update={"pack_id": "different-pack"})
+
+    with pytest.raises(ValidationError, match="manifest does not match its locator"):
+        LoadedEvaluationPack(
+            reference=pack.reference,
+            manifest=changed_manifest,
+            database_path=pack.database_path,
+            cases=pack.cases,
         )
 
 

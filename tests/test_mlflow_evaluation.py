@@ -97,12 +97,22 @@ def evaluation_pack(
             },
         }
     )
+    manifest_bytes = (
+        json.dumps(
+            manifest.model_dump(mode="json"),
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+        + b"\n"
+    )
     return LoadedEvaluationPack(
         reference=HuggingFacePackReference(
             repo_id="example/tiny",
             revision="c" * 40,
             path="tiny/1.0.0",
-            manifest_sha256="d" * 64,
+            manifest_sha256=sha256(manifest_bytes).hexdigest(),
         ),
         manifest=manifest,
         database_path=request.database_path,
