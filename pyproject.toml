@@ -13,6 +13,9 @@ dependencies = [
     "referencing>=0.37,<1",
 ]
 
+[project.scripts]
+dsa-benchmark = "dsa.benchmark_cli:main"
+
 [project.optional-dependencies]
 huggingface = [
     "huggingface-hub>=1,<2",

@@ -6,7 +6,7 @@ import asyncio
 import json
 import os
 import re
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -29,6 +29,8 @@ _IMMUTABLE_IMAGE = re.compile(
 _IMAGE_ID = re.compile(r"sha256:[0-9a-f]{64}")
 _SERVER_VERSION = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,63}")
 _CONTAINER_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,62}")
+_CONTAINER_LABEL_KEY = re.compile(r"[a-z0-9][a-z0-9._-]{0,127}")
+_CONTAINER_LABEL_VALUE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 _SLEEP_SOURCE = """\
 import os
 import shutil
@@ -348,12 +350,21 @@ class DockerPythonExecutor:
         *,
         runner: DockerCommandRunner | None = None,
         container_name_factory: Callable[[], str] | None = None,
+        container_labels: Mapping[str, str] | None = None,
     ) -> None:
         self.configuration = configuration
         self.runner = runner or AsyncSubprocessDockerRunner()
         self.container_name_factory = container_name_factory or (
             lambda: f"dsa-python-{uuid4().hex}"
         )
+        labels = container_labels or {}
+        if any(
+            _CONTAINER_LABEL_KEY.fullmatch(key) is None
+            or _CONTAINER_LABEL_VALUE.fullmatch(value) is None
+            for key, value in labels.items()
+        ):
+            raise ValueError("Docker container labels must use safe bounded identities")
+        self.container_labels = tuple(sorted(labels.items()))
 
     async def execute(self, request: PythonExecutionRequest) -> PythonExecutionResult:
         runtime_identity = await self._runtime_identity()
@@ -710,6 +721,11 @@ class DockerPythonExecutor:
         database: Path,
         inputs: Path,
     ) -> tuple[str, ...]:
+        labels = tuple(
+            argument
+            for key, value in self.container_labels
+            for argument in ("--label", f"{key}={value}")
+        )
         return (
             self.configuration.docker_executable,
             "create",
@@ -783,6 +799,7 @@ class DockerPythonExecutor:
             f"type=bind,source={database},destination=/seed/database.duckdb,readonly",
             "--mount",
             f"type=bind,source={inputs},destination=/inputs,readonly",
+            *labels,
             self.configuration.image,
             self.configuration.python_executable,
             "-I",

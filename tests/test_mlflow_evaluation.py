@@ -292,6 +292,7 @@ def test_native_evaluation_uses_dataset_expectations_and_normal_reporting_path(
             self.dataset = Dataset()
             self.output: dict[str, Any] | None = None
             self.scorer_names: list[str] = []
+            self.run_tags: dict[str, str] | None = None
 
         def create_dataset(self, *, name: str, experiment_id: str) -> Dataset:
             assert name == "tiny-dataset"
@@ -304,6 +305,11 @@ def test_native_evaluation_uses_dataset_expectations_and_normal_reporting_path(
 
         def invalid_feedback(self, name: str, rationale: str) -> object:
             return {"name": name, "rationale": rationale, "valid": False}
+
+        @contextmanager
+        def evaluation_context(self, tags: dict[str, str]) -> Any:
+            self.run_tags = tags
+            yield object()
 
         def evaluate(
             self,
@@ -344,6 +350,10 @@ def test_native_evaluation_uses_dataset_expectations_and_normal_reporting_path(
             call_tools=[], custom_output_args={"count": 3}
         ),
         api=cast(Any, api),
+        run_tags={
+            "dsa.benchmark.cell_id": "cell-1",
+            "dsa.benchmark.study_sha256": "a" * 64,
+        },
     )
 
     assert result.dataset_id == "dataset-1"
@@ -357,6 +367,10 @@ def test_native_evaluation_uses_dataset_expectations_and_normal_reporting_path(
         "agent_failure",
         "infrastructure_failure",
     ]
+    assert api.run_tags == {
+        "dsa.benchmark.cell_id": "cell-1",
+        "dsa.benchmark.study_sha256": "a" * 64,
+    }
     assert api.dataset.records[0]["expectations"] == {"answer": {"count": 3}}
     assert api.output is not None
     assert api.output["accepted"] is True
@@ -367,6 +381,40 @@ def test_native_evaluation_uses_dataset_expectations_and_normal_reporting_path(
         "failure_code": "mlflow_configuration_missing",
     }
     assert os.environ["MLFLOW_GENAI_EVAL_SKIP_TRACE_VALIDATION"] == "false"
+
+
+def test_evaluation_rejects_unsafe_benchmark_tags_before_mlflow_work(
+    tmp_path: Path,
+) -> None:
+    request = valid_request(tmp_path)
+
+    with pytest.raises(ValueError, match="safe benchmark identities"):
+        run_mlflow_evaluation(
+            evaluation_pack(tmp_path),
+            dataset_name="tiny-dataset",
+            runs_directory=tmp_path / "runs",
+            model_configuration=request.model,
+            policy=request.policy,
+            run_tags={"dsa.benchmark.cell_id": "https://private.example/secret"},
+        )
+
+
+def test_native_api_starts_the_evaluation_run_with_benchmark_tags() -> None:
+    captured: list[dict[str, str]] = []
+
+    class Mlflow:
+        def start_run(self, *, tags: dict[str, str]) -> AbstractContextManager[None]:
+            captured.append(tags)
+            return nullcontext()
+
+    api_type: Any = vars(import_module("dsa.evaluation"))["_MlflowEvaluationApi"]
+    api = api_type.__new__(api_type)
+    api.mlflow = Mlflow()
+
+    with api.evaluation_context({"dsa.benchmark.cell_id": "cell-1"}):
+        pass
+
+    assert captured == [{"dsa.benchmark.cell_id": "cell-1"}]
 
 
 def test_native_mlflow_api_executes_one_analysis_per_dataset_row(
