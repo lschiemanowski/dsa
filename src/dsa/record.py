@@ -83,6 +83,13 @@ class ArtifactRecord(ContractModel):
         return self
 
 
+class DatabaseRecord(ContractModel):
+    """Content identities for the immutable source and final private run state."""
+
+    source_sha256: str = Field(pattern=r"[0-9a-f]{64}")
+    final_sha256: str = Field(pattern=r"[0-9a-f]{64}")
+
+
 class TerminalRecord(ContractModel):
     """The single canonical debugging and reproducibility record for a run."""
 
@@ -94,6 +101,7 @@ class TerminalRecord(ContractModel):
     messages: tuple[dict[str, JsonValue], ...] = ()
     usage: dict[str, JsonValue] = Field(default_factory=dict)
     artifacts: tuple[ArtifactRecord, ...] = ()
+    database: DatabaseRecord | None = None
     outcome: RunOutcome
 
     @model_validator(mode="after")

@@ -4,11 +4,15 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
+import shutil
+import stat
 from collections.abc import Callable, Iterable, Sequence
 from copy import deepcopy
 from dataclasses import asdict
 from datetime import UTC, datetime
+from hashlib import sha256
 from pathlib import Path
 from typing import Any, Protocol, cast
 from uuid import uuid4
@@ -45,6 +49,7 @@ from dsa.environment import (
 )
 from dsa.record import (
     ArtifactRecord,
+    DatabaseRecord,
     Failure,
     RetainedTerminalRecord,
     RunFailure,
@@ -71,6 +76,13 @@ class _ValidationAttemptsExceeded(Exception):
     pass
 
 
+class _SourceDatabaseError(Exception):
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
 class RunCompletion(ContractModel):
     """A terminal run plus the integrity reference to its retained bytes."""
 
@@ -90,8 +102,11 @@ async def run_analysis(
     python_executor: PythonExecutor | None = None,
     identity_factory: Callable[[], str] | None = None,
     clock: Callable[[], datetime] | None = None,
+    keep_workdir: bool = False,
 ) -> RunCompletion:
     """Validate, execute and retain exactly one analysis run."""
+    if type(keep_workdir) is not bool:
+        raise TypeError("keep_workdir must be a boolean")
     request_data = (
         request.model_dump(mode="python", round_trip=True)
         if isinstance(request, RunRequest)
@@ -108,12 +123,17 @@ async def run_analysis(
     run_directory = runs_directory / run_id
     run_directory.mkdir(mode=0o700)
 
-    if not canonical_request.database_path.is_file():
+    try:
+        working_database, source_database_sha256 = _prepare_working_database(
+            canonical_request.database_path,
+            run_directory,
+        )
+    except _SourceDatabaseError as error:
         outcome = RunFailure(
             failure=Failure(
                 stage="analysis_environment",
-                code="source_database_not_file",
-                message="The source database is not an available regular file",
+                code=error.code,
+                message=error.message,
             )
         )
         return _retain_completion(
@@ -129,7 +149,7 @@ async def run_analysis(
         )
 
     environment = AnalysisEnvironment(
-        database_path=canonical_request.database_path,
+        database_path=working_database,
         run_directory=run_directory,
         policy=canonical_request.policy,
         python_executor=python_executor,
@@ -154,6 +174,9 @@ async def run_analysis(
             (),
             outcome,
             run_directory,
+            source_database_sha256=source_database_sha256,
+            working_database=working_database,
+            keep_workdir=keep_workdir,
         )
         retained_error = cast(Any, error)
         retained_error.terminal_record = completion.record
@@ -177,6 +200,9 @@ async def run_analysis(
             (),
             outcome,
             run_directory,
+            source_database_sha256=source_database_sha256,
+            working_database=working_database,
+            keep_workdir=keep_workdir,
         )
     except TimeoutError:
         outcome = RunFailure(
@@ -196,6 +222,9 @@ async def run_analysis(
             (),
             outcome,
             run_directory,
+            source_database_sha256=source_database_sha256,
+            working_database=working_database,
+            keep_workdir=keep_workdir,
         )
     messages: tuple[dict[str, JsonValue], ...] = ()
     usage: dict[str, JsonValue] = {}
@@ -249,7 +278,7 @@ async def run_analysis(
             ) from error
         return proposal
 
-    def answer_from_artifact(handle: str) -> JsonValue:
+    async def answer_from_artifact(handle: str) -> JsonValue:
         """Submit a retained same-run JSON artifact as the final answer."""
         nonlocal validation_failures
         try:
@@ -332,9 +361,12 @@ async def run_analysis(
                     name="run_python",
                     description=(
                         "Execute source only through the configured isolated executor. "
-                        "Name retained artifact handles in inputs and read them from "
-                        "DSAGENT_INPUTS. Write exactly the declared .json or .parquet files "
-                        "to DSAGENT_OUTPUTS."
+                        "Name retained artifact handles in inputs. DSAGENT_DATABASE, "
+                        "DSAGENT_INPUTS, and DSAGENT_OUTPUTS are environment-variable "
+                        "names: resolve their paths with os.environ. Read only selected "
+                        "artifacts from the inputs directory. Write exactly the declared "
+                        ".json or .parquet files to the outputs directory. expected_outputs "
+                        "may be empty for a database-only exploratory or mutating call."
                     ),
                     sequential=True,
                 )
@@ -421,6 +453,9 @@ async def run_analysis(
             environment.artifact_records,
             outcome,
             run_directory,
+            source_database_sha256=source_database_sha256,
+            working_database=working_database,
+            keep_workdir=keep_workdir,
         )
         retained_error = cast(Any, error)
         retained_error.terminal_record = completion.record
@@ -443,6 +478,9 @@ async def run_analysis(
         environment.artifact_records,
         outcome,
         run_directory,
+        source_database_sha256=source_database_sha256,
+        working_database=working_database,
+        keep_workdir=keep_workdir,
     )
 
 
@@ -580,7 +618,37 @@ def _retain_completion(
     artifacts: tuple[ArtifactRecord, ...],
     outcome: RunOutcome,
     run_directory: Path,
+    *,
+    source_database_sha256: str | None = None,
+    working_database: Path | None = None,
+    keep_workdir: bool = False,
 ) -> RunCompletion:
+    database: DatabaseRecord | None = None
+    if source_database_sha256 is not None and working_database is not None:
+        try:
+            database = DatabaseRecord(
+                source_sha256=source_database_sha256,
+                final_sha256=_sha256_file(working_database),
+            )
+        except OSError:
+            outcome = RunFailure(
+                failure=Failure(
+                    stage="analysis_environment",
+                    code="working_database_unavailable",
+                    message="The final private database could not be retained safely",
+                )
+            )
+    if working_database is not None and not keep_workdir:
+        try:
+            shutil.rmtree(working_database.parent)
+        except OSError:
+            outcome = RunFailure(
+                failure=Failure(
+                    stage="analysis_environment",
+                    code="workspace_cleanup_failed",
+                    message="The private database workspace could not be removed",
+                )
+            )
     record = TerminalRecord(
         run_id=run_id,
         started_at=started_at,
@@ -589,10 +657,110 @@ def _retain_completion(
         messages=messages,
         usage=usage,
         artifacts=artifacts,
+        database=database,
         outcome=outcome,
     )
     retained = write_terminal_record(record, run_directory)
     return RunCompletion(record=record, retained_record=retained)
+
+
+def _prepare_working_database(source: Path, run_directory: Path) -> tuple[Path, str]:
+    wal = Path(f"{source}.wal")
+    if os.path.lexists(wal):
+        raise _SourceDatabaseError(
+            "source_database_wal",
+            "The source database has an active write-ahead log",
+        )
+
+    work_directory = run_directory / "work"
+    temporary = work_directory / f".database.{uuid4().hex}.tmp"
+    destination = work_directory / "database.duckdb"
+    source_descriptor: int | None = None
+    destination_descriptor: int | None = None
+    digest = sha256()
+    copied = 0
+    try:
+        work_directory.mkdir(mode=0o700)
+        (work_directory / "attempts").mkdir(mode=0o700)
+        try:
+            source_descriptor = os.open(
+                source,
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            )
+        except OSError as error:
+            raise _SourceDatabaseError(
+                "source_database_not_file",
+                "The source database is not an available regular file",
+            ) from error
+        initial = os.fstat(source_descriptor)
+        if not stat.S_ISREG(initial.st_mode):
+            raise _SourceDatabaseError(
+                "source_database_not_file",
+                "The source database is not an available regular file",
+            )
+        destination_descriptor = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+        )
+        with os.fdopen(destination_descriptor, "wb") as target:
+            destination_descriptor = None
+            with os.fdopen(source_descriptor, "rb") as source_handle:
+                source_descriptor = None
+                while chunk := source_handle.read(1024 * 1024):
+                    copied += len(chunk)
+                    digest.update(chunk)
+                    target.write(chunk)
+                final = os.fstat(source_handle.fileno())
+            target.flush()
+            os.fsync(target.fileno())
+        if (
+            copied != initial.st_size
+            or final.st_size != initial.st_size
+            or final.st_mtime_ns != initial.st_mtime_ns
+            or final.st_ino != initial.st_ino
+            or final.st_dev != initial.st_dev
+            or os.path.lexists(wal)
+        ):
+            raise _SourceDatabaseError(
+                "source_database_changed",
+                "The source database changed while its private copy was created",
+            )
+        os.replace(temporary, destination)
+        _fsync_directory(work_directory)
+        return destination, digest.hexdigest()
+    except _SourceDatabaseError:
+        shutil.rmtree(work_directory, ignore_errors=True)
+        raise
+    except OSError as error:
+        shutil.rmtree(work_directory, ignore_errors=True)
+        raise _SourceDatabaseError(
+            "source_database_copy_failed",
+            "The source database could not be copied into the private run workspace",
+        ) from error
+    finally:
+        if source_descriptor is not None:
+            os.close(source_descriptor)
+        if destination_descriptor is not None:
+            os.close(destination_descriptor)
+        temporary.unlink(missing_ok=True)
+
+
+def _sha256_file(path: Path) -> str:
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    digest = sha256()
+    with os.fdopen(descriptor, "rb") as handle:
+        while chunk := handle.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _fsync_directory(directory: Path) -> None:
+    descriptor = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def _validation_error_key(error: JsonSchemaValidationError) -> tuple[str, str]:

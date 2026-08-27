@@ -171,6 +171,8 @@ def test_policy_is_flat_positive_and_caps_inline_previews() -> None:
 
     assert dumped
     assert all(not isinstance(value, dict) for value in dumped.values())
+    assert dumped["max_python_cpus"] == 2
+    assert dumped["max_python_processes"] == 64
 
     with pytest.raises(ValidationError):
         RunPolicy(max_model_requests=0)
@@ -178,3 +180,7 @@ def test_policy_is_flat_positive_and_caps_inline_previews() -> None:
         RunPolicy(max_preview_rows=6)
     with pytest.raises(ValidationError):
         RunPolicy(max_total_tool_result_bytes=0)
+    with pytest.raises(ValidationError):
+        RunPolicy(max_python_cpus=0)
+    with pytest.raises(ValidationError):
+        RunPolicy(max_python_processes=0)

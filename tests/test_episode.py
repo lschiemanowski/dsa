@@ -5,6 +5,7 @@ import json
 from collections.abc import Callable
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
+from hashlib import sha256
 from pathlib import Path
 from typing import Any, cast
 
@@ -479,6 +480,139 @@ class EpisodePythonExecutor:
             json.dumps({"count": table.num_rows}), encoding="utf-8"
         )
         return PythonExecutionResult(stdout="", stderr="")
+
+
+class MutatingEpisodeExecutor:
+    def __init__(self) -> None:
+        self.database_path: Path | None = None
+
+    async def execute(self, request: PythonExecutionRequest) -> PythonExecutionResult:
+        self.database_path = request.database_path
+        assert request.environment == {
+            "DSAGENT_DATABASE": "/database/database.duckdb",
+            "DSAGENT_INPUTS": "/inputs",
+            "DSAGENT_OUTPUTS": "/outputs",
+        }
+        connection = duckdb.connect(str(request.database_path))
+        try:
+            connection.execute("insert into events values (12, 'event-12')")
+        finally:
+            connection.close()
+        return PythonExecutionResult(
+            runtime_identity="docker/test|sha256:" + "1" * 64,
+        )
+
+
+async def test_run_uses_private_database_commits_mutation_and_cleans_workspace(
+    tmp_path: Path,
+) -> None:
+    """Successful Python mutates only the run copy and later SQL sees that commit."""
+    request = valid_database_request(tmp_path)
+    source = request.database_path
+    source_before = source.read_bytes()
+    executor = MutatingEpisodeExecutor()
+    calls = 0
+
+    async def respond(_messages: list[Any], _info: AgentInfo) -> ModelResponse:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        "run_python",
+                        {"source": "# mutate", "inputs": [], "expected_outputs": []},
+                        "python-mutate",
+                    )
+                ]
+            )
+        if calls == 2:
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        "query_database",
+                        {"sql": "select count(*) from events"},
+                        "query-mutated",
+                    )
+                ]
+            )
+        return ModelResponse(
+            parts=[ToolCallPart("final_answer", {"count": 13}, "answer")]
+        )
+
+    completion = await run_analysis(
+        request,
+        runs_directory=tmp_path / "runs",
+        model=FunctionModel(respond, model_name="test"),
+        python_executor=executor,
+        identity_factory=lambda: "run-private-database",
+        clock=clock(),
+    )
+
+    assert isinstance(completion.outcome, RunSuccess)
+    assert completion.outcome.answer == {"count": 13}
+    assert executor.database_path is not None
+    assert executor.database_path != source
+    assert source.read_bytes() == source_before
+    assert completion.record.database is not None
+    assert completion.record.database.source_sha256 == sha256(source_before).hexdigest()
+    assert completion.record.database.final_sha256 != completion.record.database.source_sha256
+    assert not (tmp_path / "runs" / "run-private-database" / "work").exists()
+    retained = json.loads(completion.retained_record.path.read_text())
+    tool_results = [
+        json.loads(part["content"])
+        for message in retained["messages"]
+        for part in message["parts"]
+        if part["part_kind"] == "tool-return"
+        and part.get("tool_name") == "query_database"
+    ]
+    assert any(result.get("rows") == [[13]] for result in tool_results)
+
+
+async def test_operator_can_retain_private_database_for_debugging(tmp_path: Path) -> None:
+    """The operator-only override retains the final run copy without changing the request."""
+    request = valid_database_request(tmp_path)
+
+    completion = await run_analysis(
+        request,
+        runs_directory=tmp_path / "runs",
+        model=TestModel(call_tools=[], custom_output_args={"count": 12}),
+        identity_factory=lambda: "run-retained-work",
+        clock=clock(),
+        keep_workdir=True,
+    )
+
+    working = tmp_path / "runs" / "run-retained-work" / "work" / "database.duckdb"
+    assert working.is_file()
+    assert completion.record.database is not None
+    assert completion.record.database.final_sha256 == sha256(working.read_bytes()).hexdigest()
+    assert "keep_workdir" not in completion.record.request.model_dump()
+
+
+async def test_source_with_wal_is_rejected_before_model_execution(tmp_path: Path) -> None:
+    """A potentially changing DuckDB source cannot become an inconsistent private copy."""
+    request = valid_database_request(tmp_path)
+    Path(f"{request.database_path}.wal").write_bytes(b"active writer")
+    called = False
+
+    async def respond(_messages: list[Any], _info: AgentInfo) -> ModelResponse:
+        nonlocal called
+        called = True
+        return ModelResponse(parts=[])
+
+    completion = await run_analysis(
+        request,
+        runs_directory=tmp_path / "runs",
+        model=FunctionModel(respond, model_name="test"),
+        identity_factory=lambda: "run-source-wal",
+        clock=clock(),
+    )
+
+    assert called is False
+    assert isinstance(completion.outcome, RunFailure)
+    assert completion.outcome.failure.code == "source_database_wal"
+    assert completion.record.database is None
+    assert not (tmp_path / "runs" / "run-source-wal" / "work").exists()
 
 
 async def test_episode_uses_database_artifact_python_locator_and_json_final_output(
