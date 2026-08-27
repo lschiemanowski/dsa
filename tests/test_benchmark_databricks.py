@@ -17,6 +17,7 @@ from dsa import (
     read_benchmark_cell_receipt,
 )
 from dsa.benchmark import prepare_benchmark, run_prepared_benchmark
+from dsa.benchmark_report import build_benchmark_report, publish_benchmark_report
 
 
 def _benchmark_databricks_acceptance_enabled() -> bool:
@@ -108,3 +109,17 @@ def test_public_pack_benchmark_cell_reaches_databricks_once(
     tags = cast(dict[str, str], run.data.tags)
     assert tags["dsa.benchmark.cell_id"] == receipt.cell_id
     assert tags["dsa.benchmark.study_sha256"] == receipt.study_sha256
+
+    report = build_benchmark_report(
+        prepared.study,
+        prepared.runtime,
+        reporter_revision=revision,
+        pack_loader=lambda _reference: prepared.packs[0][1],
+    )
+    retained = publish_benchmark_report(report, tmp_path / "reports")
+
+    assert report.overall.case_count == prepared.packs[0][1].manifest.cases.case_count
+    assert retained.json_path.read_bytes() == report.canonical_json.encode()
+    assert retained.markdown_path.read_text().startswith(
+        "# Benchmark report: online-retail-databricks-acceptance\n"
+    )

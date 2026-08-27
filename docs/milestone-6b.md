@@ -177,6 +177,8 @@ read-only validation and publication described above. It emits one bounded canon
 status object containing the study digest, report digest, and two output paths. Invalid
 usage or configuration exits two, incomplete or contradictory evidence exits one,
 success exits zero, and cancellation exits 130. It never starts a benchmark cell.
+The output directory must be outside the private benchmark workspace so publication
+cannot change the evidence inventory or break an idempotent rerun.
 
 Deterministic tests cover strict report models, canonical ordering and identity,
 mutation resistance, complete-matrix enforcement, receipt and pack verification,

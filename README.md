@@ -167,12 +167,17 @@ that revision:
 dsa-benchmark plan --study study.json --runtime runtime.json
 dsa-benchmark run --study study.json --runtime runtime.json
 dsa-benchmark run --study study.json --runtime runtime.json --resume
+dsa-benchmark report --study study.json --runtime runtime.json --output reports
 ```
 
 `plan` performs the same complete preflight as `run` but makes no model call or MLflow
 write. `--resume` skips only a locally verified completed receipt. A partial attempt or
 unverifiable receipt is reported as ambiguous and preserved for operator inspection.
-The complete contract and lifecycle are recorded in `docs/milestone-6a.md`.
+`report` requires a complete matrix of verified receipts, reads only their exact
+Databricks MLflow runs, recomputes the existing scorers against the pinned packs, and
+atomically publishes canonical JSON plus deterministic Markdown without running a
+model or modifying remote state. The execution and publication contracts are recorded
+in `docs/milestone-6a.md` and `docs/milestone-6b.md`.
 
 `completion.reporting` is `disabled`, `reported`, or `failed`. A reporting failure does
 not change `completion.outcome` or the canonical local `terminal.json`. Enabled reporting

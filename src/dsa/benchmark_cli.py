@@ -12,7 +12,7 @@ import subprocess
 import sys
 from collections.abc import Callable, Coroutine, Sequence
 from pathlib import Path
-from typing import Any, Never
+from typing import Any, Never, Protocol
 
 from dsa.benchmark import (
     BenchmarkCellRunResult,
@@ -23,12 +23,28 @@ from dsa.benchmark import (
     prepare_benchmark,
     run_prepared_benchmark,
 )
+from dsa.benchmark_report import (
+    BenchmarkReportConfigurationError,
+    RetainedBenchmarkReport,
+    create_benchmark_report,
+)
 
 Preparer = Callable[..., Coroutine[Any, Any, PreparedBenchmark]]
 Runner = Callable[
     ...,
     Coroutine[Any, Any, tuple[BenchmarkCellRunResult, ...]],
 ]
+
+
+class Reporter(Protocol):
+    def __call__(
+        self,
+        study: BenchmarkStudy | object,
+        runtime: BenchmarkRuntime | object,
+        *,
+        output_directory: Path,
+        reporter_revision: str,
+    ) -> RetainedBenchmarkReport: ...
 
 
 class _HelpRequested(Exception):
@@ -51,6 +67,7 @@ def main(
     current_revision: str | None = None,
     preparer: Preparer = prepare_benchmark,
     runner: Runner = run_prepared_benchmark,
+    reporter: Reporter = create_benchmark_report,
 ) -> int:
     """Validate and execute one benchmark CLI operation."""
     try:
@@ -63,6 +80,37 @@ def main(
     except Exception:
         _emit({"code": "benchmark_usage", "status": "rejected"})
         return 2
+    if parsed.command == "report":
+        try:
+            retained = reporter(
+                study,
+                runtime,
+                output_directory=Path(parsed.output).resolve(),
+                reporter_revision=revision,
+            )
+        except KeyboardInterrupt:
+            return 130
+        except BenchmarkReportConfigurationError:
+            _emit(
+                {
+                    "code": "benchmark_report_preflight_failed",
+                    "status": "rejected",
+                }
+            )
+            return 2
+        except Exception:
+            _emit({"code": "benchmark_report_failed", "status": "failed"})
+            return 1
+        _emit(
+            {
+                "json_path": str(retained.json_path),
+                "markdown_path": str(retained.markdown_path),
+                "report_sha256": retained.report_sha256,
+                "status": "completed",
+                "study_sha256": study.sha256,
+            }
+        )
+        return 0
     try:
         prepared = asyncio.run(
             preparer(
@@ -110,6 +158,9 @@ def _parser() -> _Parser:
     run = commands.add_parser("run", add_help=True)
     _common_arguments(run)
     run.add_argument("--resume", action="store_true")
+    report = commands.add_parser("report", add_help=True)
+    _common_arguments(report)
+    report.add_argument("--output", required=True)
     return parser
 
 
