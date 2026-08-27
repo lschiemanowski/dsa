@@ -10,8 +10,8 @@ conversational task-definition system.
 
 ## Current milestone
 
-Milestone 3 adds a private writable database lifecycle and the production Docker
-executor to the deterministic run boundary:
+Milestone 4 adds opt-in Databricks MLflow observability and one native exact-scored
+evaluation path to the deterministic run boundary:
 
 - strict, serializable request and policy models
 - JSON Schema Draft 2020-12 validation
@@ -35,10 +35,13 @@ executor to the deterministic run boundary:
 - trusted process quiescence and WAL checkpointing before database recovery
 - default cleanup of private working databases with an operator-only debug override
 - direct final answers or same-run retained JSON final answers
+- an operator-only `report_to_mlflow` flag with context-local Pydantic AI tracing
+- exact terminal-record and artifact-manifest metadata export to Databricks
+- native MLflow Evaluation Datasets with host-only expectations and exact JSON scorers
 
 Model-authored Python is never executed on the host. The `run_python` tool is
-registered only when the host injects an executor. Databricks Free Edition MLflow
-integration remains a later milestone. A local MLflow server is not part of the design.
+registered only when the host injects an executor. MLflow reporting uses Databricks
+only; a local MLflow server or tracking database is not part of the design.
 
 ## Public boundary
 
@@ -93,6 +96,30 @@ executor = DockerPythonExecutor(default_docker_configuration("sha256:<64 hex dig
 completion = await run_analysis(request, python_executor=executor)
 ```
 
+Install the optional reporting dependency and provide operator-owned Databricks runtime
+configuration to report any ordinary run:
+
+```text
+uv sync --all-groups --extra mlflow --frozen
+export MLFLOW_TRACKING_URI=databricks
+export MLFLOW_EXPERIMENT_ID=<experiment-id>
+export DATABRICKS_HOST=<workspace-url>
+export DATABRICKS_TOKEN=<token>
+```
+
+```python
+completion = await run_analysis(
+    request,
+    runs_directory=Path("runs"),
+    report_to_mlflow=True,
+)
+```
+
+`completion.reporting` is `disabled`, `reported`, or `failed`. A reporting failure does
+not change `completion.outcome` or the canonical local `terminal.json`. Enabled reporting
+uploads the native Pydantic AI trace, the exact terminal record, and artifact metadata;
+it does not upload retained artifact contents, DuckDB files, or private workspaces.
+
 Each Python call receives a size-limited tmpfs copy of the private attempt database,
 explicitly selected read-only artifact inputs, and a size-limited tmpfs output directory.
 Only the database seed and selected inputs are host bind-mounted, both read-only; the
@@ -121,6 +148,13 @@ The opt-in real Docker tier requires an already available immutable image:
 
 ```text
 DSA_DOCKER_TEST_IMAGE=sha256:<64 hex digits> uv run pytest -m integration
+```
+
+The real Databricks acceptance test additionally requires the configuration above, a
+Unity Catalog dataset name in `DSA_MLFLOW_DATASET_NAME`, and explicit opt-in:
+
+```text
+DSA_DATABRICKS_TEST=1 uv run pytest -m databricks
 ```
 
 Python 3.12 is the development and CI baseline. Dependencies are resolved in
