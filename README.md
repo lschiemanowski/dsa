@@ -32,6 +32,7 @@ executor to the deterministic run boundary:
 - a digest-pinned, never-pull, non-root, networkless Docker backend with read-only binds
 - Docker memory, CPU, process, elapsed-time, writable-tmpfs, and diagnostic limits
 - disabled daemon logging and bounded host recovery of database and output bytes
+- trusted process quiescence and WAL checkpointing before database recovery
 - default cleanup of private working databases with an operator-only debug override
 - direct final answers or same-run retained JSON final answers
 

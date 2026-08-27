@@ -53,11 +53,15 @@ mounts. The host recovers those bytes through bounded descriptor streams after e
 Source code arrives on standard input rather than through a host mount. The declared
 output list may be empty for a database-only call.
 
-After the container has stopped and been removed, the host validates the complete attempt
-database and the complete declared output set. Artifact publication and replacement of
-the working database form one host-owned logical commit while the tool lock is held. If
-any validation, publication, replacement, or cleanup step fails, the attempt database
-and staged outputs are discarded and the prior working database remains current.
+After model execution, a trusted in-container phase terminates any remaining model
+processes, forces a DuckDB checkpoint, and requires the database directory to contain
+exactly one regular `database.duckdb` file with no WAL. Only then does the host recover
+the main file. After the container has been removed, the host validates the complete
+attempt database and declared output set. Artifact publication and replacement of the
+working database form one host-owned logical commit while the tool lock is held. If any
+quiescence, checkpoint, validation, publication, replacement, or cleanup step fails, the
+attempt database and staged outputs are discarded and the prior working database remains
+current.
 
 Successful mutations persist for later SQL and Python calls in the same run. Timeout,
 out-of-memory termination, nonzero exit, invalid or undeclared output, database
@@ -115,7 +119,7 @@ logical database-and-artifact commit, terminal digests, default cleanup, debuggi
 retention, strict Docker configuration, exact shell-free Docker arguments, bounded
 writable tmpfs state and recovery, disabled daemon logging, timeout killing, OOM
 classification, removal after uncertain creation and cancellation, permission recovery,
-and all earlier milestone behavior.
+trusted WAL checkpointing after abrupt model exit, and all earlier milestone behavior.
 
 A separately invoked real-Docker tier proves non-root execution, network denial, narrow
 mount visibility, read-only selected inputs, writable private database and outputs,

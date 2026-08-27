@@ -105,6 +105,7 @@ def successful_results(
         result(stdout=json.dumps(terminal).encode()),
         result(),
         result(),
+        result(),
         remove or result(),
     ]
 
@@ -227,6 +228,11 @@ async def test_executor_applies_complete_narrow_isolation_boundary(tmp_path: Pat
     )
     assert runner.calls[5][0][:3] == ("docker", "exec", "--interactive")
     assert runner.calls[5][1] == b"print('ok')"
+    checkpoint = runner.calls[7][0]
+    assert checkpoint[:3] == ("docker", "exec", "dsa-python-test")
+    assert "force checkpoint" in checkpoint[-1]
+    assert runner.calls[8][0][:3] == ("docker", "exec", "dsa-python-test")
+    assert runner.calls[9][0][:3] == ("docker", "exec", "dsa-python-test")
     assert runner.calls[-1][0] == ("docker", "rm", "--force", "dsa-python-test")
 
 
@@ -340,6 +346,47 @@ async def test_create_cancellation_finishes_named_cleanup(tmp_path: Path) -> Non
         "rm",
         "--force",
         "dsa-python-cancelled-create",
+    )
+
+
+async def test_failed_trusted_checkpoint_prevents_database_export(
+    tmp_path: Path,
+) -> None:
+    """A WAL or non-quiescent process failure cannot publish the main file alone."""
+    runner = RecordingDockerRunner(
+        [
+            result(stdout=b"29.7.2\n"),
+            result(stdout=(IMAGE + "\n").encode()),
+            result(),
+            result(),
+            result(),
+            result(),
+            result(
+                stdout=json.dumps(
+                    {"ExitCode": 0, "OOMKilled": False, "Running": True}
+                ).encode()
+            ),
+            result(returncode=4),
+            result(),
+        ]
+    )
+    executor = DockerPythonExecutor(
+        configuration(),
+        runner=runner,
+        container_name_factory=lambda: "dsa-python-checkpoint-failure",
+    )
+
+    with pytest.raises(PythonExecutionError) as caught:
+        await executor.execute(execution_request(tmp_path))
+
+    assert caught.value.code == "python_backend_error"
+    assert "checkpointed" in caught.value.message
+    assert len(runner.calls) == 9
+    assert runner.calls[-1][0] == (
+        "docker",
+        "rm",
+        "--force",
+        "dsa-python-checkpoint-failure",
     )
 
 
@@ -577,6 +624,85 @@ output.write_text(json.dumps({"isolated": True}))
     assert parquet.read_table(  # pyright: ignore[reportUnknownMemberType]
         run_directory / runtime.artifact_records[0].relative_path
     ).num_rows == 2
+    inspected = subprocess.run(
+        ["docker", "inspect", container_name],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    assert inspected.returncode != 0
+
+
+@pytest.mark.integration
+async def test_real_docker_checkpoints_wal_after_abrupt_success(
+    tmp_path: Path,
+) -> None:
+    """Committed WAL state survives os._exit while stray model children are terminated."""
+    image = os.environ.get("DSA_DOCKER_TEST_IMAGE")
+    if image is None:
+        pytest.skip("DSA_DOCKER_TEST_IMAGE is required for the real Docker tier")
+    source = tmp_path / "source.duckdb"
+    connection = duckdb.connect(str(source))
+    try:
+        connection.execute("create table events(value integer)")
+        connection.execute("insert into events values (1)")
+    finally:
+        connection.close()
+    run_directory = tmp_path / "run"
+    work_directory = run_directory / "work"
+    work_directory.mkdir(parents=True)
+    working = work_directory / "database.duckdb"
+    shutil.copyfile(source, working)
+    container_name = "dsa-python-real-wal-checkpoint"
+    runtime = AnalysisEnvironment(
+        database_path=working,
+        run_directory=run_directory,
+        policy=RunPolicy(max_python_seconds=20),
+        python_executor=DockerPythonExecutor(
+            DockerExecutorConfiguration(
+                image=image,
+                user_id=os.getuid(),
+                group_id=os.getgid(),
+            ),
+            container_name_factory=lambda: container_name,
+        ),
+    )
+    abrupt_source = """
+import os
+import subprocess
+import sys
+import duckdb
+
+subprocess.Popen(
+    [sys.executable, '-c', 'import time; time.sleep(300)'],
+    stdin=subprocess.DEVNULL,
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL,
+    start_new_session=True,
+)
+connection = duckdb.connect(os.environ['DSAGENT_DATABASE'])
+connection.execute('insert into events values (2)')
+os._exit(0)
+"""
+
+    tool_result = json.loads(
+        await runtime.run_python(
+            abrupt_source,
+            inputs=[],
+            expected_outputs=[],
+            tool_call_id="python-real-wal-checkpoint",
+        )
+    )
+
+    assert tool_result["ok"] is True, tool_result
+    connection = duckdb.connect(str(working), read_only=True)
+    try:
+        rows = connection.execute("select value from events order by value").fetchall()
+    finally:
+        connection.close()
+    assert rows == [(1,), (2,)]
+    assert not Path(f"{working}.wal").exists()
     inspected = subprocess.run(
         ["docker", "inspect", container_name],
         stdin=subprocess.DEVNULL,

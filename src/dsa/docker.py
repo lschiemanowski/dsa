@@ -29,20 +29,85 @@ _IMMUTABLE_IMAGE = re.compile(
 _IMAGE_ID = re.compile(r"sha256:[0-9a-f]{64}")
 _SERVER_VERSION = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,63}")
 _CONTAINER_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,62}")
-_SLEEP_SOURCE = (
-    "import shutil,time; "
-    "shutil.copyfile('/seed/database.duckdb','/database/database.duckdb'); "
-    "open('/database/.ready','wb').close(); "
-    "time.sleep(2147483647)"
-)
+_SLEEP_SOURCE = """\
+import os
+import shutil
+import signal
+import time
+
+def reap_children(*_ignored):
+    while True:
+        try:
+            child, _status = os.waitpid(-1, os.WNOHANG)
+        except ChildProcessError:
+            return
+        if child == 0:
+            return
+
+signal.signal(signal.SIGCHLD, reap_children)
+shutil.copyfile('/seed/database.duckdb', '/database/database.duckdb')
+open('/database/.ready', 'xb').close()
+while True:
+    time.sleep(3600)
+"""
 _WAIT_FOR_SEED_SOURCE = (
     "import pathlib,time; "
     "ready=pathlib.Path('/database/.ready'); "
     "deadline=time.monotonic()+30; "
     "exec(\"while not ready.exists():\\n"
     " if time.monotonic() >= deadline: raise SystemExit(1)\\n"
-    " time.sleep(0.01)\")"
+    " time.sleep(0.01)\"); "
+    "ready.unlink()"
 )
+_CHECKPOINT_DATABASE_SOURCE = """\
+import os
+import signal
+import stat
+import time
+from pathlib import Path
+
+import duckdb
+
+database_directory = Path('/database')
+database = database_directory / 'database.duckdb'
+os.chmod(database_directory, 0o700)
+metadata = database.lstat()
+if not stat.S_ISREG(metadata.st_mode):
+    raise SystemExit(2)
+os.chmod(database, 0o600)
+self_pid = os.getpid()
+deadline = time.monotonic() + 5
+while True:
+    foreign_pids = [
+        int(entry.name)
+        for entry in Path('/proc').iterdir()
+        if entry.name.isdigit() and int(entry.name) not in (1, self_pid)
+    ]
+    if not foreign_pids:
+        break
+    for pid in foreign_pids:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    if time.monotonic() >= deadline:
+        raise SystemExit(3)
+    time.sleep(0.01)
+connection = duckdb.connect(
+    str(database),
+    config={'enable_external_access': 'false'},
+)
+try:
+    connection.execute('force checkpoint')
+finally:
+    connection.close()
+entries = list(database_directory.iterdir())
+if len(entries) != 1 or entries[0].name != 'database.duckdb':
+    raise SystemExit(4)
+metadata = database.lstat()
+if not stat.S_ISREG(metadata.st_mode):
+    raise SystemExit(5)
+"""
 _VALIDATE_OUTPUTS_SOURCE = (
     "import json,os,sys; "
     "raise SystemExit(0 if sorted(os.listdir('/outputs')) == json.loads(sys.argv[1]) else 2)"
@@ -405,6 +470,24 @@ class DockerPythonExecutor:
                     failure = (
                         "python_exit_nonzero",
                         "Python execution exited unsuccessfully",
+                    )
+            if failure is None:
+                checkpointed = await self._control(
+                    (
+                        self.configuration.docker_executable,
+                        "exec",
+                        name,
+                        self.configuration.python_executable,
+                        "-I",
+                        "-B",
+                        "-c",
+                        _CHECKPOINT_DATABASE_SOURCE,
+                    )
+                )
+                if checkpointed.timed_out or checkpointed.returncode != 0:
+                    failure = (
+                        "python_backend_error",
+                        "The private database could not be checkpointed safely",
                     )
             if failure is None:
                 validated_outputs = await self._control(
