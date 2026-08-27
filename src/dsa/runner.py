@@ -58,6 +58,7 @@ from dsa.record import (
     TerminalRecord,
     write_terminal_record,
 )
+from dsa.reporting import MlflowReporting, run_with_mlflow_reporting
 
 _INSTRUCTIONS = """You are executing one completely specified data science task.
 Use the database tools to inspect schema and run bounded read-only SQL.
@@ -88,10 +89,15 @@ class RunCompletion(ContractModel):
 
     record: TerminalRecord
     retained_record: RetainedTerminalRecord
+    reporting: MlflowReporting = MlflowReporting()
 
     @property
     def outcome(self) -> RunOutcome:
         return self.record.outcome
+
+    def with_reporting(self, reporting: MlflowReporting) -> RunCompletion:
+        """Return an operator projection without changing canonical run state."""
+        return self.model_copy(update={"reporting": reporting})
 
 
 async def run_analysis(
@@ -103,10 +109,13 @@ async def run_analysis(
     identity_factory: Callable[[], str] | None = None,
     clock: Callable[[], datetime] | None = None,
     keep_workdir: bool = False,
+    report_to_mlflow: bool = False,
 ) -> RunCompletion:
     """Validate, execute and retain exactly one analysis run."""
     if type(keep_workdir) is not bool:
         raise TypeError("keep_workdir must be a boolean")
+    if type(report_to_mlflow) is not bool:
+        raise TypeError("report_to_mlflow must be a boolean")
     request_data = (
         request.model_dump(mode="python", round_trip=True)
         if isinstance(request, RunRequest)
@@ -118,6 +127,39 @@ async def run_analysis(
     run_id = identity_source()
     _validate_run_id(run_id)
     started_at = _aware_time(now())
+
+    async def operation() -> RunCompletion:
+        return await _run_canonical_analysis(
+            canonical_request,
+            run_id=run_id,
+            started_at=started_at,
+            runs_directory=runs_directory,
+            model=model,
+            python_executor=python_executor,
+            now=now,
+            keep_workdir=keep_workdir,
+        )
+
+    return await run_with_mlflow_reporting(
+        enabled=report_to_mlflow,
+        run_id=run_id,
+        request=canonical_request,
+        operation=operation,
+    )
+
+
+async def _run_canonical_analysis(
+    canonical_request: RunRequest,
+    *,
+    run_id: str,
+    started_at: datetime,
+    runs_directory: Path,
+    model: Model | str | None,
+    python_executor: PythonExecutor | None,
+    now: Callable[[], datetime],
+    keep_workdir: bool,
+) -> RunCompletion:
+    """Execute a validated request under its already-owned run identity."""
 
     runs_directory.mkdir(mode=0o700, parents=True, exist_ok=True)
     run_directory = runs_directory / run_id

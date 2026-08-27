@@ -12,6 +12,13 @@ from dsa.environment import (
     PythonExecutionResult,
     PythonExecutor,
 )
+from dsa.evaluation import (
+    MlflowEvaluationCase,
+    MlflowEvaluationError,
+    MlflowEvaluationPrediction,
+    MlflowEvaluationResult,
+    run_mlflow_evaluation,
+)
 from dsa.record import (
     ArtifactRecord,
     DatabaseRecord,
@@ -22,6 +29,7 @@ from dsa.record import (
     TerminalRecord,
     write_terminal_record,
 )
+from dsa.reporting import MlflowReporting
 from dsa.runner import RunCompletion, run_analysis
 
 __all__ = [
@@ -30,6 +38,11 @@ __all__ = [
     "DockerExecutorConfiguration",
     "DockerPythonExecutor",
     "Failure",
+    "MlflowEvaluationCase",
+    "MlflowEvaluationError",
+    "MlflowEvaluationPrediction",
+    "MlflowEvaluationResult",
+    "MlflowReporting",
     "ModelConfiguration",
     "PythonExecutionError",
     "PythonExecutionRequest",
@@ -44,5 +57,6 @@ __all__ = [
     "TerminalRecord",
     "default_docker_configuration",
     "run_analysis",
+    "run_mlflow_evaluation",
     "write_terminal_record",
 ]
