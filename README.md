@@ -10,8 +10,8 @@ conversational task-definition system.
 
 ## Current milestone
 
-Milestone 4 adds opt-in Databricks MLflow observability and one native exact-scored
-evaluation path to the deterministic run boundary:
+Milestone 5 adds one content-pinned Hugging Face evaluation pack to the opt-in
+Databricks MLflow observability and native exact-scored evaluation path:
 
 - strict, serializable request and policy models
 - JSON Schema Draft 2020-12 validation
@@ -38,6 +38,9 @@ evaluation path to the deterministic run boundary:
 - an operator-only `report_to_mlflow` flag with context-local Pydantic AI tracing
 - exact terminal-record and artifact-manifest metadata export to Databricks
 - native MLflow Evaluation Datasets with host-only expectations and exact JSON scorers
+- one immutable public Online Retail II pack containing twenty evaluation cases
+- exact Hugging Face repository revision, manifest, case-export, and database identities
+- runtime-only database paths, model configuration, and policy outside MLflow records
 
 Model-authored Python is never executed on the host. The `run_python` tool is
 registered only when the host injects an executor. MLflow reporting uses Databricks
@@ -96,11 +99,11 @@ executor = DockerPythonExecutor(default_docker_configuration("sha256:<64 hex dig
 completion = await run_analysis(request, python_executor=executor)
 ```
 
-Install the optional reporting dependency and provide operator-owned Databricks runtime
-configuration to report any ordinary run:
+Install the optional dependencies and provide operator-owned Databricks runtime
+configuration to resolve packs and report any ordinary run:
 
 ```text
-uv sync --all-groups --extra mlflow --frozen
+uv sync --all-groups --extra huggingface --extra mlflow --frozen
 export MLFLOW_TRACKING_URI=databricks
 export MLFLOW_EXPERIMENT_ID=<experiment-id>
 export DATABRICKS_HOST=<workspace-url>
@@ -114,6 +117,37 @@ completion = await run_analysis(
     report_to_mlflow=True,
 )
 ```
+
+The repository pins Online Retail II 1.0.0 through
+`evaluation-packs/online-retail-ii-1.0.0.json`. Load it from its exact public Hugging
+Face commit, then bind the machine-local model and policy only when evaluating:
+
+```python
+from pathlib import Path
+
+from dsa import (
+    HuggingFacePackReference,
+    load_huggingface_evaluation_pack,
+    run_mlflow_evaluation,
+)
+
+reference = HuggingFacePackReference.model_validate_json(
+    Path("evaluation-packs/online-retail-ii-1.0.0.json").read_bytes()
+)
+pack = load_huggingface_evaluation_pack(reference)
+result = run_mlflow_evaluation(
+    pack,
+    dataset_name="<databricks-unity-catalog-dataset>",
+    runs_directory=Path("runs"),
+    model_configuration=request.model,
+    policy=request.policy,
+)
+```
+
+Only case identity/version, database identity/digest, question, and answer schema enter
+MLflow dataset inputs. Reference answers remain evaluator-only expectations. Hugging Face
+cache paths, model configuration, run policy, and executor configuration remain host
+runtime bindings.
 
 `completion.reporting` is `disabled`, `reported`, or `failed`. A reporting failure does
 not change `completion.outcome` or the canonical local `terminal.json`. Enabled reporting
@@ -155,6 +189,12 @@ Unity Catalog dataset name in `DSA_MLFLOW_DATASET_NAME`, and explicit opt-in:
 
 ```text
 DSA_DATABRICKS_TEST=1 uv run pytest -m databricks
+```
+
+The exact public Hugging Face boundary has a separate opt-in acceptance test:
+
+```text
+DSA_HUGGINGFACE_TEST=1 uv run pytest tests/test_online_retail_pack.py
 ```
 
 Python 3.12 is the development and CI baseline. Dependencies are resolved in

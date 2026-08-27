@@ -13,11 +13,18 @@ from dsa.environment import (
     PythonExecutor,
 )
 from dsa.evaluation import (
-    MlflowEvaluationCase,
     MlflowEvaluationError,
     MlflowEvaluationPrediction,
     MlflowEvaluationResult,
     run_mlflow_evaluation,
+)
+from dsa.pack import (
+    EvaluationPackCase,
+    EvaluationPackError,
+    EvaluationPackManifest,
+    HuggingFacePackReference,
+    LoadedEvaluationPack,
+    load_huggingface_evaluation_pack,
 )
 from dsa.record import (
     ArtifactRecord,
@@ -37,8 +44,12 @@ __all__ = [
     "DatabaseRecord",
     "DockerExecutorConfiguration",
     "DockerPythonExecutor",
+    "EvaluationPackCase",
+    "EvaluationPackError",
+    "EvaluationPackManifest",
     "Failure",
-    "MlflowEvaluationCase",
+    "HuggingFacePackReference",
+    "LoadedEvaluationPack",
     "MlflowEvaluationError",
     "MlflowEvaluationPrediction",
     "MlflowEvaluationResult",
@@ -56,6 +67,7 @@ __all__ = [
     "RunSuccess",
     "TerminalRecord",
     "default_docker_configuration",
+    "load_huggingface_evaluation_pack",
     "run_analysis",
     "run_mlflow_evaluation",
     "write_terminal_record",
