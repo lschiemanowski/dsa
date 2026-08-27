@@ -7,6 +7,7 @@ import json
 import os
 import re
 from collections.abc import Callable, Sequence
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Protocol, cast
@@ -28,6 +29,29 @@ _IMMUTABLE_IMAGE = re.compile(
 _IMAGE_ID = re.compile(r"sha256:[0-9a-f]{64}")
 _SERVER_VERSION = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,63}")
 _CONTAINER_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,62}")
+_SLEEP_SOURCE = (
+    "import shutil,time; "
+    "shutil.copyfile('/seed/database.duckdb','/database/database.duckdb'); "
+    "open('/database/.ready','wb').close(); "
+    "time.sleep(2147483647)"
+)
+_WAIT_FOR_SEED_SOURCE = (
+    "import pathlib,time; "
+    "ready=pathlib.Path('/database/.ready'); "
+    "deadline=time.monotonic()+30; "
+    "exec(\"while not ready.exists():\\n"
+    " if time.monotonic() >= deadline: raise SystemExit(1)\\n"
+    " time.sleep(0.01)\")"
+)
+_VALIDATE_OUTPUTS_SOURCE = (
+    "import json,os,sys; "
+    "raise SystemExit(0 if sorted(os.listdir('/outputs')) == json.loads(sys.argv[1]) else 2)"
+)
+_STREAM_FILE_SOURCE = (
+    "import shutil,sys; "
+    "source=open(sys.argv[1],'rb',buffering=0); "
+    "shutil.copyfileobj(source,sys.stdout.buffer,length=1048576)"
+)
 
 
 class DockerExecutorConfiguration(ContractModel):
@@ -72,6 +96,8 @@ class DockerCommandResult:
     stdout_truncated: bool = False
     stderr_truncated: bool = False
     timed_out: bool = False
+    size_limit_exceeded: bool = False
+    written_bytes: int = 0
 
 
 class DockerCommandRunner(Protocol):
@@ -80,6 +106,15 @@ class DockerCommandRunner(Protocol):
         arguments: Sequence[str],
         *,
         input_bytes: bytes | None,
+        timeout_seconds: float,
+        output_limit: int,
+    ) -> DockerCommandResult: ...
+
+    async def run_to_file(
+        self,
+        arguments: Sequence[str],
+        *,
+        destination: Path,
         timeout_seconds: float,
         output_limit: int,
     ) -> DockerCommandResult: ...
@@ -148,6 +183,96 @@ class AsyncSubprocessDockerRunner:
             timed_out=timed_out,
         )
 
+    async def run_to_file(
+        self,
+        arguments: Sequence[str],
+        *,
+        destination: Path,
+        timeout_seconds: float,
+        output_limit: int,
+    ) -> DockerCommandResult:
+        descriptor = os.open(
+            destination,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+        )
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *arguments,
+                stdin=None,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except asyncio.CancelledError:
+            os.close(descriptor)
+            destination.unlink(missing_ok=True)
+            raise
+        except OSError:
+            os.close(descriptor)
+            destination.unlink(missing_ok=True)
+            return DockerCommandResult(returncode=127)
+
+        exceeded = asyncio.Event()
+        stdout_task = asyncio.create_task(
+            _drain_stream_to_descriptor(
+                process.stdout,
+                descriptor,
+                output_limit,
+                exceeded,
+            )
+        )
+        stderr_task = asyncio.create_task(
+            _drain_stream(process.stderr, _CONTROL_OUTPUT_BYTES)
+        )
+        wait_task = asyncio.create_task(process.wait())
+        exceeded_task = asyncio.create_task(exceeded.wait())
+        timed_out = False
+        size_limit_exceeded = False
+        cancel_streams = False
+        try:
+            async with asyncio.timeout(timeout_seconds):
+                done, _pending = await asyncio.wait(
+                    (wait_task, exceeded_task),
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if exceeded_task in done and exceeded.is_set():
+                    size_limit_exceeded = True
+                    cancel_streams = True
+                    if process.returncode is None:
+                        process.kill()
+                await process.wait()
+        except TimeoutError:
+            timed_out = True
+            cancel_streams = True
+            if process.returncode is None:
+                process.kill()
+            await process.wait()
+        except asyncio.CancelledError:
+            cancel_streams = True
+            if process.returncode is None:
+                process.kill()
+            await process.wait()
+            raise
+        finally:
+            wait_task.cancel()
+            exceeded_task.cancel()
+            if cancel_streams:
+                stdout_task.cancel()
+                stderr_task.cancel()
+            written_bytes = await stdout_task
+            stderr, stderr_truncated = await stderr_task
+            os.fsync(descriptor)
+            os.close(descriptor)
+
+        return DockerCommandResult(
+            returncode=process.returncode if process.returncode is not None else -1,
+            stderr=stderr,
+            stderr_truncated=stderr_truncated,
+            timed_out=timed_out,
+            size_limit_exceeded=size_limit_exceeded,
+            written_bytes=written_bytes,
+        )
+
 
 class DockerPythonExecutor:
     """Execute one Python request in a fresh constrained Docker container."""
@@ -179,15 +304,13 @@ class DockerPythonExecutor:
                 "The host generated an invalid container identity",
                 runtime_identity=runtime_identity,
             )
-        paths = (
-            request.database_path.resolve().parent,
-            request.inputs_directory.resolve(),
-            request.output_directory.resolve(),
-        )
+        database = request.database_path.resolve()
+        inputs = request.inputs_directory.resolve()
+        outputs = request.output_directory.resolve()
         if (
             request.database_path.name != "database.duckdb"
-            or any("," in str(path) for path in paths)
-            or not _separate_mounts(paths)
+            or any("," in str(path) or ":" in str(path) for path in (database, inputs, outputs))
+            or not _separate_mounts((database.parent, inputs, outputs))
         ):
             raise PythonExecutionError(
                 "python_backend_error",
@@ -195,31 +318,70 @@ class DockerPythonExecutor:
                 runtime_identity=runtime_identity,
             )
 
-        create = await self._control(self._create_arguments(name, request, paths))
-        if create.timed_out or create.returncode != 0:
-            raise PythonExecutionError(
-                "python_backend_error",
-                "The isolated Python container could not be created",
-                runtime_identity=runtime_identity,
-            )
-
-        start: DockerCommandResult | None = None
+        execution: DockerCommandResult | None = None
         failure: tuple[str, str] | None = None
         removed: DockerCommandResult | None = None
+        create_started = False
+        created = False
+        export_database = database.parent / f".container.{uuid4().hex}.duckdb"
         try:
-            start = await self.runner.run(
-                (
-                    self.configuration.docker_executable,
-                    "start",
-                    "--attach",
-                    "--interactive",
-                    name,
-                ),
-                input_bytes=request.source.encode("utf-8"),
-                timeout_seconds=max(0.05, request.timeout_seconds - 0.25),
-                output_limit=request.output_bytes,
+            database.chmod(0o444)
+            create_started = True
+            create = await self._control(
+                self._create_arguments(name, request, database, inputs)
             )
-            if start.timed_out:
+            if create.timed_out or create.returncode != 0:
+                failure = (
+                    "python_backend_error",
+                    "The isolated Python container could not be created",
+                )
+            else:
+                created = True
+            if failure is None:
+                start = await self._control(
+                    (self.configuration.docker_executable, "start", name)
+                )
+                if start.timed_out or start.returncode != 0:
+                    failure = (
+                        "python_backend_error",
+                        "The isolated Python container could not be started",
+                    )
+            if failure is None:
+                seeded = await self._control(
+                    (
+                        self.configuration.docker_executable,
+                        "exec",
+                        name,
+                        self.configuration.python_executable,
+                        "-I",
+                        "-B",
+                        "-c",
+                        _WAIT_FOR_SEED_SOURCE,
+                    )
+                )
+                database.chmod(0o600)
+                if seeded.timed_out or seeded.returncode != 0:
+                    failure = (
+                        "python_backend_error",
+                        "The private database could not initialize in the isolated container",
+                    )
+            if failure is None:
+                execution = await self.runner.run(
+                    (
+                        self.configuration.docker_executable,
+                        "exec",
+                        "--interactive",
+                        name,
+                        self.configuration.python_executable,
+                        "-I",
+                        "-B",
+                        "-",
+                    ),
+                    input_bytes=request.source.encode("utf-8"),
+                    timeout_seconds=max(0.05, request.timeout_seconds - 0.5),
+                    output_limit=request.output_bytes,
+                )
+            if execution is not None and execution.timed_out:
                 failure = (
                     "python_timeout",
                     "Python execution exceeded its elapsed-time limit",
@@ -227,7 +389,7 @@ class DockerPythonExecutor:
                 await self._control(
                     (self.configuration.docker_executable, "kill", name)
                 )
-            else:
+            elif execution is not None:
                 state = await self._container_state(name)
                 if state is None:
                     failure = (
@@ -239,21 +401,115 @@ class DockerPythonExecutor:
                         "python_memory_limit",
                         "Python execution exceeded its memory limit",
                     )
-                elif state[0] != 0:
+                elif execution.returncode != 0 or not state[2]:
                     failure = (
                         "python_exit_nonzero",
                         "Python execution exited unsuccessfully",
                     )
-        finally:
-            removed = await self._control(
-                (self.configuration.docker_executable, "rm", "--force", name)
+            if failure is None:
+                validated_outputs = await self._control(
+                    (
+                        self.configuration.docker_executable,
+                        "exec",
+                        name,
+                        self.configuration.python_executable,
+                        "-I",
+                        "-B",
+                        "-c",
+                        _VALIDATE_OUTPUTS_SOURCE,
+                        json.dumps(sorted(request.expected_outputs)),
+                    )
+                )
+                if validated_outputs.timed_out or validated_outputs.returncode != 0:
+                    failure = (
+                        "python_backend_error",
+                        "The isolated Python output set could not be recovered safely",
+                    )
+            if failure is None:
+                streamed_database = await self.runner.run_to_file(
+                    (
+                        self.configuration.docker_executable,
+                        "exec",
+                        name,
+                        self.configuration.python_executable,
+                        "-I",
+                        "-B",
+                        "-c",
+                        _STREAM_FILE_SOURCE,
+                        "/database/database.duckdb",
+                    ),
+                    destination=export_database,
+                    timeout_seconds=self.configuration.control_timeout_seconds,
+                    output_limit=request.database_storage_bytes,
+                )
+                if (
+                    streamed_database.timed_out
+                    or streamed_database.size_limit_exceeded
+                    or streamed_database.returncode != 0
+                ):
+                    failure = (
+                        "python_backend_error",
+                        "The private database could not be recovered within its limit",
+                    )
+                else:
+                    remaining_output_bytes = request.output_storage_bytes
+                    for expected_output in request.expected_outputs:
+                        streamed_output = await self.runner.run_to_file(
+                            (
+                                self.configuration.docker_executable,
+                                "exec",
+                                name,
+                                self.configuration.python_executable,
+                                "-I",
+                                "-B",
+                                "-c",
+                                _STREAM_FILE_SOURCE,
+                                f"/outputs/{expected_output}",
+                            ),
+                            destination=outputs / expected_output,
+                            timeout_seconds=self.configuration.control_timeout_seconds,
+                            output_limit=remaining_output_bytes,
+                        )
+                        if (
+                            streamed_output.timed_out
+                            or streamed_output.size_limit_exceeded
+                            or streamed_output.returncode != 0
+                        ):
+                            failure = (
+                                "python_backend_error",
+                                "An isolated Python output could not be recovered within "
+                                "its limit",
+                            )
+                            break
+                        remaining_output_bytes -= streamed_output.written_bytes
+                    if failure is None:
+                        os.replace(export_database, database)
+        except OSError:
+            failure = (
+                "python_backend_error",
+                "The isolated Python workspace could not be prepared safely",
             )
+        finally:
+            with suppress(OSError):
+                database.chmod(0o600)
+            with suppress(OSError):
+                export_database.unlink(missing_ok=True)
+            if create_started:
+                removed = await self._remove_container(name)
 
-        assert start is not None
-        assert removed is not None
-        stdout = start.stdout.decode("utf-8", errors="replace")
-        stderr = start.stderr.decode("utf-8", errors="replace")
-        if removed.timed_out or removed.returncode != 0:
+        stdout = (
+            execution.stdout.decode("utf-8", errors="replace")
+            if execution is not None
+            else ""
+        )
+        stderr = (
+            execution.stderr.decode("utf-8", errors="replace")
+            if execution is not None
+            else ""
+        )
+        if created and (
+            removed is None or removed.timed_out or removed.returncode != 0
+        ):
             failure = (
                 "python_container_cleanup",
                 "The isolated Python container could not be removed",
@@ -264,15 +520,19 @@ class DockerPythonExecutor:
                 failure[1],
                 stdout=stdout,
                 stderr=stderr,
-                stdout_truncated=start.stdout_truncated,
-                stderr_truncated=start.stderr_truncated,
+                stdout_truncated=(
+                    execution.stdout_truncated if execution is not None else False
+                ),
+                stderr_truncated=(
+                    execution.stderr_truncated if execution is not None else False
+                ),
                 runtime_identity=runtime_identity,
             )
         return PythonExecutionResult(
             stdout=stdout,
             stderr=stderr,
-            stdout_truncated=start.stdout_truncated,
-            stderr_truncated=start.stderr_truncated,
+            stdout_truncated=execution.stdout_truncated if execution is not None else False,
+            stderr_truncated=execution.stderr_truncated if execution is not None else False,
             runtime_identity=runtime_identity,
         )
 
@@ -308,7 +568,7 @@ class DockerPythonExecutor:
             return None
         return f"docker/{server}|{self.configuration.image}|{image_id}"
 
-    async def _container_state(self, name: str) -> tuple[int, bool] | None:
+    async def _container_state(self, name: str) -> tuple[int, bool, bool] | None:
         inspected = await self._control(
             (
                 self.configuration.docker_executable,
@@ -329,9 +589,14 @@ class DockerPythonExecutor:
         mapping = cast(dict[str, object], state)
         exit_code = mapping.get("ExitCode")
         oom_killed = mapping.get("OOMKilled")
-        if type(exit_code) is not int or type(oom_killed) is not bool:
+        running = mapping.get("Running")
+        if (
+            type(exit_code) is not int
+            or type(oom_killed) is not bool
+            or type(running) is not bool
+        ):
             return None
-        return exit_code, oom_killed
+        return exit_code, oom_killed, running
 
     async def _control(self, arguments: Sequence[str]) -> DockerCommandResult:
         return await self.runner.run(
@@ -341,18 +606,36 @@ class DockerPythonExecutor:
             output_limit=_CONTROL_OUTPUT_BYTES,
         )
 
+    async def _remove_container(self, name: str) -> DockerCommandResult:
+        """Finish one bounded removal attempt even if this task is cancelled."""
+        cleanup = asyncio.create_task(
+            self._control(
+                (self.configuration.docker_executable, "rm", "--force", name)
+            )
+        )
+        try:
+            return await asyncio.shield(cleanup)
+        except asyncio.CancelledError:
+            with suppress(asyncio.CancelledError):
+                await cleanup
+            raise
+
     def _create_arguments(
         self,
         name: str,
         request: PythonExecutionRequest,
-        paths: tuple[Path, Path, Path],
+        database: Path,
+        inputs: Path,
     ) -> tuple[str, ...]:
-        database, inputs, outputs = paths
         return (
             self.configuration.docker_executable,
             "create",
             "--name",
             name,
+            "--pull",
+            "never",
+            "--log-driver",
+            "none",
             "--interactive",
             "--network",
             "none",
@@ -375,6 +658,14 @@ class DockerPythonExecutor:
             str(request.process_limit),
             "--tmpfs",
             f"/tmp:rw,nosuid,nodev,noexec,mode=1777,size={request.scratch_bytes}",
+            "--tmpfs",
+            "/database:rw,nosuid,nodev,noexec,"
+            f"uid={self.configuration.user_id},gid={self.configuration.group_id},"
+            f"mode=0700,size={request.database_storage_bytes}",
+            "--tmpfs",
+            "/outputs:rw,nosuid,nodev,noexec,"
+            f"uid={self.configuration.user_id},gid={self.configuration.group_id},"
+            f"mode=0700,size={request.output_storage_bytes}",
             "--workdir",
             "/outputs",
             "--env",
@@ -406,16 +697,15 @@ class DockerPythonExecutor:
             "--env",
             "DSAGENT_OUTPUTS=/outputs",
             "--mount",
-            f"type=bind,source={database},destination=/database",
+            f"type=bind,source={database},destination=/seed/database.duckdb,readonly",
             "--mount",
             f"type=bind,source={inputs},destination=/inputs,readonly",
-            "--mount",
-            f"type=bind,source={outputs},destination=/outputs",
             self.configuration.image,
             self.configuration.python_executable,
             "-I",
             "-B",
-            "-",
+            "-c",
+            _SLEEP_SOURCE,
         )
 
 
@@ -439,6 +729,31 @@ async def _drain_stream(
         # the executor can kill and remove that container in its own finally.
         pass
     return bytes(retained), truncated
+
+
+async def _drain_stream_to_descriptor(
+    stream: asyncio.StreamReader | None,
+    descriptor: int,
+    limit: int,
+    exceeded: asyncio.Event,
+) -> int:
+    if stream is None:
+        return 0
+    written = 0
+    try:
+        while chunk := await stream.read(64 * 1024):
+            remaining = max(0, limit - written)
+            retained = chunk[:remaining]
+            offset = 0
+            while offset < len(retained):
+                offset += os.write(descriptor, retained[offset:])
+            written += len(retained)
+            if len(chunk) > remaining:
+                exceeded.set()
+                break
+    except asyncio.CancelledError:
+        pass
+    return written
 
 
 def _separate_mounts(paths: tuple[Path, Path, Path]) -> bool:

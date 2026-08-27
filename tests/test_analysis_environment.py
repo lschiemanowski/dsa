@@ -4,6 +4,7 @@ import asyncio
 import json
 import math
 import os
+import shutil
 from collections.abc import Callable, Iterator
 from hashlib import sha256
 from pathlib import Path
@@ -1069,6 +1070,61 @@ async def test_failed_python_call_rolls_back_database_mutation(tmp_path: Path) -
 
     assert result["error"]["code"] == "python_failed"
     assert sha256(runtime.database_path.read_bytes()).hexdigest() == before
+
+
+class PermissionChangingExecutor:
+    async def execute(self, request: PythonExecutionRequest) -> PythonExecutionResult:
+        request.output_directory.chmod(0)
+        request.database_path.parent.chmod(0)
+        return PythonExecutionResult()
+
+
+async def test_executor_permissions_cannot_escape_python_tool_boundary(
+    tmp_path: Path,
+) -> None:
+    """Managed modes are restored before validation and private cleanup."""
+    runtime = environment(tmp_path, python_executor=PermissionChangingExecutor())
+
+    result = json.loads(
+        await runtime.run_python(
+            "# change managed directory modes",
+            inputs=[],
+            expected_outputs=[],
+            tool_call_id="python-permissions",
+        )
+    )
+
+    assert result["ok"] is True
+    assert list((runtime.run_directory / "work" / "attempts").iterdir()) == []
+
+
+async def test_attempt_cleanup_failure_is_stable_and_rolls_back(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cleanup completes before promotion, so its failure cannot commit state."""
+    runtime = environment(tmp_path, python_executor=DatabaseOnlyExecutor())
+    before = runtime.database_path.read_bytes()
+    original_rmtree = shutil.rmtree
+
+    def fail_attempt(path: Path) -> None:
+        if path.name.startswith("python-"):
+            raise PermissionError("simulated private cleanup failure")
+        original_rmtree(path)
+
+    monkeypatch.setattr(environment_module.shutil, "rmtree", fail_attempt)
+    result = json.loads(
+        await runtime.run_python(
+            "# mutate before cleanup failure",
+            inputs=[],
+            expected_outputs=[],
+            tool_call_id="python-cleanup-failure",
+        )
+    )
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == "python_workspace_cleanup_failed"
+    assert runtime.database_path.read_bytes() == before
 
 
 class BlockingMutationExecutor:

@@ -41,16 +41,17 @@ argument is not part of the public request, model context, or `RunPolicy`.
 
 Each call receives a fresh private attempt directory containing:
 
-- a copy of the current working database in its own writable mount directory
+- a host-private copy of the current working database used only as a read-only seed
 - read-only copies of only the selected retained input artifacts
-- a fresh output staging directory
+- a fresh host output staging directory that is never mounted into the container
 
 The container receives fixed locators through the environment-variable names
 `DSAGENT_DATABASE`, `DSAGENT_INPUTS`, and `DSAGENT_OUTPUTS`; model code resolves their
-values through `os.environ`. The database directory is isolated from the input and
-output directories so DuckDB can manage its private write-ahead log without exposing a
-broader host directory. Source code arrives on standard input rather than through a host
-mount. The declared output list may be empty for a database-only call.
+values through `os.environ`. Docker copies the seed into a size-limited private tmpfs;
+model code writes the database and declared outputs only in separate size-limited tmpfs
+mounts. The host recovers those bytes through bounded descriptor streams after execution.
+Source code arrives on standard input rather than through a host mount. The declared
+output list may be empty for a database-only call.
 
 After the container has stopped and been removed, the host validates the complete attempt
 database and the complete declared output set. Artifact publication and replacement of
@@ -78,14 +79,19 @@ Every invocation uses a fresh container with:
 - no host PID namespace and a private IPC namespace
 - explicit memory, CPU, process, elapsed-time, and tmpfs limits
 - deterministic single-thread analytical-library environment variables
-- only the attempt database, selected inputs, and output staging mounts
+- only a read-only database seed and selected-input bind mounts; writable database,
+  output, and scratch state lives in size-limited tmpfs mounts
+- disabled daemon logging and bounded attached-stream diagnostics
+- an explicit never-pull policy at container creation
 - no checkout, home directory, credentials, Docker socket, or inherited container
   environment
 
-The host drains stdout and stderr while retaining only bounded prefixes. Timeout kills
-the container. OOM state and nonzero exit are classified separately. Container removal
-is mandatory before an invocation can succeed. The Docker server, configured image
-reference, and inspected image identity are retained as safe runtime evidence.
+The host drains stdout and stderr while retaining only bounded prefixes, and Docker does
+not retain a second daemon-side log. Timeout kills the container. OOM state and nonzero
+exit are classified separately. A bounded best-effort named removal follows every
+create attempt, including uncertain failures and cancellation; successful creation
+requires successful removal. The Docker server, configured image reference, and
+inspected image identity are retained as safe runtime evidence.
 
 The repository image recipe uses a digest-pinned Python 3.12 base, a fully pinned
 analytical package set derived from the proven prototype environment, and a non-root
@@ -107,8 +113,9 @@ Deterministic tests cover source copying and hashing, WAL rejection, source immu
 tool serialization, successful mutation persistence, rollback for every failure class,
 logical database-and-artifact commit, terminal digests, default cleanup, debugging
 retention, strict Docker configuration, exact shell-free Docker arguments, bounded
-diagnostics, timeout killing, OOM classification, mandatory removal, and all earlier
-milestone behavior.
+writable tmpfs state and recovery, disabled daemon logging, timeout killing, OOM
+classification, removal after uncertain creation and cancellation, permission recovery,
+and all earlier milestone behavior.
 
 A separately invoked real-Docker tier proves non-root execution, network denial, narrow
 mount visibility, read-only selected inputs, writable private database and outputs,

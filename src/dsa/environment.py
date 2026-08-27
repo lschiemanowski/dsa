@@ -12,6 +12,7 @@ import stat
 import tempfile
 from base64 import b64encode
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import date, datetime, time
 from decimal import Decimal
@@ -116,6 +117,8 @@ class PythonExecutionRequest:
     process_limit: int
     scratch_bytes: int
     output_bytes: int
+    database_storage_bytes: int
+    output_storage_bytes: int
 
 
 @dataclass(frozen=True)
@@ -594,7 +597,8 @@ class AnalysisEnvironment:
         *,
         tool_call_id: str,
     ) -> str:
-        if self.python_executor is None:
+        executor = self.python_executor
+        if executor is None:
             return self._tool_error(
                 "python_unavailable",
                 "No isolated Python executor is configured for this run",
@@ -602,6 +606,20 @@ class AnalysisEnvironment:
         issue = _python_request_issue(source, inputs, expected_outputs)
         if issue is not None:
             return self._tool_error(*issue)
+        retained = self._artifacts.records
+        if len(retained) + len(expected_outputs) > self.policy.max_artifact_count:
+            return self._tool_error(
+                "artifact_count_limit",
+                "The run artifact count limit was reached",
+            )
+        remaining_output_bytes = self.policy.max_total_artifact_bytes - sum(
+            record.size_bytes for record in retained
+        )
+        if expected_outputs and remaining_output_bytes <= 0:
+            return self._tool_error(
+                "artifact_total_limit",
+                "The run artifact byte limit was reached. Reuse or reduce existing results",
+            )
         self._attempts_directory.mkdir(mode=0o700, parents=True, exist_ok=True)
         staging = Path(
             tempfile.mkdtemp(prefix="python-", dir=self._attempts_directory)
@@ -613,80 +631,116 @@ class AnalysisEnvironment:
         database_directory = staging / "database"
         database_directory.mkdir(mode=0o700)
         attempt_database = database_directory / "database.duckdb"
-        candidate_database = staging / ".database.candidate"
-        try:
-            shutil.copyfile(self.database_path, attempt_database)
-            attempt_database.chmod(0o600)
-            for handle in inputs:
-                self._artifacts.copy_verified(handle, inputs_directory)
-            request = PythonExecutionRequest(
-                source=source,
-                database_path=attempt_database,
-                inputs_directory=inputs_directory,
-                output_directory=output_directory,
-                expected_outputs=tuple(expected_outputs),
-                environment={
-                    "DSAGENT_DATABASE": "/database/database.duckdb",
-                    "DSAGENT_INPUTS": "/inputs",
-                    "DSAGENT_OUTPUTS": "/outputs",
-                },
-                timeout_seconds=self.policy.max_python_seconds,
-                memory_bytes=self.policy.max_python_memory_bytes,
-                cpu_count=self.policy.max_python_cpus,
-                process_limit=self.policy.max_python_processes,
-                scratch_bytes=self.policy.max_python_scratch_bytes,
-                output_bytes=self.policy.max_python_output_bytes,
-            )
-            try:
-                async with asyncio.timeout(self.policy.max_python_seconds):
-                    execution = await self.python_executor.execute(request)
-            except TimeoutError:
-                return self._tool_error("python_timeout", "Python execution timed out")
-            except PythonExecutionError as error:
-                return self._python_error(error)
-            except Exception as error:
-                return self._tool_error(
-                    "python_failed",
-                    f"The isolated Python executor failed ({type(error).__name__})",
-                )
+        candidate_database = self._attempts_directory / f".candidate.{uuid4().hex}.duckdb"
 
-            if output_directory.is_symlink() or not output_directory.is_dir():
-                return self._tool_error(
-                    "python_output_directory_invalid",
-                    "The managed Python output directory was replaced",
+        async def execute_attempt() -> str:
+            try:
+                shutil.copyfile(self.database_path, attempt_database)
+                attempt_database.chmod(0o600)
+                for handle in inputs:
+                    self._artifacts.copy_verified(handle, inputs_directory)
+                request = PythonExecutionRequest(
+                    source=source,
+                    database_path=attempt_database,
+                    inputs_directory=inputs_directory,
+                    output_directory=output_directory,
+                    expected_outputs=tuple(expected_outputs),
+                    environment={
+                        "DSAGENT_DATABASE": "/database/database.duckdb",
+                        "DSAGENT_INPUTS": "/inputs",
+                        "DSAGENT_OUTPUTS": "/outputs",
+                    },
+                    timeout_seconds=self.policy.max_python_seconds,
+                    memory_bytes=self.policy.max_python_memory_bytes,
+                    cpu_count=self.policy.max_python_cpus,
+                    process_limit=self.policy.max_python_processes,
+                    scratch_bytes=self.policy.max_python_scratch_bytes,
+                    output_bytes=self.policy.max_python_output_bytes,
+                    database_storage_bytes=(
+                        attempt_database.stat().st_size
+                        + self.policy.max_python_scratch_bytes
+                    ),
+                    output_storage_bytes=max(1, remaining_output_bytes),
                 )
-            actual_outputs = sorted(path.name for path in output_directory.iterdir())
-            if actual_outputs != sorted(expected_outputs):
-                return self._tool_error(
-                    "python_outputs_mismatch",
-                    "Python must create exactly the declared output files",
+                try:
+                    async with asyncio.timeout(self.policy.max_python_seconds):
+                        execution = await executor.execute(request)
+                except TimeoutError:
+                    return self._tool_error("python_timeout", "Python execution timed out")
+                except PythonExecutionError as error:
+                    return self._python_error(error)
+                except Exception as error:
+                    return self._tool_error(
+                        "python_failed",
+                        f"The isolated Python executor failed ({type(error).__name__})",
+                    )
+
+                try:
+                    _restore_managed_directory(staging)
+                    _restore_managed_directory(inputs_directory)
+                    _restore_managed_directory(output_directory)
+                    _restore_managed_directory(database_directory)
+                    _restore_regular_file(attempt_database)
+                    for name in expected_outputs:
+                        _restore_regular_file(output_directory / name, required=False)
+                except OSError:
+                    return self._tool_error(
+                        "python_workspace_invalid",
+                        "The isolated executor replaced a managed workspace path",
+                    )
+                actual_outputs = sorted(path.name for path in output_directory.iterdir())
+                if actual_outputs != sorted(expected_outputs):
+                    return self._tool_error(
+                        "python_outputs_mismatch",
+                        "Python must create exactly the declared output files",
+                    )
+                await _run_blocking(
+                    _snapshot_and_checkpoint_database,
+                    attempt_database,
+                    candidate_database,
+                    self.policy.max_query_memory_bytes,
                 )
-            await _run_blocking(
-                _snapshot_and_checkpoint_database,
-                attempt_database,
-                candidate_database,
-                self.policy.max_query_memory_bytes,
+                output_paths = [output_directory / name for name in expected_outputs]
+                records = self._artifacts.publish_files(
+                    [
+                        (path, _OUTPUT_MEDIA_TYPES[Path(name).suffix])
+                        for name, path in zip(expected_outputs, output_paths, strict=True)
+                    ],
+                    producer_tool_call_id=tool_call_id,
+                    validator=lambda path, media_type: _validate_executor_output(
+                        path,
+                        media_type,
+                        self.policy.max_artifact_bytes,
+                        self.policy.max_tool_result_bytes,
+                    ),
+                    commit=lambda: _commit_python_attempt(
+                        staging,
+                        candidate_database,
+                        self.database_path,
+                    ),
+                )
+                return self._python_result(execution, records)
+            except ArtifactError as error:
+                return self._tool_error(error.code, error.message)
+
+        try:
+            result = await execute_attempt()
+        except BaseException:
+            _remove_attempt_workspace(staging)
+            with suppress(OSError):
+                candidate_database.unlink(missing_ok=True)
+            raise
+        cleanup_error = _remove_attempt_workspace(staging)
+        try:
+            candidate_database.unlink(missing_ok=True)
+        except OSError:
+            cleanup_error = True
+        if cleanup_error:
+            return self._tool_error(
+                "python_workspace_cleanup_failed",
+                "The private Python attempt workspace could not be removed",
             )
-            output_paths = [output_directory / name for name in expected_outputs]
-            records = self._artifacts.publish_files(
-                [
-                    (path, _OUTPUT_MEDIA_TYPES[Path(name).suffix])
-                    for name, path in zip(expected_outputs, output_paths, strict=True)
-                ],
-                producer_tool_call_id=tool_call_id,
-                validator=lambda path, media_type: _validate_executor_output(
-                    path,
-                    media_type,
-                    self.policy.max_artifact_bytes,
-                    self.policy.max_tool_result_bytes,
-                ),
-                commit=lambda: os.replace(candidate_database, self.database_path),
-            )
-            return self._python_result(execution, records)
-        except ArtifactError as error:
-            return self._tool_error(error.code, error.message)
-        finally:
-            shutil.rmtree(staging)
+        return result
 
     def load_json_artifact(self, handle: str) -> JsonValue:
         record, content = self._artifacts.read_verified_bytes(
@@ -1376,6 +1430,51 @@ def _snapshot_and_checkpoint_database(
             "python_database_invalid",
             "Python did not leave a checkpointed DuckDB database",
         )
+
+
+def _restore_managed_directory(path: Path) -> None:
+    metadata = path.lstat()
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise OSError("managed directory was replaced")
+    os.chmod(path, 0o700, follow_symlinks=False)
+
+
+def _restore_regular_file(path: Path, *, required: bool = True) -> None:
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        if required:
+            raise
+        return
+    if stat.S_ISREG(metadata.st_mode):
+        os.chmod(path, 0o600, follow_symlinks=False)
+
+
+def _remove_attempt_workspace(staging: Path) -> bool:
+    if not os.path.lexists(staging):
+        return False
+    try:
+        _restore_managed_directory(staging)
+        for name in ("inputs", "outputs", "database"):
+            with suppress(OSError):
+                _restore_managed_directory(staging / name)
+        shutil.rmtree(staging)
+    except OSError:
+        return True
+    return False
+
+
+def _commit_python_attempt(
+    staging: Path,
+    candidate_database: Path,
+    working_database: Path,
+) -> None:
+    if _remove_attempt_workspace(staging):
+        raise ArtifactError(
+            "python_workspace_cleanup_failed",
+            "The private Python attempt workspace could not be removed",
+        )
+    os.replace(candidate_database, working_database)
 
 
 def _open_connection(path: Path, memory_bytes: int) -> duckdb.DuckDBPyConnection:

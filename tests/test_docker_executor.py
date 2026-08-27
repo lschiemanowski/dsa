@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import shutil
@@ -46,6 +47,26 @@ class RecordingDockerRunner:
             raise AssertionError(f"unexpected Docker command: {arguments!r}")
         return self.results.pop(0)
 
+    async def run_to_file(
+        self,
+        arguments: Sequence[str],
+        *,
+        destination: Path,
+        timeout_seconds: float,
+        output_limit: int,
+    ) -> DockerCommandResult:
+        self.calls.append((tuple(arguments), None, timeout_seconds, output_limit))
+        if not self.results:
+            raise AssertionError(f"unexpected Docker stream command: {arguments!r}")
+        command_result = self.results.pop(0)
+        if command_result.returncode == 0 and not command_result.size_limit_exceeded:
+            shutil.copyfile(destination.parent / "database.duckdb", destination)
+            return replace(
+                command_result,
+                written_bytes=destination.stat().st_size,
+            )
+        return command_result
+
 
 def result(
     returncode: int = 0,
@@ -73,13 +94,17 @@ def successful_results(
     state: dict[str, object] | None = None,
     remove: DockerCommandResult | None = None,
 ) -> list[DockerCommandResult]:
-    terminal = state or {"ExitCode": 0, "OOMKilled": False}
+    terminal = state or {"ExitCode": 0, "OOMKilled": False, "Running": True}
     return [
         result(stdout=b"29.7.2\n"),
         result(stdout=(IMAGE + "\n").encode()),
         result(stdout=b"container-id\n"),
+        result(),
+        result(),
         result(stdout=stdout, stderr=stderr),
         result(stdout=json.dumps(terminal).encode()),
+        result(),
+        result(),
         remove or result(),
     ]
 
@@ -125,6 +150,8 @@ def execution_request(tmp_path: Path) -> PythonExecutionRequest:
         process_limit=32,
         scratch_bytes=16 * 1024 * 1024,
         output_bytes=1024,
+        database_storage_bytes=32 * 1024 * 1024,
+        output_storage_bytes=64 * 1024 * 1024,
     )
 
 
@@ -151,7 +178,7 @@ def test_configuration_requires_immutable_nonroot_bounded_controls(
 
 
 async def test_executor_applies_complete_narrow_isolation_boundary(tmp_path: Path) -> None:
-    """One shell-free create command contains every required control and only three mounts."""
+    """One shell-free lifecycle exposes one read-only bind and bounded tmpfs state."""
     runner = RecordingDockerRunner(successful_results(stdout=b"ok\n"))
     executor = DockerPythonExecutor(
         configuration(),
@@ -167,6 +194,8 @@ async def test_executor_applies_complete_narrow_isolation_boundary(tmp_path: Pat
     create = runner.calls[2][0]
     joined = " ".join(create)
     assert create[:2] == ("docker", "create")
+    assert "--pull never" in joined
+    assert "--log-driver none" in joined
     assert "--network none" in joined
     assert "--read-only" in create
     assert "--cap-drop ALL" in joined
@@ -178,24 +207,26 @@ async def test_executor_applies_complete_narrow_isolation_boundary(tmp_path: Pat
     assert "--cpus 2" in joined
     assert "--pids-limit 32" in joined
     assert "/tmp:rw,nosuid,nodev,noexec,mode=1777,size=16777216" in joined
-    assert joined.count("type=bind,source=") == 3
+    assert "/database:rw,nosuid,nodev,noexec,uid=1000,gid=1000,mode=0700,size=33554432" in joined
+    assert "/outputs:rw,nosuid,nodev,noexec,uid=1000,gid=1000,mode=0700,size=67108864" in joined
+    assert joined.count("type=bind,source=") == 2
     assert (
-        f"source={request.database_path.resolve().parent},destination=/database" in joined
+        f"source={request.database_path.resolve()},"
+        "destination=/seed/database.duckdb,readonly" in joined
     )
     assert f"source={request.inputs_directory.resolve()},destination=/inputs,readonly" in joined
-    assert f"source={request.output_directory.resolve()},destination=/outputs" in joined
+    assert str(request.output_directory.resolve()) not in joined
     assert "/var/run/docker.sock" not in joined
     assert "--privileged" not in create
     assert "--pid" not in create
-    assert create[-4:] == (IMAGE, "/usr/local/bin/python", "-I", "-B", "-")[-4:]
+    assert create[-6:-1] == (IMAGE, "/usr/local/bin/python", "-I", "-B", "-c")
     assert runner.calls[3][0] == (
         "docker",
         "start",
-        "--attach",
-        "--interactive",
         "dsa-python-test",
     )
-    assert runner.calls[3][1] == b"print('ok')"
+    assert runner.calls[5][0][:3] == ("docker", "exec", "--interactive")
+    assert runner.calls[5][1] == b"print('ok')"
     assert runner.calls[-1][0] == ("docker", "rm", "--force", "dsa-python-test")
 
 
@@ -219,6 +250,99 @@ async def test_executor_rejects_overlapping_managed_mounts(tmp_path: Path) -> No
     assert runner.results == []
 
 
+@pytest.mark.parametrize(
+    "create_result",
+    [result(returncode=1), result(timed_out=True)],
+)
+async def test_uncertain_create_outcome_still_attempts_named_cleanup(
+    tmp_path: Path,
+    create_result: DockerCommandResult,
+) -> None:
+    """A daemon-side create cannot leak when its CLI result is failed or uncertain."""
+    runner = RecordingDockerRunner(
+        [
+            result(stdout=b"29.7.2\n"),
+            result(stdout=(IMAGE + "\n").encode()),
+            create_result,
+            result(),
+        ]
+    )
+    executor = DockerPythonExecutor(
+        configuration(),
+        runner=runner,
+        container_name_factory=lambda: "dsa-python-uncertain-create",
+    )
+
+    with pytest.raises(PythonExecutionError) as caught:
+        await executor.execute(execution_request(tmp_path))
+
+    assert caught.value.code == "python_backend_error"
+    assert runner.calls[-1][0] == (
+        "docker",
+        "rm",
+        "--force",
+        "dsa-python-uncertain-create",
+    )
+
+
+async def test_create_cancellation_finishes_named_cleanup(tmp_path: Path) -> None:
+    """Cancellation during an uncertain create still completes one removal attempt."""
+
+    class BlockingCreateRunner(RecordingDockerRunner):
+        def __init__(self) -> None:
+            super().__init__(
+                [result(stdout=b"29.7.2\n"), result(stdout=(IMAGE + "\n").encode())]
+            )
+            self.create_started = asyncio.Event()
+
+        async def run(
+            self,
+            arguments: Sequence[str],
+            *,
+            input_bytes: bytes | None,
+            timeout_seconds: float,
+            output_limit: int,
+        ) -> DockerCommandResult:
+            if len(arguments) > 1 and arguments[1] == "create":
+                self.calls.append(
+                    (tuple(arguments), input_bytes, timeout_seconds, output_limit)
+                )
+                self.create_started.set()
+                await asyncio.Event().wait()
+                raise AssertionError("unreachable")
+            if len(arguments) > 1 and arguments[1] == "rm":
+                self.calls.append(
+                    (tuple(arguments), input_bytes, timeout_seconds, output_limit)
+                )
+                return result()
+            return await super().run(
+                arguments,
+                input_bytes=input_bytes,
+                timeout_seconds=timeout_seconds,
+                output_limit=output_limit,
+            )
+
+    runner = BlockingCreateRunner()
+    executor = DockerPythonExecutor(
+        configuration(),
+        runner=runner,
+        container_name_factory=lambda: "dsa-python-cancelled-create",
+    )
+    execution = asyncio.create_task(executor.execute(execution_request(tmp_path)))
+    await runner.create_started.wait()
+
+    execution.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await execution
+
+    assert runner.calls[-1][0] == (
+        "docker",
+        "rm",
+        "--force",
+        "dsa-python-cancelled-create",
+    )
+
+
 async def test_timeout_kills_and_removes_container_with_bounded_diagnostics(
     tmp_path: Path,
 ) -> None:
@@ -227,6 +351,8 @@ async def test_timeout_kills_and_removes_container_with_bounded_diagnostics(
         [
             result(stdout=b"29.7.2\n"),
             result(stdout=(IMAGE + "\n").encode()),
+            result(),
+            result(),
             result(),
             result(stdout=b"partial", stdout_truncated=True, timed_out=True),
             result(),
@@ -257,7 +383,20 @@ async def test_timeout_kills_and_removes_container_with_bounded_diagnostics(
 async def test_oom_and_cleanup_failures_are_distinct(tmp_path: Path) -> None:
     """OOM is actionable, while failed removal invalidates an otherwise successful call."""
     oom_runner = RecordingDockerRunner(
-        successful_results(state={"ExitCode": 137, "OOMKilled": True})
+        [
+            result(stdout=b"29.7.2\n"),
+            result(stdout=(IMAGE + "\n").encode()),
+            result(),
+            result(),
+            result(),
+            result(returncode=137),
+            result(
+                stdout=json.dumps(
+                    {"ExitCode": 0, "OOMKilled": True, "Running": True}
+                ).encode()
+            ),
+            result(),
+        ]
     )
     cleanup_runner = RecordingDockerRunner(
         successful_results(remove=result(returncode=1, stderr=b"private daemon detail"))
@@ -298,6 +437,25 @@ async def test_subprocess_runner_drains_but_bounds_both_streams() -> None:
     assert len(observation.stderr) == 32
     assert observation.stdout_truncated is True
     assert observation.stderr_truncated is True
+
+
+async def test_subprocess_file_stream_cannot_exceed_host_byte_limit(
+    tmp_path: Path,
+) -> None:
+    """Container recovery stops at the host-owned descriptor byte ceiling."""
+    runner = AsyncSubprocessDockerRunner()
+    destination = tmp_path / "bounded.bin"
+
+    observation = await runner.run_to_file(
+        (sys.executable, "-c", "import sys; sys.stdout.buffer.write(b'x' * 100000)"),
+        destination=destination,
+        timeout_seconds=5,
+        output_limit=32,
+    )
+
+    assert observation.size_limit_exceeded is True
+    assert observation.written_bytes == 32
+    assert destination.read_bytes() == b"x" * 32
 
 
 @pytest.mark.integration

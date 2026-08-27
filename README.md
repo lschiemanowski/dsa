@@ -29,8 +29,9 @@ executor to the deterministic run boundary:
 - an injected Python executor protocol using managed database, input, and output paths
 - one private database copy per run with retained source and final SHA-256 identities
 - transactional per-call database mutation with rollback on every failed Python call
-- a digest-pinned, non-root, networkless Docker backend with narrow mounts
-- Docker memory, CPU, process, elapsed-time, scratch, and diagnostic limits
+- a digest-pinned, never-pull, non-root, networkless Docker backend with read-only binds
+- Docker memory, CPU, process, elapsed-time, writable-tmpfs, and diagnostic limits
+- disabled daemon logging and bounded host recovery of database and output bytes
 - default cleanup of private working databases with an operator-only debug override
 - direct final answers or same-run retained JSON final answers
 
@@ -91,8 +92,10 @@ executor = DockerPythonExecutor(default_docker_configuration("sha256:<64 hex dig
 completion = await run_analysis(request, python_executor=executor)
 ```
 
-Each Python call receives only the private attempt database, explicitly selected
-artifact inputs, and an empty output directory. Model code resolves
+Each Python call receives a size-limited tmpfs copy of the private attempt database,
+explicitly selected read-only artifact inputs, and a size-limited tmpfs output directory.
+Only the database seed and selected inputs are host bind-mounted, both read-only; the
+host recovers database and output bytes through bounded streams. Model code resolves
 `DSAGENT_DATABASE`, `DSAGENT_INPUTS`, and `DSAGENT_OUTPUTS` through `os.environ`.
 Declared outputs must be `.json` or `.parquet`; `expected_outputs=[]` is valid for a
 database-only call. Successful database changes become visible to later tools in the
