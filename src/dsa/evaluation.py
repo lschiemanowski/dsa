@@ -5,67 +5,23 @@ from __future__ import annotations
 import json
 import math
 import os
-from collections.abc import Callable, Generator, Sequence
+from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from copy import deepcopy
+from hashlib import sha256
 from importlib import import_module
 from pathlib import Path
 from typing import Any, Protocol, cast
 
-from jsonschema import Draft202012Validator
-from jsonschema.exceptions import ValidationError as JsonSchemaValidationError
-from pydantic import Field, JsonValue, field_validator, model_validator
+from pydantic import Field, JsonValue, model_validator
 from pydantic_ai.models import Model
 
-from dsa.contract import ContractModel, RunRequest
+from dsa.contract import ContractModel, ModelConfiguration, RunPolicy, RunRequest
 from dsa.environment import PythonExecutor
+from dsa.pack import EvaluationPackCase, LoadedEvaluationPack
 from dsa.record import FailureStage, RunSuccess
 from dsa.reporting import MlflowReporting
 from dsa.runner import RunCompletion, run_analysis
-
-
-class MlflowEvaluationCase(ContractModel):
-    """A normal run request plus a host-only expected answer."""
-
-    case_id: str = Field(pattern=r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
-    request: RunRequest
-    expected_answer: JsonValue
-
-    @field_validator("request", mode="before")
-    @classmethod
-    def revalidate_request(cls, value: object) -> object:
-        if isinstance(value, RunRequest):
-            return value.model_dump(mode="python", round_trip=True)
-        return value
-
-    @field_validator("expected_answer")
-    @classmethod
-    def snapshot_expected_answer(cls, value: JsonValue) -> JsonValue:
-        _ensure_finite_json(value)
-        return deepcopy(value)
-
-    @model_validator(mode="after")
-    def validate_expected_answer(self) -> MlflowEvaluationCase:
-        validator = cast(
-            Any,
-            Draft202012Validator(self.request.answer_schema),
-        )
-        errors: list[JsonSchemaValidationError] = list(
-            validator.iter_errors(self.expected_answer)
-        )
-        if errors:
-            raise ValueError("expected answer must satisfy the request answer schema")
-        return self
-
-    def dataset_record(self) -> dict[str, JsonValue]:
-        """Build one native row with expectations outside model inputs."""
-        return {
-            "inputs": {
-                "case_id": self.case_id,
-                "request": self.request.model_dump(mode="json"),
-            },
-            "expectations": {"answer": deepcopy(self.expected_answer)},
-        }
 
 
 class MlflowEvaluationPrediction(ContractModel):
@@ -131,26 +87,32 @@ class _EvaluationApi(Protocol):
     ) -> object: ...
 
 
-ModelFactory = Callable[[MlflowEvaluationCase], Model | str | None]
+ModelFactory = Callable[[EvaluationPackCase], Model | str | None]
 
 
 def run_mlflow_evaluation(
-    cases: Sequence[MlflowEvaluationCase | object],
+    pack: LoadedEvaluationPack | object,
     *,
     dataset_name: str,
     runs_directory: Path,
+    model_configuration: ModelConfiguration | object,
+    policy: RunPolicy | object,
     model_factory: ModelFactory | None = None,
     python_executor: PythonExecutor | None = None,
     api: _EvaluationApi | None = None,
 ) -> MlflowEvaluationResult:
-    """Create a native dataset and exact-score it through ordinary DSA runs."""
-    canonical_cases = tuple(_canonical_case(case) for case in cases)
-    if not canonical_cases:
-        raise ValueError("at least one evaluation case is required")
+    """Create a native dataset from a verified pack and run ordinary DSA analyses."""
+    canonical_pack = _canonical_pack(pack)
+    canonical_cases = canonical_pack.cases
     if len({case.case_id for case in canonical_cases}) != len(canonical_cases):
         raise ValueError("evaluation case IDs must be unique")
+    if len(canonical_cases) != canonical_pack.manifest.cases.case_count:
+        raise ValueError("evaluation pack case count does not match its manifest")
     if not dataset_name.strip():
         raise ValueError("dataset_name must not be blank")
+    canonical_model = _canonical_model_configuration(model_configuration)
+    canonical_policy = _canonical_policy(policy)
+    _verify_pack_database(canonical_pack)
     configuration_failure = _evaluation_configuration_failure()
     if configuration_failure is not None:
         raise MlflowEvaluationError(configuration_failure)
@@ -162,22 +124,41 @@ def run_mlflow_evaluation(
             name=dataset_name,
             experiment_id=experiment_id,
         )
-        dataset = dataset.merge_records([case.dataset_record() for case in canonical_cases])
+        dataset = dataset.merge_records(
+            [case.dataset_record(canonical_pack.manifest) for case in canonical_cases]
+        )
     except ModuleNotFoundError:
         raise MlflowEvaluationError("mlflow_dependency_missing") from None
     except Exception:
         raise MlflowEvaluationError("mlflow_dataset_failed") from None
     indexed = {case.case_id: case for case in canonical_cases}
 
-    async def predict_fn(case_id: str, request: dict[str, JsonValue]) -> dict[str, JsonValue]:
+    async def predict_fn(
+        case_id: str,
+        case_version: str,
+        database_id: str,
+        database_sha256: str,
+        question: str,
+        answer_schema: dict[str, JsonValue],
+    ) -> dict[str, JsonValue]:
         case = indexed.get(case_id)
         if case is None:
             raise ValueError("evaluation input contains an unknown case ID")
-        canonical_request = RunRequest.model_validate_json(
-            _canonical_json(request)
-        ).model_copy(deep=True)
-        if canonical_request != case.request:
-            raise ValueError("evaluation input request does not match its retained case")
+        if (
+            case_version != case.case_version
+            or database_id != canonical_pack.manifest.database.id
+            or database_sha256 != canonical_pack.manifest.database.sha256
+            or question != case.question
+            or answer_schema != case.answer_schema
+        ):
+            raise ValueError("evaluation input does not match its verified pack case")
+        canonical_request = RunRequest(
+            database_path=canonical_pack.database_path,
+            question=case.question,
+            answer_schema=case.answer_schema,
+            model=canonical_model,
+            policy=canonical_policy,
+        )
         selected_model = model_factory(case) if model_factory is not None else None
         completion = await run_analysis(
             canonical_request,
@@ -301,13 +282,41 @@ def exact_json_equal(left: JsonValue, right: JsonValue) -> bool:
     return _canonical_json(left) == _canonical_json(right)
 
 
-def _canonical_case(value: MlflowEvaluationCase | object) -> MlflowEvaluationCase:
-    data = (
-        value.model_dump(mode="python", round_trip=True)
-        if isinstance(value, MlflowEvaluationCase)
-        else value
-    )
-    return MlflowEvaluationCase.model_validate(data).model_copy(deep=True)
+def _canonical_pack(value: LoadedEvaluationPack | object) -> LoadedEvaluationPack:
+    if isinstance(value, LoadedEvaluationPack):
+        return LoadedEvaluationPack.model_validate_json(value.model_dump_json())
+    return LoadedEvaluationPack.model_validate(value)
+
+
+def _canonical_model_configuration(
+    value: ModelConfiguration | object,
+) -> ModelConfiguration:
+    if isinstance(value, ModelConfiguration):
+        return ModelConfiguration.model_validate_json(value.model_dump_json())
+    return ModelConfiguration.model_validate(value)
+
+
+def _canonical_policy(value: RunPolicy | object) -> RunPolicy:
+    if isinstance(value, RunPolicy):
+        return RunPolicy.model_validate_json(value.model_dump_json())
+    return RunPolicy.model_validate(value)
+
+
+def _verify_pack_database(pack: LoadedEvaluationPack) -> None:
+    expected = pack.manifest.database
+    try:
+        with pack.database_path.open("rb") as source:
+            if os.fstat(source.fileno()).st_size != expected.size_bytes:
+                raise MlflowEvaluationError("evaluation_database_mismatch")
+            digest = sha256()
+            for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except MlflowEvaluationError:
+        raise
+    except OSError:
+        raise MlflowEvaluationError("evaluation_database_unavailable") from None
+    if digest.hexdigest() != expected.sha256:
+        raise MlflowEvaluationError("evaluation_database_mismatch")
 
 
 def _evaluation_configuration_failure() -> str | None:
@@ -364,17 +373,6 @@ def _canonical_json(value: JsonValue) -> str:
         sort_keys=True,
         separators=(",", ":"),
     )
-
-
-def _ensure_finite_json(value: JsonValue) -> None:
-    if isinstance(value, float) and not math.isfinite(value):
-        raise ValueError("expected answer must contain only finite JSON")
-    if isinstance(value, dict):
-        for child in value.values():
-            _ensure_finite_json(child)
-    elif isinstance(value, list):
-        for child in value:
-            _ensure_finite_json(child)
 
 
 def _native_scorers(api: _EvaluationApi) -> list[object]:

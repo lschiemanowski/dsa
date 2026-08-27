@@ -62,7 +62,7 @@ class ModelConfiguration(ContractModel):
                 "model settings must not contain credentials or endpoints",
                 {"keys": unsupported},
             )
-        _ensure_finite_json(value, "model settings")
+        ensure_finite_json(value, "model settings")
         return {key: deepcopy(value[key]) for key in sorted(value)}
 
 
@@ -120,27 +120,32 @@ class RunRequest(ContractModel):
     @field_validator("answer_schema")
     @classmethod
     def snapshot_valid_schema(cls, value: dict[str, JsonValue]) -> dict[str, JsonValue]:
-        if value.get("$schema") != DRAFT_2020_12:
-            raise PydanticCustomError(
-                "answer_schema_draft",
-                "answer schema must declare JSON Schema Draft 2020-12",
-            )
-        _ensure_finite_json(value, "answer schema")
-        try:
-            Draft202012Validator.check_schema(value)
-        except SchemaError as error:
-            raise PydanticCustomError(
-                "answer_schema_invalid",
-                "answer schema must be valid JSON Schema Draft 2020-12",
-            ) from error
-        external_reference = _first_external_reference(value)
-        if external_reference is not None:
-            raise PydanticCustomError(
-                "answer_schema_external_reference",
-                "answer schema may use local references but not external references",
-                {"reference": external_reference},
-            )
-        return deepcopy(value)
+        return snapshot_answer_schema(value)
+
+
+def snapshot_answer_schema(value: dict[str, JsonValue]) -> dict[str, JsonValue]:
+    """Validate and isolate one caller-owned Draft 2020-12 answer schema."""
+    if value.get("$schema") != DRAFT_2020_12:
+        raise PydanticCustomError(
+            "answer_schema_draft",
+            "answer schema must declare JSON Schema Draft 2020-12",
+        )
+    ensure_finite_json(value, "answer schema")
+    try:
+        Draft202012Validator.check_schema(value)
+    except SchemaError as error:
+        raise PydanticCustomError(
+            "answer_schema_invalid",
+            "answer schema must be valid JSON Schema Draft 2020-12",
+        ) from error
+    external_reference = _first_external_reference(value)
+    if external_reference is not None:
+        raise PydanticCustomError(
+            "answer_schema_external_reference",
+            "answer schema may use local references but not external references",
+            {"reference": external_reference},
+        )
+    return deepcopy(value)
 
 
 def _first_external_reference(value: dict[str, JsonValue]) -> str | None:
@@ -158,7 +163,7 @@ def _first_external_reference(value: dict[str, JsonValue]) -> str | None:
     return None
 
 
-def _ensure_finite_json(value: JsonValue, label: str) -> None:
+def ensure_finite_json(value: JsonValue, label: str) -> None:
     if isinstance(value, float) and not math.isfinite(value):
         raise PydanticCustomError(
             "non_finite_json",
@@ -168,8 +173,8 @@ def _ensure_finite_json(value: JsonValue, label: str) -> None:
     if isinstance(value, dict):
         mapping = cast(dict[str, JsonValue], value)
         for child in mapping.values():
-            _ensure_finite_json(child, label)
+            ensure_finite_json(child, label)
     elif isinstance(value, list):
         sequence = cast(list[JsonValue], value)
         for child in sequence:
-            _ensure_finite_json(child, label)
+            ensure_finite_json(child, label)

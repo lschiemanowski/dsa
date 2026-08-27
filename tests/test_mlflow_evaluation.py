@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 from contextlib import AbstractContextManager, contextmanager, nullcontext
+from hashlib import sha256
 from importlib import import_module
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,7 +14,7 @@ import pytest
 from pydantic import JsonValue, ValidationError
 from pydantic_ai.models.test import TestModel
 
-from dsa import MlflowEvaluationCase, MlflowEvaluationError, MlflowReporting
+from dsa import MlflowEvaluationError, MlflowReporting
 from dsa.evaluation import (
     MlflowEvaluationPrediction,
     agent_failure,
@@ -22,8 +24,90 @@ from dsa.evaluation import (
     infrastructure_failure,
     run_mlflow_evaluation,
 )
+from dsa.pack import (
+    EvaluationCaseMetadata,
+    EvaluationPackCase,
+    EvaluationPackManifest,
+    HuggingFacePackReference,
+    LoadedEvaluationPack,
+)
 
 from .test_episode import valid_request
+
+
+def case_metadata() -> EvaluationCaseMetadata:
+    return EvaluationCaseMetadata(family="counting", source_level="small")
+
+
+def evaluation_pack(
+    tmp_path: Path,
+    *cases: EvaluationPackCase,
+) -> LoadedEvaluationPack:
+    request = valid_request(tmp_path)
+    selected_cases = cases or (
+        EvaluationPackCase(
+            case_id="tiny-count",
+            case_version="1",
+            question=request.question,
+            answer_schema=request.answer_schema,
+            expected_answer={"count": 3},
+            metadata=case_metadata(),
+        ),
+    )
+    database_bytes = request.database_path.read_bytes()
+    case_bytes = b"".join(
+        json.dumps(
+            case.model_dump(mode="json"),
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+        + b"\n"
+        for case in selected_cases
+    )
+    manifest = EvaluationPackManifest.model_validate(
+        {
+            "format": "dsa-evaluation-pack/v1",
+            "pack_id": "tiny-pack",
+            "version": "1.0.0",
+            "license": "CC0-1.0",
+            "database": {
+                "id": "tiny-database-1.0.0",
+                "path": "database/tiny.duckdb",
+                "size_bytes": len(database_bytes),
+                "sha256": sha256(database_bytes).hexdigest(),
+            },
+            "cases": {
+                "path": "cases.jsonl",
+                "case_count": len(selected_cases),
+                "size_bytes": len(case_bytes),
+                "sha256": sha256(case_bytes).hexdigest(),
+            },
+            "scorer": {"name": "exact-json", "version": "1"},
+            "provenance": {
+                "source_datasets": (
+                    {
+                        "name": "tiny-source",
+                        "version": "1",
+                        "case_count": len(selected_cases),
+                        "export_sha256": "b" * 64,
+                    },
+                )
+            },
+        }
+    )
+    return LoadedEvaluationPack(
+        reference=HuggingFacePackReference(
+            repo_id="example/tiny",
+            revision="c" * 40,
+            path="tiny/1.0.0",
+            manifest_sha256="d" * 64,
+        ),
+        manifest=manifest,
+        database_path=request.database_path,
+        cases=selected_cases,
+    )
 
 
 def prediction(**updates: object) -> MlflowEvaluationPrediction:
@@ -45,30 +129,47 @@ def prediction(**updates: object) -> MlflowEvaluationPrediction:
 
 def test_case_snapshots_expectation_and_keeps_it_out_of_inputs(tmp_path: Path) -> None:
     expected: dict[str, JsonValue] = {"count": 3}
-    case = MlflowEvaluationCase(
+    request = valid_request(tmp_path)
+    case = EvaluationPackCase(
         case_id="tiny-count",
-        request=valid_request(tmp_path),
+        case_version="1",
+        question=request.question,
+        answer_schema=request.answer_schema,
         expected_answer=expected,
+        metadata=case_metadata(),
     )
     expected["count"] = 99
+    pack = evaluation_pack(tmp_path, case)
 
-    row = case.dataset_record()
+    row = case.dataset_record(pack.manifest)
 
     assert row["expectations"] == {"answer": {"count": 3}}
     inputs = row["inputs"]
     assert isinstance(inputs, dict)
     assert "expected_answer" not in inputs
-    request = inputs["request"]
-    assert isinstance(request, dict)
-    assert "expected" not in request
+    assert "request" not in inputs
+    assert "database_path" not in inputs
+    assert "model" not in inputs
+    assert "policy" not in inputs
+    assert inputs["database_id"] == "tiny-database-1.0.0"
+    assert row["tags"] == {
+        "family": "counting",
+        "pack": "tiny-pack",
+        "pack_version": "1.0.0",
+        "source_level": "small",
+    }
 
 
 def test_case_rejects_expectation_outside_answer_schema(tmp_path: Path) -> None:
+    request = valid_request(tmp_path)
     with pytest.raises(ValidationError, match="must satisfy"):
-        MlflowEvaluationCase(
+        EvaluationPackCase(
             case_id="bad",
-            request=valid_request(tmp_path),
+            case_version="1",
+            question=request.question,
+            answer_schema=request.answer_schema,
             expected_answer={"count": "three"},
+            metadata=case_metadata(),
         )
 
 
@@ -212,16 +313,23 @@ def test_native_evaluation_uses_dataset_expectations_and_normal_reporting_path(
             return Result(self.output)
 
     api = Api()
-    case = MlflowEvaluationCase(
+    request = valid_request(tmp_path)
+    case = EvaluationPackCase(
         case_id="tiny-count",
-        request=valid_request(tmp_path),
+        case_version="1",
+        question=request.question,
+        answer_schema=request.answer_schema,
         expected_answer={"count": 3},
+        metadata=case_metadata(),
     )
+    pack = evaluation_pack(tmp_path, case)
 
     result = run_mlflow_evaluation(
-        [case],
+        pack,
         dataset_name="tiny-dataset",
         runs_directory=tmp_path / "runs",
+        model_configuration=request.model,
+        policy=request.policy,
         model_factory=lambda _case: TestModel(
             call_tools=[], custom_output_args={"count": 3}
         ),
@@ -368,25 +476,35 @@ def test_native_mlflow_api_executes_one_analysis_per_dataset_row(
 
     model_factory_calls = 0
 
-    def model_factory(_case: MlflowEvaluationCase) -> TestModel:
+    def model_factory(_case: EvaluationPackCase) -> TestModel:
         nonlocal model_factory_calls
         model_factory_calls += 1
         return TestModel(call_tools=[], custom_output_args={"count": 3})
 
-    first_case = MlflowEvaluationCase(
+    request = valid_request(tmp_path)
+    first_case = EvaluationPackCase(
         case_id="first-native-case",
-        request=valid_request(tmp_path),
+        case_version="1",
+        question=request.question,
+        answer_schema=request.answer_schema,
         expected_answer={"count": 3},
+        metadata=case_metadata(),
     )
-    second_case = MlflowEvaluationCase(
+    second_case = EvaluationPackCase(
         case_id="second-native-case",
-        request=valid_request(tmp_path),
+        case_version="1",
+        question=request.question,
+        answer_schema=request.answer_schema,
         expected_answer={"count": 3},
+        metadata=case_metadata(),
     )
+    pack = evaluation_pack(tmp_path, first_case, second_case)
     result = run_mlflow_evaluation(
-        [first_case, second_case],
+        pack,
         dataset_name="native-dataset",
         runs_directory=tmp_path / "runs",
+        model_configuration=request.model,
+        policy=request.policy,
         model_factory=model_factory,
         api=cast(Any, NativeApi()),
     )
@@ -402,18 +520,46 @@ def test_native_evaluation_rejects_local_or_incomplete_tracking_configuration(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    case = MlflowEvaluationCase(
+    request = valid_request(tmp_path)
+    case = EvaluationPackCase(
         case_id="tiny-count",
-        request=valid_request(tmp_path),
+        case_version="1",
+        question=request.question,
+        answer_schema=request.answer_schema,
         expected_answer={"count": 3},
+        metadata=case_metadata(),
     )
+    pack = evaluation_pack(tmp_path, case)
     monkeypatch.setenv("MLFLOW_TRACKING_URI", "file:/tmp/mlruns")
 
     with pytest.raises(MlflowEvaluationError) as caught:
         run_mlflow_evaluation(
-            [case],
+            pack,
             dataset_name="tiny",
             runs_directory=tmp_path / "runs",
+            model_configuration=request.model,
+            policy=request.policy,
         )
 
     assert caught.value.code == "mlflow_tracking_uri_invalid"
+
+
+def test_native_evaluation_reverifies_the_pack_database_before_remote_work(
+    tmp_path: Path,
+) -> None:
+    """A changed cached database cannot be evaluated under its released identity."""
+    request = valid_request(tmp_path)
+    pack = evaluation_pack(tmp_path)
+    pack.database_path.write_bytes(b"changed after pack resolution")
+
+    with pytest.raises(MlflowEvaluationError) as caught:
+        run_mlflow_evaluation(
+            pack,
+            dataset_name="tiny",
+            runs_directory=tmp_path / "runs",
+            model_configuration=request.model,
+            policy=request.policy,
+        )
+
+    assert caught.value.code == "evaluation_database_mismatch"
+    assert not (tmp_path / "runs").exists()

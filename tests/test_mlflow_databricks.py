@@ -11,9 +11,11 @@ import pytest
 from pydantic_ai.messages import ModelResponse, ToolCallPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 
-from dsa import MlflowEvaluationCase, run_mlflow_evaluation
+from dsa import run_mlflow_evaluation
+from dsa.pack import EvaluationPackCase
 
 from .test_episode import valid_request
+from .test_mlflow_evaluation import case_metadata, evaluation_pack
 
 
 def _databricks_acceptance_enabled() -> bool:
@@ -47,7 +49,7 @@ def test_tiny_native_databricks_evaluation_and_pydantic_ai_trace(
     connection.execute("insert into events values (1), (2), (3)")
     connection.close()
 
-    def model_factory(_case: MlflowEvaluationCase) -> FunctionModel:
+    def model_factory(_case: EvaluationPackCase) -> FunctionModel:
         calls = 0
 
         async def respond(_messages: list[Any], _info: AgentInfo) -> ModelResponse:
@@ -69,15 +71,21 @@ def test_tiny_native_databricks_evaluation_and_pydantic_ai_trace(
 
         return FunctionModel(respond, model_name="deterministic-databricks-test")
 
-    case = MlflowEvaluationCase(
+    case = EvaluationPackCase(
         case_id="tiny-event-count",
-        request=request,
+        case_version="1",
+        question=request.question,
+        answer_schema=request.answer_schema,
         expected_answer={"count": 3},
+        metadata=case_metadata(),
     )
+    pack = evaluation_pack(tmp_path, case)
     result = run_mlflow_evaluation(
-        [case],
+        pack,
         dataset_name=os.environ["DSA_MLFLOW_DATASET_NAME"],
         runs_directory=tmp_path / "runs",
+        model_configuration=request.model,
+        policy=request.policy,
         model_factory=model_factory,
     )
 
