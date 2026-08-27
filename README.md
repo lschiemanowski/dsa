@@ -10,8 +10,8 @@ conversational task-definition system.
 
 ## Current milestone
 
-Milestone 2 adds bounded database investigation and automatic artifact routing to
-the deterministic run boundary:
+Milestone 3 adds a private writable database lifecycle and the production Docker
+executor to the deterministic run boundary:
 
 - strict, serializable request and policy models
 - JSON Schema Draft 2020-12 validation
@@ -26,14 +26,17 @@ the deterministic run boundary:
 - automatic full-result Parquet retention with at most five preview rows
 - run-private artifact handles with same-descriptor integrity checks
 - transactional publication for complete multi-output Python batches
-- an injected Python executor protocol using managed input and output paths
+- an injected Python executor protocol using managed database, input, and output paths
+- one private database copy per run with retained source and final SHA-256 identities
+- transactional per-call database mutation with rollback on every failed Python call
+- a digest-pinned, non-root, networkless Docker backend with narrow mounts
+- Docker memory, CPU, process, elapsed-time, scratch, and diagnostic limits
+- default cleanup of private working databases with an operator-only debug override
 - direct final answers or same-run retained JSON final answers
 
-Model-authored Python is never executed on the host by this milestone. The
-`run_python` tool is registered only when the host injects an executor. Milestone 3
-will provide the production Docker executor, run-private database copies, and
-transactional mutation behavior. Databricks Free Edition MLflow integration remains
-a later milestone. A local MLflow server is not part of the design.
+Model-authored Python is never executed on the host. The `run_python` tool is
+registered only when the host injects an executor. Databricks Free Edition MLflow
+integration remains a later milestone. A local MLflow server is not part of the design.
 
 ## Public boundary
 
@@ -70,6 +73,32 @@ bounded orientation preview. The preview is not an analytical substitute for the
 artifact. Python receives selected artifacts through `DSAGENT_INPUTS` rather than
 through copied transcript content.
 
+The Docker image must be built or obtained before a run and supplied by immutable
+SHA-256 identity. Runtime execution never pulls or builds an image:
+
+```text
+docker build --tag dsa-python:m3 docker
+docker image inspect --format '{{.Id}}' dsa-python:m3
+```
+
+The resulting raw `sha256:...` image ID is valid for that local Docker store. A
+registry deployment should use its `repository@sha256:...` digest instead.
+
+```python
+from dsa import DockerPythonExecutor, default_docker_configuration, run_analysis
+
+executor = DockerPythonExecutor(default_docker_configuration("sha256:<64 hex digits>"))
+completion = await run_analysis(request, python_executor=executor)
+```
+
+Each Python call receives only the private attempt database, explicitly selected
+artifact inputs, and an empty output directory. Model code resolves
+`DSAGENT_DATABASE`, `DSAGENT_INPUTS`, and `DSAGENT_OUTPUTS` through `os.environ`.
+Declared outputs must be `.json` or `.parquet`; `expected_outputs=[]` is valid for a
+database-only call. Successful database changes become visible to later tools in the
+same run. Any failed call is discarded. The source database is never mounted and is
+never modified.
+
 Once a valid run starts, it produces exactly one terminal outcome. Success
 contains the answer validated against the caller's schema. Failure contains a
 stage, stable code, safe message, and bounded diagnostics. Cancellation is
@@ -82,6 +111,12 @@ uv sync --all-groups --frozen
 uv run ruff check .
 uv run pyright
 uv run pytest
+```
+
+The opt-in real Docker tier requires an already available immutable image:
+
+```text
+DSA_DOCKER_TEST_IMAGE=sha256:<64 hex digits> uv run pytest -m integration
 ```
 
 Python 3.12 is the development and CI baseline. Dependencies are resolved in

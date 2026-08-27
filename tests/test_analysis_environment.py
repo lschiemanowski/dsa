@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import math
 import os
@@ -658,9 +659,11 @@ class FakePythonExecutor:
 
     async def execute(self, request: PythonExecutionRequest) -> PythonExecutionResult:
         self.request = request
-        assert request.environment["DSAGENT_DATABASE"] == str(request.database_path)
-        assert request.environment["DSAGENT_INPUTS"] == str(request.inputs_directory)
-        assert request.environment["DSAGENT_OUTPUTS"] == str(request.output_directory)
+        assert request.environment == {
+            "DSAGENT_DATABASE": "/database/database.duckdb",
+            "DSAGENT_INPUTS": "/inputs",
+            "DSAGENT_OUTPUTS": "/outputs",
+        }
         table = parquet.read_table(  # pyright: ignore[reportUnknownMemberType]
             request.inputs_directory / "a1.parquet"
         )
@@ -737,6 +740,11 @@ async def test_artifact_integrity_is_checked_before_consumption(tmp_path: Path) 
 
 class InvalidOutputExecutor:
     async def execute(self, request: PythonExecutionRequest) -> PythonExecutionResult:
+        connection = duckdb.connect(str(request.database_path))
+        try:
+            connection.execute("delete from analytics.events")
+        finally:
+            connection.close()
         (request.output_directory / "answer.json").write_text(
             "not JSON", encoding="utf-8"
         )
@@ -745,6 +753,7 @@ class InvalidOutputExecutor:
 
 async def test_invalid_python_output_is_not_published(tmp_path: Path) -> None:
     runtime = environment(tmp_path, python_executor=InvalidOutputExecutor())
+    before = sha256(runtime.database_path.read_bytes()).hexdigest()
     await runtime.query_database(
         "select * from analytics.events order by event_id",
         tool_call_id="query-before-invalid-output",
@@ -762,10 +771,16 @@ async def test_invalid_python_output_is_not_published(tmp_path: Path) -> None:
     assert result["ok"] is False
     assert result["error"]["code"] == "python_output_invalid"
     assert [record.handle for record in runtime.artifact_records] == ["a1"]
+    assert sha256(runtime.database_path.read_bytes()).hexdigest() == before
 
 
 class TwoOutputExecutor:
     async def execute(self, request: PythonExecutionRequest) -> PythonExecutionResult:
+        connection = duckdb.connect(str(request.database_path))
+        try:
+            connection.execute("delete from analytics.events")
+        finally:
+            connection.close()
         (request.output_directory / "first.json").write_text("{\"value\":1}", encoding="utf-8")
         (request.output_directory / "second.json").write_text("{\"value\":2}", encoding="utf-8")
         return PythonExecutionResult()
@@ -776,6 +791,7 @@ async def test_multi_output_publication_rolls_back_the_complete_batch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     runtime = environment(tmp_path, python_executor=TwoOutputExecutor())
+    before = sha256(runtime.database_path.read_bytes()).hexdigest()
     original_link = os.link
     calls = 0
 
@@ -800,6 +816,35 @@ async def test_multi_output_publication_rolls_back_the_complete_batch(
     assert result["ok"] is False
     assert result["error"]["code"] == "artifact_publication_failed"
     assert runtime.artifact_records == ()
+    artifacts = runtime.run_directory / "artifacts"
+    assert not artifacts.exists() or list(artifacts.iterdir()) == []
+    assert sha256(runtime.database_path.read_bytes()).hexdigest() == before
+
+
+async def test_database_commit_failure_rolls_back_published_artifacts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Artifact files disappear if the paired working-database replacement fails."""
+    runtime = environment(tmp_path, python_executor=JsonAnswerExecutor())
+    before = sha256(runtime.database_path.read_bytes()).hexdigest()
+
+    def fail_replace(_source: Path, _destination: Path) -> None:
+        raise OSError("simulated database replacement failure")
+
+    monkeypatch.setattr("dsa.environment.os.replace", fail_replace)
+    result = json.loads(
+        await runtime.run_python(
+            "# produce output before failed database commit",
+            inputs=[],
+            expected_outputs=["answer.json"],
+            tool_call_id="python-database-commit-failure",
+        )
+    )
+
+    assert result["error"]["code"] == "artifact_publication_failed"
+    assert runtime.artifact_records == ()
+    assert sha256(runtime.database_path.read_bytes()).hexdigest() == before
     artifacts = runtime.run_directory / "artifacts"
     assert not artifacts.exists() or list(artifacts.iterdir()) == []
 
@@ -930,3 +975,141 @@ async def test_parquet_output_validation_reads_data_pages(
     assert result["ok"] is False
     assert result["error"]["code"] == "python_output_invalid"
     assert runtime.artifact_records == ()
+
+
+class DatabaseOnlyExecutor:
+    async def execute(self, request: PythonExecutionRequest) -> PythonExecutionResult:
+        connection = duckdb.connect(str(request.database_path))
+        try:
+            connection.execute("insert into analytics.events values (12, 'event-12')")
+        finally:
+            connection.close()
+        return PythonExecutionResult(runtime_identity="docker/test")
+
+
+async def test_database_only_python_call_commits_without_artifacts(tmp_path: Path) -> None:
+    """A successful database-only call promotes its attempt without inventing an artifact."""
+    runtime = environment(tmp_path, python_executor=DatabaseOnlyExecutor())
+
+    result = json.loads(
+        await runtime.run_python(
+            "# mutate database only",
+            inputs=[],
+            expected_outputs=[],
+            tool_call_id="python-database-only",
+        )
+    )
+
+    connection = duckdb.connect(str(runtime.database_path), read_only=True)
+    try:
+        count = connection.execute("select count(*) from analytics.events").fetchone()
+    finally:
+        connection.close()
+    assert result["ok"] is True
+    assert result["outputs"] == []
+    assert runtime.artifact_records == ()
+    assert count == (13,)
+
+
+class SymlinkDatabaseExecutor:
+    def __init__(self, target: Path) -> None:
+        self.target = target
+
+    async def execute(self, request: PythonExecutionRequest) -> PythonExecutionResult:
+        request.database_path.unlink()
+        request.database_path.symlink_to(self.target)
+        return PythonExecutionResult()
+
+
+async def test_python_database_promotion_does_not_follow_replaced_path(
+    tmp_path: Path,
+) -> None:
+    """Only regular bytes copied into host-private storage reach DuckDB validation."""
+    runtime = environment(tmp_path)
+    before = runtime.database_path.read_bytes()
+    runtime.python_executor = SymlinkDatabaseExecutor(runtime.database_path)
+
+    result = json.loads(
+        await runtime.run_python(
+            "# replace the managed database pathname",
+            inputs=[],
+            expected_outputs=[],
+            tool_call_id="python-database-symlink",
+        )
+    )
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == "python_database_invalid"
+    assert runtime.database_path.read_bytes() == before
+
+
+class MutateThenFailExecutor:
+    async def execute(self, request: PythonExecutionRequest) -> PythonExecutionResult:
+        connection = duckdb.connect(str(request.database_path))
+        try:
+            connection.execute("delete from analytics.events")
+        finally:
+            connection.close()
+        raise RuntimeError("container failed")
+
+
+async def test_failed_python_call_rolls_back_database_mutation(tmp_path: Path) -> None:
+    """An executor failure discards its candidate database before later tools can see it."""
+    runtime = environment(tmp_path, python_executor=MutateThenFailExecutor())
+    before = sha256(runtime.database_path.read_bytes()).hexdigest()
+
+    result = json.loads(
+        await runtime.run_python(
+            "# mutate then fail",
+            inputs=[],
+            expected_outputs=[],
+            tool_call_id="python-rollback",
+        )
+    )
+
+    assert result["error"]["code"] == "python_failed"
+    assert sha256(runtime.database_path.read_bytes()).hexdigest() == before
+
+
+class BlockingMutationExecutor:
+    def __init__(self) -> None:
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def execute(self, request: PythonExecutionRequest) -> PythonExecutionResult:
+        connection = duckdb.connect(str(request.database_path))
+        try:
+            connection.execute("insert into analytics.events values (12, 'event-12')")
+        finally:
+            connection.close()
+        self.entered.set()
+        await self.release.wait()
+        return PythonExecutionResult()
+
+
+async def test_query_waits_for_python_database_commit(tmp_path: Path) -> None:
+    """One run lock prevents SQL from observing a Python attempt before promotion."""
+    executor = BlockingMutationExecutor()
+    runtime = environment(tmp_path, python_executor=executor)
+    python_task = asyncio.create_task(
+        runtime.run_python(
+            "# block before commit",
+            inputs=[],
+            expected_outputs=[],
+            tool_call_id="python-blocking-commit",
+        )
+    )
+    await executor.entered.wait()
+    query_task = asyncio.create_task(
+        runtime.query_database(
+            "select count(*) from analytics.events",
+            tool_call_id="query-after-blocking-commit",
+        )
+    )
+    await asyncio.sleep(0)
+
+    assert query_task.done() is False
+    executor.release.set()
+    python_result, query_result = await asyncio.gather(python_task, query_task)
+    assert json.loads(python_result)["ok"] is True
+    assert json.loads(query_result)["rows"] == [[13]]

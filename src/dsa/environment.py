@@ -17,7 +17,8 @@ from datetime import date, datetime, time
 from decimal import Decimal
 from hashlib import sha256
 from pathlib import Path
-from threading import Event, Lock, Timer
+from queue import SimpleQueue
+from threading import Event, Lock, Thread, Timer
 from typing import Any, Protocol, cast
 from uuid import UUID, uuid4
 
@@ -75,6 +76,30 @@ class ToolResultLimitExceeded(Exception):
     """A model-visible tool result exceeded a host-enforced byte limit."""
 
 
+class PythonExecutionError(Exception):
+    """Stable isolated-executor failure with bounded model-authored diagnostics."""
+
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        stdout: str = "",
+        stderr: str = "",
+        stdout_truncated: bool = False,
+        stderr_truncated: bool = False,
+        runtime_identity: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.stdout = stdout
+        self.stderr = stderr
+        self.stdout_truncated = stdout_truncated
+        self.stderr_truncated = stderr_truncated
+        self.runtime_identity = runtime_identity
+
+
 @dataclass(frozen=True)
 class PythonExecutionRequest:
     """Managed paths and source passed to an injected Python executor."""
@@ -85,6 +110,12 @@ class PythonExecutionRequest:
     output_directory: Path
     expected_outputs: tuple[str, ...]
     environment: Mapping[str, str]
+    timeout_seconds: int
+    memory_bytes: int
+    cpu_count: int
+    process_limit: int
+    scratch_bytes: int
+    output_bytes: int
 
 
 @dataclass(frozen=True)
@@ -93,6 +124,9 @@ class PythonExecutionResult:
 
     stdout: str = ""
     stderr: str = ""
+    stdout_truncated: bool = False
+    stderr_truncated: bool = False
+    runtime_identity: str | None = None
 
 
 class PythonExecutor(Protocol):
@@ -219,13 +253,24 @@ class _ArtifactStore:
         *,
         producer_tool_call_id: str,
         validator: Callable[[Path, str], None] | None = None,
+        commit: Callable[[], None] | None = None,
     ) -> tuple[ArtifactRecord, ...]:
-        if not sources:
+        if not sources and commit is None:
             raise ArtifactError("artifact_batch_empty", "An artifact batch must not be empty")
         if not producer_tool_call_id or len(producer_tool_call_id) > 256:
             raise ArtifactError("artifact_producer", "The artifact producer identity is invalid")
 
         with self._lock:
+            if not sources:
+                assert commit is not None
+                try:
+                    commit()
+                except OSError as error:
+                    raise ArtifactError(
+                        "artifact_publication_failed",
+                        "The database mutation could not be published",
+                    ) from error
+                return ()
             source_sizes: list[int] = []
             extensions: list[str] = []
             for source, media_type in sources:
@@ -296,6 +341,8 @@ class _ArtifactStore:
                     os.link(temporary, destination)
                     linked.append(destination)
                 _fsync_directory(directory)
+                if commit is not None:
+                    commit()
                 published = True
             except ArtifactError:
                 raise
@@ -401,6 +448,8 @@ class AnalysisEnvironment:
         self.policy = policy
         self.python_executor = python_executor
         self._artifacts = _ArtifactStore(run_directory, policy)
+        self._tool_lock = asyncio.Lock()
+        self._attempts_directory = run_directory / "work" / "attempts"
 
     @property
     def artifact_records(self) -> tuple[ArtifactRecord, ...]:
@@ -409,11 +458,15 @@ class AnalysisEnvironment:
     async def check_database(self) -> None:
         """Open the supplied file through the same locked-down DuckDB boundary."""
         async with asyncio.timeout(self.policy.max_inspection_seconds):
-            await asyncio.to_thread(self._check_database_sync)
+            await _run_blocking(self._check_database_sync)
 
     async def inspect_database(self, relation: str | None, *, tool_call_id: str) -> str:
+        async with self._tool_lock:
+            return await self._inspect_database(relation, tool_call_id=tool_call_id)
+
+    async def _inspect_database(self, relation: str | None, *, tool_call_id: str) -> str:
         try:
-            result = await asyncio.to_thread(self._inspect_database_sync, relation)
+            result = await _run_blocking(self._inspect_database_sync, relation)
         except TimeoutError:
             return self._tool_error("inspection_timeout", "Database inspection timed out")
         except duckdb.Error as error:
@@ -428,11 +481,15 @@ class AnalysisEnvironment:
         return _bound_inspection_result(result, limit, self._tool_error)
 
     async def query_database(self, sql: str, *, tool_call_id: str) -> str:
+        async with self._tool_lock:
+            return await self._query_database(sql, tool_call_id=tool_call_id)
+
+    async def _query_database(self, sql: str, *, tool_call_id: str) -> str:
         issue = _query_issue(sql)
         if issue is not None:
             return self._tool_error(*issue)
         try:
-            materialization = await asyncio.to_thread(self._query_database_sync, sql)
+            materialization = await _run_blocking(self._query_database_sync, sql)
         except ArtifactError as error:
             return self._tool_error(error.code, error.message)
         except TimeoutError:
@@ -521,6 +578,22 @@ class AnalysisEnvironment:
         *,
         tool_call_id: str,
     ) -> str:
+        async with self._tool_lock:
+            return await self._run_python(
+                source,
+                inputs,
+                expected_outputs,
+                tool_call_id=tool_call_id,
+            )
+
+    async def _run_python(
+        self,
+        source: str,
+        inputs: Sequence[str],
+        expected_outputs: Sequence[str],
+        *,
+        tool_call_id: str,
+    ) -> str:
         if self.python_executor is None:
             return self._tool_error(
                 "python_unavailable",
@@ -529,31 +602,48 @@ class AnalysisEnvironment:
         issue = _python_request_issue(source, inputs, expected_outputs)
         if issue is not None:
             return self._tool_error(*issue)
-        staging = Path(tempfile.mkdtemp(prefix=".python-", dir=self.run_directory))
+        self._attempts_directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        staging = Path(
+            tempfile.mkdtemp(prefix="python-", dir=self._attempts_directory)
+        )
         inputs_directory = staging / "inputs"
         inputs_directory.mkdir(mode=0o700)
         output_directory = staging / "outputs"
         output_directory.mkdir(mode=0o700)
+        database_directory = staging / "database"
+        database_directory.mkdir(mode=0o700)
+        attempt_database = database_directory / "database.duckdb"
+        candidate_database = staging / ".database.candidate"
         try:
+            shutil.copyfile(self.database_path, attempt_database)
+            attempt_database.chmod(0o600)
             for handle in inputs:
                 self._artifacts.copy_verified(handle, inputs_directory)
             request = PythonExecutionRequest(
                 source=source,
-                database_path=self.database_path,
+                database_path=attempt_database,
                 inputs_directory=inputs_directory,
                 output_directory=output_directory,
                 expected_outputs=tuple(expected_outputs),
                 environment={
-                    "DSAGENT_DATABASE": str(self.database_path),
-                    "DSAGENT_INPUTS": str(inputs_directory),
-                    "DSAGENT_OUTPUTS": str(output_directory),
+                    "DSAGENT_DATABASE": "/database/database.duckdb",
+                    "DSAGENT_INPUTS": "/inputs",
+                    "DSAGENT_OUTPUTS": "/outputs",
                 },
+                timeout_seconds=self.policy.max_python_seconds,
+                memory_bytes=self.policy.max_python_memory_bytes,
+                cpu_count=self.policy.max_python_cpus,
+                process_limit=self.policy.max_python_processes,
+                scratch_bytes=self.policy.max_python_scratch_bytes,
+                output_bytes=self.policy.max_python_output_bytes,
             )
             try:
                 async with asyncio.timeout(self.policy.max_python_seconds):
                     execution = await self.python_executor.execute(request)
             except TimeoutError:
                 return self._tool_error("python_timeout", "Python execution timed out")
+            except PythonExecutionError as error:
+                return self._python_error(error)
             except Exception as error:
                 return self._tool_error(
                     "python_failed",
@@ -571,6 +661,12 @@ class AnalysisEnvironment:
                     "python_outputs_mismatch",
                     "Python must create exactly the declared output files",
                 )
+            await _run_blocking(
+                _snapshot_and_checkpoint_database,
+                attempt_database,
+                candidate_database,
+                self.policy.max_query_memory_bytes,
+            )
             output_paths = [output_directory / name for name in expected_outputs]
             records = self._artifacts.publish_files(
                 [
@@ -584,6 +680,7 @@ class AnalysisEnvironment:
                     self.policy.max_artifact_bytes,
                     self.policy.max_tool_result_bytes,
                 ),
+                commit=lambda: os.replace(candidate_database, self.database_path),
             )
             return self._python_result(execution, records)
         except ArtifactError as error:
@@ -753,8 +850,8 @@ class AnalysisEnvironment:
                 "ok": True,
                 "stdout": stdout,
                 "stderr": stderr,
-                "stdout_truncated": stdout_truncated,
-                "stderr_truncated": stderr_truncated,
+                "stdout_truncated": execution.stdout_truncated or stdout_truncated,
+                "stderr_truncated": execution.stderr_truncated or stderr_truncated,
                 "outputs": [
                     {
                         "handle": record.handle,
@@ -765,6 +862,8 @@ class AnalysisEnvironment:
                     for record in records
                 ],
             }
+            if execution.runtime_identity is not None:
+                result["runtime_identity"] = execution.runtime_identity
             encoded = _canonical_json(result)
             if len(encoded.encode("utf-8")) <= self.policy.max_tool_result_bytes:
                 return encoded
@@ -772,6 +871,32 @@ class AnalysisEnvironment:
                 raise ToolResultLimitExceeded(
                     "python result metadata exceeds the per-result byte limit"
                 )
+            diagnostic_budget //= 2
+
+    def _python_error(self, error: PythonExecutionError) -> str:
+        diagnostic_budget = min(
+            self.policy.max_python_output_bytes,
+            self.policy.max_tool_result_bytes,
+        )
+        while True:
+            stdout, stdout_truncated = _bounded_utf8(error.stdout, diagnostic_budget)
+            stderr_budget = max(0, diagnostic_budget - len(stdout.encode("utf-8")))
+            stderr, stderr_truncated = _bounded_utf8(error.stderr, stderr_budget)
+            result: dict[str, JsonValue] = {
+                "ok": False,
+                "error": {"code": error.code, "message": error.message},
+                "stdout": stdout,
+                "stderr": stderr,
+                "stdout_truncated": error.stdout_truncated or stdout_truncated,
+                "stderr_truncated": error.stderr_truncated or stderr_truncated,
+            }
+            if error.runtime_identity is not None:
+                result["runtime_identity"] = error.runtime_identity
+            encoded = _canonical_json(result)
+            if len(encoded.encode("utf-8")) <= self.policy.max_tool_result_bytes:
+                return encoded
+            if diagnostic_budget == 0:
+                return self._tool_error(error.code, error.message)
             diagnostic_budget //= 2
 
 
@@ -1174,8 +1299,6 @@ def _python_request_issue(
         return "python_source_blank", "Python source must not be blank"
     if len(set(inputs)) != len(inputs):
         return "python_inputs_duplicate", "Python input handles must be unique"
-    if not expected_outputs:
-        return "python_outputs_empty", "Declare at least one expected output file"
     if len(set(expected_outputs)) != len(expected_outputs):
         return "python_outputs_duplicate", "Expected output names must be unique"
     for name in expected_outputs:
@@ -1188,6 +1311,73 @@ def _python_request_issue(
     return None
 
 
+def _snapshot_and_checkpoint_database(
+    source: Path,
+    candidate: Path,
+    memory_bytes: int,
+) -> None:
+    source_descriptor: int | None = None
+    candidate_descriptor: int | None = None
+    try:
+        if sorted(path.name for path in source.parent.iterdir()) != [source.name]:
+            raise OSError("unexpected database-directory entries")
+        source_descriptor = os.open(
+            source,
+            os.O_RDONLY
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0),
+        )
+        metadata = os.fstat(source_descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise OSError("database is not a regular file")
+        candidate_descriptor = os.open(
+            candidate,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+        )
+        copied = 0
+        with os.fdopen(candidate_descriptor, "wb") as target:
+            candidate_descriptor = None
+            with os.fdopen(source_descriptor, "rb") as origin:
+                source_descriptor = None
+                while chunk := origin.read(1024 * 1024):
+                    copied += len(chunk)
+                    target.write(chunk)
+            target.flush()
+            os.fsync(target.fileno())
+        if copied != metadata.st_size:
+            raise OSError("database changed while being copied")
+        connection = duckdb.connect(
+            str(candidate),
+            config={
+                "enable_external_access": "false",
+                "memory_limit": f"{memory_bytes}B",
+            },
+        )
+        try:
+            connection.execute("force checkpoint")
+        finally:
+            connection.close()
+    except (OSError, duckdb.Error) as error:
+        candidate.unlink(missing_ok=True)
+        raise ArtifactError(
+            "python_database_invalid",
+            "Python did not leave a valid DuckDB database",
+        ) from error
+    finally:
+        if source_descriptor is not None:
+            os.close(source_descriptor)
+        if candidate_descriptor is not None:
+            os.close(candidate_descriptor)
+    if Path(f"{candidate}.wal").exists():
+        candidate.unlink(missing_ok=True)
+        Path(f"{candidate}.wal").unlink(missing_ok=True)
+        raise ArtifactError(
+            "python_database_invalid",
+            "Python did not leave a checkpointed DuckDB database",
+        )
+
+
 def _open_connection(path: Path, memory_bytes: int) -> duckdb.DuckDBPyConnection:
     return duckdb.connect(
         str(path),
@@ -1197,6 +1387,38 @@ def _open_connection(path: Path, memory_bytes: int) -> duckdb.DuckDBPyConnection
             "memory_limit": f"{memory_bytes}B",
         },
     )
+
+
+async def _run_blocking[BlockingResult](
+    function: Callable[..., BlockingResult],
+    *arguments: object,
+) -> BlockingResult:
+    """Run DuckDB work without relying on its worker-thread future callback.
+
+    DuckDB 1.5.5 can complete work in a Python worker thread without waking an
+    asyncio executor future on supported Linux hosts. A private daemon thread
+    plus event-loop polling retains the non-blocking boundary and avoids making
+    event-loop progress depend on that callback path.
+    """
+    outcomes: SimpleQueue[tuple[bool, BlockingResult | BaseException]] = (
+        SimpleQueue()
+    )
+
+    def invoke() -> None:
+        try:
+            outcomes.put((True, function(*arguments)))
+        except BaseException as error:
+            outcomes.put((False, error))
+
+    worker = Thread(target=invoke, daemon=True, name="dsa-duckdb")
+    worker.start()
+    while worker.is_alive():
+        await asyncio.sleep(0.01)
+    worker.join()
+    succeeded, value = outcomes.get()
+    if not succeeded:
+        raise cast(BaseException, value)
+    return cast(BlockingResult, value)
 
 
 def _interrupt_after(

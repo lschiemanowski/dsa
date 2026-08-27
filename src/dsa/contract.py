@@ -86,6 +86,8 @@ class RunPolicy(ContractModel):
     max_query_result_bytes: PositiveInt = 64 * 1024 * 1024
     max_python_seconds: PositiveInt = 300
     max_python_memory_bytes: PositiveInt = 4 * 1024 * 1024 * 1024
+    max_python_cpus: PositiveInt = 2
+    max_python_processes: PositiveInt = 64
     max_python_output_bytes: PositiveInt = 64 * 1024
     max_python_scratch_bytes: PositiveInt = 1024 * 1024 * 1024
     max_artifact_count: PositiveInt = 20

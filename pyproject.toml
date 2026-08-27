@@ -33,6 +33,9 @@ packages = ["src/dsa"]
 testpaths = ["tests"]
 addopts = "-q"
 asyncio_mode = "auto"
+markers = [
+    "integration: opt-in tests that exercise a real external runtime boundary",
+]
 
 [tool.ruff]
 target-version = "py312"
