@@ -6,10 +6,11 @@ import asyncio
 import json
 import os
 import re
+import signal
 import stat
 import sys
 from collections.abc import Awaitable, Callable, Mapping
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
@@ -19,7 +20,12 @@ from uuid import uuid4
 from pydantic import Field, field_validator, model_validator
 
 from dsa.contract import ContractModel, ModelConfiguration, RunPolicy
-from dsa.docker import DockerPythonExecutor, default_docker_configuration
+from dsa.docker import (
+    AsyncSubprocessDockerRunner,
+    DockerCommandRunner,
+    DockerPythonExecutor,
+    default_docker_configuration,
+)
 from dsa.evaluation import (
     MlflowEvaluationPrediction,
     MlflowEvaluationResult,
@@ -37,7 +43,13 @@ SafeName = Annotated[
 ]
 SafeDatasetName = Annotated[
     str,
-    Field(pattern=r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,255}$"),
+    Field(
+        pattern=(
+            r"^[a-z0-9_][a-z0-9_-]{0,127}\."
+            r"[a-z0-9_][a-z0-9_-]{0,127}\."
+            r"[a-z0-9_][a-z0-9_-]{0,127}$"
+        )
+    ),
 ]
 SafeRemoteId = Annotated[
     str,
@@ -155,6 +167,9 @@ class BenchmarkRuntime(ContractModel):
         identities = tuple(item.pack_id for item in ordered)
         if len(identities) != len(set(identities)):
             raise ValueError("runtime dataset identities must be unique")
+        dataset_names = tuple(item.dataset_name for item in ordered)
+        if len(dataset_names) != len(set(dataset_names)):
+            raise ValueError("runtime dataset names must be unique across packs")
         return ordered
 
     @property
@@ -189,6 +204,7 @@ class BenchmarkCellInvocation(ContractModel):
     agent_revision: GitRevision
     workspace_root: Path
     attempt: Annotated[int, Field(gt=0)]
+    cleanup_token: str = Field(pattern=r"^[0-9a-f]{32}$")
 
     @property
     def cell_directory(self) -> Path:
@@ -332,15 +348,18 @@ CellInvoker = Callable[
 PackLoader = Callable[[HuggingFacePackReference], LoadedEvaluationPack]
 ImageVerifier = Callable[[str], Awaitable[None]]
 EvaluationRunner = Callable[..., MlflowEvaluationResult]
+ContainerCleaner = Callable[[BenchmarkCellInvocation], Awaitable[bool]]
 
 _WORKER_ARGUMENT = "--cell-worker"
 _WORKER_PREFIX = b"DSA_BENCHMARK_CELL_RESULT="
 _WORKER_STDOUT_BYTES = 1024 * 1024
 _WORKER_STDERR_BYTES = 16 * 1024
 _WORKER_INPUT_BYTES = 1024 * 1024
-_WORKER_STOP_SECONDS = 5
+_WORKER_STOP_SECONDS = 15
 _RECEIPT_BYTES = 64 * 1024 * 1024
 _DOCKER_IMAGE_ID = re.compile(r"sha256:[0-9a-f]{64}\Z")
+_DOCKER_CONTAINER_ID = re.compile(r"[0-9a-f]{12,64}\Z")
+_BENCHMARK_CLEANUP_LABEL = "dsa.benchmark.cleanup"
 
 
 @dataclass(frozen=True)
@@ -376,6 +395,7 @@ def _invocation_from_canonical_prepared(
         agent_revision=prepared.study.agent_revision,
         workspace_root=prepared.runtime.workspace_root,
         attempt=attempt,
+        cleanup_token=uuid4().hex,
     )
 
 
@@ -698,11 +718,11 @@ async def verify_docker_image(image: str) -> None:
         )
     except TimeoutError:
         if process is not None:
-            await _stop_worker(process)
+            await _stop_control_process(process)
         raise ValueError("benchmark Docker image is unavailable") from None
     except asyncio.CancelledError:
         if process is not None:
-            await _stop_worker(process)
+            await _stop_control_process(process)
         raise
     except OSError:
         raise ValueError("benchmark Docker image is unavailable") from None
@@ -741,11 +761,11 @@ async def invoke_benchmark_cell(
             * ((selected.case_count + selected.case_workers - 1) // selected.case_workers)
             + 300
         )
-        await asyncio.wait_for(process.wait(), timeout=timeout)
+        await asyncio.wait_for(asyncio.shield(process.wait()), timeout=timeout)
         stdout, stdout_overflow = await stdout_task
         _stderr, _stderr_overflow = await stderr_task
     except BaseException:
-        await _stop_worker(process)
+        await stop_benchmark_cell_worker(process, selected)
         for task in (stdout_task, stderr_task):
             if not task.done():
                 task.cancel()
@@ -795,16 +815,129 @@ async def _read_stream_tail(
     return bytes(value), total > limit
 
 
-async def _stop_worker(process: asyncio.subprocess.Process) -> None:
+async def _stop_control_process(process: asyncio.subprocess.Process) -> None:
     if process.returncode is not None:
         await process.wait()
         return
     process.terminate()
     try:
-        await asyncio.wait_for(process.wait(), timeout=_WORKER_STOP_SECONDS)
+        await asyncio.wait_for(
+            asyncio.shield(process.wait()),
+            timeout=_WORKER_STOP_SECONDS,
+        )
     except TimeoutError:
         process.kill()
         await process.wait()
+
+
+async def stop_benchmark_cell_worker(
+    process: asyncio.subprocess.Process,
+    invocation: BenchmarkCellInvocation,
+    *,
+    cleaner: ContainerCleaner | None = None,
+    grace_seconds: float = _WORKER_STOP_SECONDS,
+    settle_seconds: float | None = None,
+) -> None:
+    """Stop one worker and remove only its labeled Docker containers."""
+    selected_cleaner = cleaner or remove_benchmark_cell_containers
+    if process.returncode is not None:
+        await process.wait()
+        await _attempt_container_cleanup(selected_cleaner, invocation)
+        return
+    _signal_worker(process, signal.SIGINT)
+    wait_task = asyncio.create_task(process.wait())
+    try:
+        await asyncio.wait_for(asyncio.shield(wait_task), timeout=grace_seconds)
+    except TimeoutError:
+        _signal_worker(process, signal.SIGSTOP)
+        await _attempt_container_cleanup(selected_cleaner, invocation)
+        _signal_worker(process, signal.SIGKILL)
+        await wait_task
+        selected_settle_seconds = (
+            default_docker_configuration(
+                invocation.docker_image
+            ).control_timeout_seconds
+            if settle_seconds is None
+            else settle_seconds
+        )
+        if selected_settle_seconds > 0:
+            await asyncio.sleep(selected_settle_seconds)
+    await _attempt_container_cleanup(selected_cleaner, invocation)
+
+
+async def _attempt_container_cleanup(
+    cleaner: ContainerCleaner,
+    invocation: BenchmarkCellInvocation,
+) -> bool:
+    try:
+        return await cleaner(invocation)
+    except Exception:
+        return False
+
+
+def _signal_worker(process: asyncio.subprocess.Process, selected_signal: int) -> None:
+    with suppress(ProcessLookupError):
+        process.send_signal(selected_signal)
+
+
+async def remove_benchmark_cell_containers(
+    invocation: BenchmarkCellInvocation,
+    *,
+    runner: DockerCommandRunner | None = None,
+) -> bool:
+    """Force-remove the bounded set of containers labeled for one cell attempt."""
+    configuration = default_docker_configuration(invocation.docker_image)
+    selected_runner = runner or AsyncSubprocessDockerRunner()
+    try:
+        listed = await selected_runner.run(
+            (
+                configuration.docker_executable,
+                "container",
+                "ls",
+                "--all",
+                "--quiet",
+                "--filter",
+                f"label={_BENCHMARK_CLEANUP_LABEL}={invocation.cleanup_token}",
+            ),
+            input_bytes=None,
+            timeout_seconds=configuration.control_timeout_seconds,
+            output_limit=8 * 1024,
+        )
+    except OSError:
+        return False
+    if (
+        listed.timed_out
+        or listed.returncode != 0
+        or listed.stdout_truncated
+        or listed.stderr_truncated
+    ):
+        return False
+    try:
+        container_ids = tuple(line.decode("ascii") for line in listed.stdout.splitlines())
+    except UnicodeDecodeError:
+        return False
+    if len(container_ids) > invocation.policy.max_tool_calls or any(
+        _DOCKER_CONTAINER_ID.fullmatch(container_id) is None
+        for container_id in container_ids
+    ):
+        return False
+    if not container_ids:
+        return True
+    try:
+        removed = await selected_runner.run(
+            (
+                configuration.docker_executable,
+                "rm",
+                "--force",
+                *container_ids,
+            ),
+            input_bytes=None,
+            timeout_seconds=configuration.control_timeout_seconds,
+            output_limit=8 * 1024,
+        )
+    except OSError:
+        return False
+    return not removed.timed_out and removed.returncode == 0
 
 
 def execute_benchmark_cell(
@@ -828,7 +961,10 @@ def execute_benchmark_cell(
             or pack.manifest.cases.case_count != selected.case_count
         ):
             raise ValueError("benchmark pack changed after preflight")
-        executor = DockerPythonExecutor(default_docker_configuration(selected.docker_image))
+        executor = DockerPythonExecutor(
+            default_docker_configuration(selected.docker_image),
+            container_labels={_BENCHMARK_CLEANUP_LABEL: selected.cleanup_token},
+        )
         tags = {
             "dsa.benchmark.agent_revision": selected.agent_revision,
             "dsa.benchmark.cell_id": selected.cell.cell_id,

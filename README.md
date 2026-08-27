@@ -156,11 +156,12 @@ runtime bindings.
 
 Benchmark studies bind exact pack references, model configurations, policy, Docker image,
 concurrency, repetitions, and the exact agent Git revision. Runtime files bind only a new
-local workspace and one Databricks dataset name per pack. Both inputs must be canonical
-JSON. Preflight resolves every pack, checks the already-present immutable Docker image,
-requires Databricks configuration, and verifies the running Git revision before starting
-any cell. Tracked or untracked implementation changes under `src/dsa`, `pyproject.toml`,
-or `uv.lock` are rejected because they are not represented by that revision:
+local workspace and one distinct `catalog.schema.table` Databricks dataset per pack. Both
+inputs must be canonical JSON. Preflight resolves every pack, checks the already-present
+immutable Docker image, requires Databricks configuration, and verifies the running Git
+revision before starting any cell. Tracked or untracked implementation changes under
+`src/dsa`, `pyproject.toml`, or `uv.lock` are rejected because they are not represented by
+that revision:
 
 ```text
 dsa-benchmark plan --study study.json --runtime runtime.json

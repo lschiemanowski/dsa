@@ -31,7 +31,8 @@ Their IDs are derived from that canonical tuple rather than host paths or remote
 ## Runtime and secret boundary
 
 `dsa-benchmark-runtime/v1` contains only a new workspace root and an exact mapping from
-each study pack identity to its Databricks MLflow dataset name. Databricks credentials,
+each study pack identity to its distinct three-component Unity Catalog dataset name.
+No two packs may merge records into the same persistent dataset. Databricks credentials,
 experiment identity, provider credentials, provider endpoints, and Hugging Face cache
 locations remain process environment or library-owned state and never enter study,
 cell, or receipt identity.
@@ -52,10 +53,12 @@ values default to one and are retained in study identity.
 
 The worker accepts one canonical payload on standard input and emits one framed strict
 result on standard output. Other output is bounded diagnostic material. Cancellation
-terminates, force-kills when necessary, and reaps workers without deleting completed run
-records. Model failures, wrong accepted answers, policy limits, and provider failures
-inside a returned evaluation are benchmark observations rather than worker crashes and
-are never retried automatically.
+first interrupts the worker so Docker executor cleanup can unwind. Every container also
+carries a private attempt label; before force-killing a stuck worker, the parent freezes
+it and force-removes only containers with that label, then performs a second bounded
+sweep after reaping. Model failures, wrong accepted answers, policy limits, and provider
+failures inside a returned evaluation are benchmark observations rather than worker
+crashes and are never retried automatically.
 
 Every attempt has a new private directory. A successful evaluation atomically publishes
 one no-overwrite canonical `cell.json` containing study and cell identities, the exact

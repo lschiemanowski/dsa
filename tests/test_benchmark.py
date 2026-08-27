@@ -145,15 +145,37 @@ def test_study_bounds_the_expanded_cell_matrix() -> None:
 def test_runtime_rejects_dataset_values_that_cannot_be_safely_retained(
     tmp_path: Path,
 ) -> None:
-    with pytest.raises(ValidationError):
+    for dataset_name in (
+        "https://private.example/?token=secret",
+        "dataset",
+        "catalog..table",
+        "catalog.schema.table.extra",
+        "Catalog.schema.table",
+    ):
+        with pytest.raises(ValidationError):
+            BenchmarkRuntime.model_validate(
+                runtime_value(
+                    tmp_path,
+                    datasets=(
+                        {
+                            "pack_id": "pack-a",
+                            "dataset_name": dataset_name,
+                        },
+                    ),
+                )
+            )
+
+
+def test_runtime_requires_a_distinct_databricks_dataset_for_each_pack(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(ValidationError, match="dataset names must be unique"):
         BenchmarkRuntime.model_validate(
             runtime_value(
                 tmp_path,
                 datasets=(
-                    {
-                        "pack_id": "pack-a",
-                        "dataset_name": "https://private.example/?token=secret",
-                    },
+                    {"pack_id": "pack-a", "dataset_name": "catalog.schema.shared"},
+                    {"pack_id": "pack-b", "dataset_name": "catalog.schema.shared"},
                 ),
             )
         )

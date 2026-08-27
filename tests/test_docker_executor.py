@@ -185,6 +185,7 @@ async def test_executor_applies_complete_narrow_isolation_boundary(tmp_path: Pat
         configuration(),
         runner=runner,
         container_name_factory=lambda: "dsa-python-test",
+        container_labels={"dsa.benchmark.cleanup": "a" * 32},
     )
     request = execution_request(tmp_path)
 
@@ -197,6 +198,7 @@ async def test_executor_applies_complete_narrow_isolation_boundary(tmp_path: Pat
     assert create[:2] == ("docker", "create")
     assert "--pull never" in joined
     assert "--log-driver none" in joined
+    assert f"--label dsa.benchmark.cleanup={'a' * 32}" in joined
     assert "--network none" in joined
     assert "--read-only" in create
     assert "--cap-drop ALL" in joined
@@ -234,6 +236,14 @@ async def test_executor_applies_complete_narrow_isolation_boundary(tmp_path: Pat
     assert runner.calls[8][0][:3] == ("docker", "exec", "dsa-python-test")
     assert runner.calls[9][0][:3] == ("docker", "exec", "dsa-python-test")
     assert runner.calls[-1][0] == ("docker", "rm", "--force", "dsa-python-test")
+
+
+def test_executor_rejects_unsafe_container_labels() -> None:
+    with pytest.raises(ValueError, match="safe bounded identities"):
+        DockerPythonExecutor(
+            configuration(),
+            container_labels={"dsa.benchmark.cleanup": "https://private.example"},
+        )
 
 
 async def test_executor_rejects_overlapping_managed_mounts(tmp_path: Path) -> None:

@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import signal
+from collections.abc import Sequence
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 import pytest
 
@@ -21,9 +23,12 @@ from dsa.benchmark import (
     expand_benchmark_study,
     invoke_benchmark_cell,
     read_benchmark_cell_receipt,
+    remove_benchmark_cell_containers,
     retain_benchmark_cell_receipt,
     run_prepared_benchmark,
+    stop_benchmark_cell_worker,
 )
+from dsa.docker import DockerCommandResult, DockerPythonExecutor
 from dsa.evaluation import MlflowEvaluationPrediction, MlflowEvaluationResult
 from dsa.reporting import MlflowReporting
 
@@ -346,6 +351,10 @@ def test_worker_composes_existing_evaluation_and_records_effective_context(
     assert captured["dataset_name"] == invocation.dataset_name
     assert captured["model_configuration"] == invocation.model_configuration
     assert captured["policy"] == invocation.policy
+    executor = cast(DockerPythonExecutor, captured["python_executor"])
+    assert executor.container_labels == (
+        ("dsa.benchmark.cleanup", invocation.cleanup_token),
+    )
     assert captured["run_tags"] == {
         "dsa.benchmark.agent_revision": invocation.agent_revision,
         "dsa.benchmark.cell_id": invocation.cell.cell_id,
@@ -389,3 +398,120 @@ def test_worker_classifies_uncertain_mlflow_outcomes_as_ambiguous(
     assert isinstance(result, BenchmarkWorkerAmbiguous)
     assert result.failure_code == "cell_evaluation_ambiguous"
     assert not invocation.receipt_path.exists()
+
+
+class CleanupDockerRunner:
+    def __init__(self, results: tuple[DockerCommandResult, ...]) -> None:
+        self.results = list(results)
+        self.calls: list[tuple[str, ...]] = []
+
+    async def run(
+        self,
+        arguments: Sequence[str],
+        *,
+        input_bytes: bytes | None,
+        timeout_seconds: float,
+        output_limit: int,
+    ) -> DockerCommandResult:
+        del input_bytes, timeout_seconds, output_limit
+        self.calls.append(tuple(arguments))
+        return self.results.pop(0)
+
+    async def run_to_file(
+        self,
+        arguments: Sequence[str],
+        *,
+        destination: Path,
+        timeout_seconds: float,
+        output_limit: int,
+    ) -> DockerCommandResult:
+        del arguments, destination, timeout_seconds, output_limit
+        raise AssertionError("container cleanup must not stream files")
+
+
+def docker_result(
+    *,
+    returncode: int = 0,
+    stdout: bytes = b"",
+) -> DockerCommandResult:
+    return DockerCommandResult(
+        returncode=returncode,
+        stdout=stdout,
+        stderr=b"",
+        stdout_truncated=False,
+        stderr_truncated=False,
+        timed_out=False,
+    )
+
+
+async def test_parent_cleanup_removes_only_containers_with_the_attempt_label(
+    tmp_path: Path,
+) -> None:
+    prepared = prepared_benchmark(tmp_path)
+    invocation = BenchmarkCellInvocation.from_prepared(prepared, prepared.cells[0], 1)
+    first_id = "a" * 12
+    second_id = "b" * 64
+    runner = CleanupDockerRunner(
+        (
+            docker_result(stdout=f"{first_id}\n{second_id}\n".encode()),
+            docker_result(),
+        )
+    )
+
+    removed = await remove_benchmark_cell_containers(invocation, runner=runner)
+
+    assert removed is True
+    assert runner.calls[0][-2:] == (
+        "--filter",
+        f"label=dsa.benchmark.cleanup={invocation.cleanup_token}",
+    )
+    assert runner.calls[1] == (
+        "docker",
+        "rm",
+        "--force",
+        first_id,
+        second_id,
+    )
+
+
+async def test_parent_freezes_and_cleans_a_stuck_worker_before_killing_it(
+    tmp_path: Path,
+) -> None:
+    prepared = prepared_benchmark(tmp_path)
+    invocation = BenchmarkCellInvocation.from_prepared(prepared, prepared.cells[0], 1)
+
+    class StuckProcess:
+        def __init__(self) -> None:
+            self.returncode: int | None = None
+            self.pid = 123
+            self.signals: list[int] = []
+            self.exited = asyncio.Event()
+
+        async def wait(self) -> int:
+            await self.exited.wait()
+            assert self.returncode is not None
+            return self.returncode
+
+        def send_signal(self, selected_signal: int) -> None:
+            self.signals.append(selected_signal)
+            if selected_signal == signal.SIGKILL:
+                self.returncode = -signal.SIGKILL
+                self.exited.set()
+
+    process = StuckProcess()
+    states: list[int | None] = []
+
+    async def clean(_invocation: BenchmarkCellInvocation) -> bool:
+        states.append(process.returncode)
+        return True
+
+    await stop_benchmark_cell_worker(
+        cast(Any, process),
+        invocation,
+        cleaner=clean,
+        grace_seconds=0.01,
+        settle_seconds=0,
+    )
+
+    assert states == [None, -signal.SIGKILL]
+    assert process.signals == [signal.SIGINT, signal.SIGSTOP, signal.SIGKILL]
