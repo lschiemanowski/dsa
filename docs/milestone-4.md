@@ -77,6 +77,13 @@ uses four explicit scorers:
 - `infrastructure_failure`: true for provider, host-runtime, cancellation, or MLflow
   reporting failure
 
+MLflow's prediction trace preflight is disabled only around the native evaluation call
+and its prior environment setting is restored afterward. The DSA prediction already emits
+an explicit trace, while the preflight would otherwise execute the first side-effecting
+analysis twice. Native MLflow evaluation is itself documented as not thread-safe. Host
+run-timeout, model-usage-limit, and tool-result-limit terminal codes count as
+infrastructure failures alongside internal orchestration errors.
+
 The live acceptance case uses a generated tiny DuckDB database and a deterministic
 scripted Pydantic AI model. It proves native Databricks dataset creation, one evaluation,
 one DSA tracking run in addition to the native evaluation run, the expected trace shape,

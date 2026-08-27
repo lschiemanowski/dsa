@@ -5,7 +5,8 @@ from __future__ import annotations
 import json
 import math
 import os
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Generator, Sequence
+from contextlib import contextmanager
 from copy import deepcopy
 from importlib import import_module
 from pathlib import Path
@@ -189,11 +190,12 @@ def run_mlflow_evaluation(
 
     scorers = _native_scorers(selected_api)
     try:
-        raw_result = selected_api.evaluate(
-            data=dataset,
-            predict_fn=predict_fn,
-            scorers=scorers,
-        )
+        with _skip_mlflow_prediction_preflight():
+            raw_result = selected_api.evaluate(
+                data=dataset,
+                predict_fn=predict_fn,
+                scorers=scorers,
+            )
     except Exception:
         raise MlflowEvaluationError("mlflow_evaluation_failed") from None
     metrics = {
@@ -288,6 +290,9 @@ def infrastructure_failure(
         return True
     return prediction.failure_stage == "orchestration" and prediction.failure_code in {
         "internal_error",
+        "run_timeout",
+        "tool_result_limit_exceeded",
+        "usage_limit_exceeded",
     }
 
 
@@ -312,6 +317,21 @@ def _evaluation_configuration_failure() -> str | None:
     if any(not os.environ.get(key, "").strip() for key in required):
         return "mlflow_configuration_missing"
     return None
+
+
+@contextmanager
+def _skip_mlflow_prediction_preflight() -> Generator[None]:
+    """Prevent MLflow from executing a side-effecting prediction as validation."""
+    key = "MLFLOW_GENAI_EVAL_SKIP_TRACE_VALIDATION"
+    original = os.environ.get(key)
+    os.environ[key] = "true"
+    try:
+        yield
+    finally:
+        if original is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = original
 
 
 def _result_predictions(raw_result: object) -> tuple[MlflowEvaluationPrediction, ...]:

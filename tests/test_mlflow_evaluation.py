@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import os
+from contextlib import AbstractContextManager, contextmanager, nullcontext
+from importlib import import_module
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
@@ -110,6 +114,20 @@ def test_exact_json_and_failure_scorers_cover_the_all_case_denominator() -> None
     assert infrastructure_failure(invalid) is False
     assert agent_failure(invalid, expectations) is True
 
+    for code in (
+        "run_timeout",
+        "tool_result_limit_exceeded",
+        "usage_limit_exceeded",
+    ):
+        host_limit = prediction(
+            accepted=False,
+            answer=None,
+            failure_stage="orchestration",
+            failure_code=code,
+        )
+        assert infrastructure_failure(host_limit) is True
+        assert agent_failure(host_limit, expectations) is False
+
     assert end_to_end_exact_success(reporting_failed, expectations) is False
     assert conditional_exact_json(reporting_failed, expectations) is True
     assert infrastructure_failure(reporting_failed) is True
@@ -124,6 +142,7 @@ def test_native_evaluation_uses_dataset_expectations_and_normal_reporting_path(
     monkeypatch.setenv("MLFLOW_TRACKING_URI", "databricks")
     monkeypatch.setenv("DATABRICKS_HOST", "https://workspace.example")
     monkeypatch.setenv("DATABRICKS_TOKEN", "test-token")
+    monkeypatch.setenv("MLFLOW_GENAI_EVAL_SKIP_TRACE_VALIDATION", "false")
 
     class Dataset:
         dataset_id = "dataset-1"
@@ -184,6 +203,7 @@ def test_native_evaluation_uses_dataset_expectations_and_normal_reporting_path(
         ) -> Result:
             assert data is self.dataset
             assert len(scorers) == 4
+            assert os.environ["MLFLOW_GENAI_EVAL_SKIP_TRACE_VALIDATION"] == "true"
             inputs = data.records[0]["inputs"]
             assert isinstance(inputs, dict)
             monkeypatch.delenv("DATABRICKS_TOKEN")
@@ -228,6 +248,154 @@ def test_native_evaluation_uses_dataset_expectations_and_normal_reporting_path(
         "trace_id": None,
         "failure_code": "mlflow_configuration_missing",
     }
+    assert os.environ["MLFLOW_GENAI_EVAL_SKIP_TRACE_VALIDATION"] == "false"
+
+
+def test_native_mlflow_api_executes_one_analysis_per_dataset_row(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mlflow = pytest.importorskip("mlflow")
+    pandas = pytest.importorskip("pandas")
+    base_module: Any = import_module("mlflow.genai.evaluation.base")
+    harness_module: Any = import_module("mlflow.genai.evaluation.harness")
+    scorers_module: Any = import_module("mlflow.genai.scorers")
+    entities_module: Any = import_module("mlflow.entities")
+
+    monkeypatch.setenv("MLFLOW_EXPERIMENT_ID", "123")
+    monkeypatch.setenv("MLFLOW_TRACKING_URI", "databricks")
+    monkeypatch.setenv("DATABRICKS_HOST", "https://workspace.example")
+    monkeypatch.setenv("DATABRICKS_TOKEN", "test-token")
+    monkeypatch.delenv("MLFLOW_GENAI_EVAL_SKIP_TRACE_VALIDATION", raising=False)
+
+    @contextmanager
+    def evaluation_run() -> Any:
+        yield SimpleNamespace(
+            info=SimpleNamespace(run_id="native-evaluation-run"),
+            data=SimpleNamespace(tags={}),
+        )
+
+    class Client:
+        def set_tag(self, *_args: object, **_kwargs: object) -> None:
+            return None
+
+    outputs: list[dict[str, Any]] = []
+
+    def harness_run(
+        *,
+        predict_fn: Any,
+        eval_df: Any,
+        scorers: list[object],
+        run_id: str,
+    ) -> Any:
+        assert predict_fn is not None
+        assert len(scorers) == 4
+        assert run_id == "native-evaluation-run"
+        for inputs in eval_df["inputs"].tolist():
+            outputs.append(predict_fn(inputs))
+        return SimpleNamespace(
+            run_id=run_id,
+            metrics={"end_to_end_exact_success/mean": 0.0},
+            result_df=pandas.DataFrame({"outputs": outputs}),
+        )
+
+    def evaluation_autologging(
+        **_kwargs: object,
+    ) -> AbstractContextManager[None]:
+        return nullcontext()
+
+    def no_log(*_args: object, **_kwargs: object) -> None:
+        return None
+
+    def no_display(*_args: object) -> None:
+        return None
+
+    monkeypatch.setattr(base_module, "_start_run_or_reuse_active_run", evaluation_run)
+    monkeypatch.setattr(
+        base_module,
+        "configure_autologging_for_evaluation",
+        evaluation_autologging,
+    )
+    monkeypatch.setattr(base_module, "_log_dataset_input", no_log)
+    monkeypatch.setattr(base_module, "MlflowClient", Client)
+    monkeypatch.setattr(base_module, "display_evaluation_output", no_display)
+    monkeypatch.setattr(harness_module, "run", harness_run)
+
+    class Dataset:
+        dataset_id = "native-dataset"
+        digest = "native-digest"
+
+        def __init__(self) -> None:
+            self.records: list[dict[str, Any]] = []
+
+        def merge_records(self, records: list[dict[str, Any]]) -> Dataset:
+            self.records.extend(records)
+            return self
+
+    class NativeApi:
+        def __init__(self) -> None:
+            self.dataset = Dataset()
+
+        def create_dataset(self, *, name: str, experiment_id: str) -> Dataset:
+            assert name == "native-dataset"
+            assert experiment_id == "123"
+            return self.dataset
+
+        def scorer(self, function: Any, *, name: str) -> object:
+            return scorers_module.scorer(function, name=name)
+
+        def invalid_feedback(self, name: str, rationale: str) -> object:
+            return entities_module.Feedback(
+                name=name,
+                value=None,
+                rationale=rationale,
+                valid=False,
+            )
+
+        def evaluate(
+            self,
+            *,
+            data: Dataset,
+            predict_fn: Any,
+            scorers: list[object],
+        ) -> object:
+            monkeypatch.delenv("DATABRICKS_TOKEN")
+            return mlflow.genai.evaluate(
+                data=data.records,
+                predict_fn=predict_fn,
+                scorers=scorers,
+            )
+
+    model_factory_calls = 0
+
+    def model_factory(_case: MlflowEvaluationCase) -> TestModel:
+        nonlocal model_factory_calls
+        model_factory_calls += 1
+        return TestModel(call_tools=[], custom_output_args={"count": 3})
+
+    first_case = MlflowEvaluationCase(
+        case_id="first-native-case",
+        request=valid_request(tmp_path),
+        expected_answer={"count": 3},
+    )
+    second_case = MlflowEvaluationCase(
+        case_id="second-native-case",
+        request=valid_request(tmp_path),
+        expected_answer={"count": 3},
+    )
+    result = run_mlflow_evaluation(
+        [first_case, second_case],
+        dataset_name="native-dataset",
+        runs_directory=tmp_path / "runs",
+        model_factory=model_factory,
+        api=cast(Any, NativeApi()),
+    )
+
+    assert model_factory_calls == 2
+    assert len(outputs) == 2
+    assert len(list((tmp_path / "runs").glob("*/terminal.json"))) == 2
+    assert len(result.predictions) == 2
+    assert "MLFLOW_GENAI_EVAL_SKIP_TRACE_VALIDATION" not in os.environ
 
 
 def test_native_evaluation_rejects_local_or_incomplete_tracking_configuration(
