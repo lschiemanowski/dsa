@@ -17,6 +17,12 @@ from dsa.benchmark import (
     read_benchmark_cell_receipt,
     run_prepared_benchmark,
 )
+from dsa.benchmark_report import (
+    BenchmarkReport,
+    RetainedBenchmarkReport,
+    build_benchmark_report,
+    publish_benchmark_report,
+)
 from dsa.contract import ModelConfiguration, RunPolicy, RunRequest
 from dsa.docker import (
     DockerExecutorConfiguration,
@@ -65,6 +71,7 @@ __all__ = [
     "BenchmarkModel",
     "BenchmarkPack",
     "BenchmarkPlan",
+    "BenchmarkReport",
     "BenchmarkRuntime",
     "BenchmarkStudy",
     "DatabaseRecord",
@@ -86,6 +93,7 @@ __all__ = [
     "PythonExecutionRequest",
     "PythonExecutionResult",
     "PythonExecutor",
+    "RetainedBenchmarkReport",
     "RetainedTerminalRecord",
     "RunCompletion",
     "RunFailure",
@@ -94,10 +102,12 @@ __all__ = [
     "RunSuccess",
     "TerminalRecord",
     "benchmark_plan",
+    "build_benchmark_report",
     "default_docker_configuration",
     "expand_benchmark_study",
     "load_huggingface_evaluation_pack",
     "prepare_benchmark",
+    "publish_benchmark_report",
     "read_benchmark_cell_receipt",
     "run_analysis",
     "run_mlflow_evaluation",

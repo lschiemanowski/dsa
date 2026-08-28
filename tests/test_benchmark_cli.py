@@ -14,6 +14,10 @@ from dsa.benchmark import (
     benchmark_plan,
 )
 from dsa.benchmark_cli import main
+from dsa.benchmark_report import (
+    BenchmarkReportConfigurationError,
+    RetainedBenchmarkReport,
+)
 
 from .test_benchmark import REVISION
 from .test_benchmark_execution import prepared_benchmark
@@ -174,6 +178,105 @@ def test_run_returns_one_for_an_incomplete_matrix(
 
     assert status == 1
     assert json.loads(capsys.readouterr().out)["status"] == "incomplete"
+
+
+def test_report_uses_only_the_read_only_reporter_and_emits_exact_paths(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    prepared = prepared_benchmark(tmp_path)
+    study_path, runtime_path = write_contracts(tmp_path, prepared)
+    output_directory = tmp_path / "reports"
+    calls: list[tuple[str, Path]] = []
+
+    def report(
+        study: object,
+        runtime: object,
+        *,
+        output_directory: Path,
+        reporter_revision: str,
+    ) -> RetainedBenchmarkReport:
+        del study
+        assert isinstance(runtime, BenchmarkRuntime)
+        calls.append((reporter_revision, runtime.workspace_root))
+        return RetainedBenchmarkReport(
+            report_sha256="f" * 64,
+            json_path=output_directory / "study.report.json",
+            markdown_path=output_directory / "study.report.md",
+        )
+
+    async def forbidden(*_args: object, **_kwargs: object) -> PreparedBenchmark:
+        raise AssertionError("report must not use execution preflight")
+
+    status = main(
+        [
+            "report",
+            "--study",
+            str(study_path),
+            "--runtime",
+            str(runtime_path),
+            "--output",
+            str(output_directory),
+        ],
+        current_revision=REVISION,
+        preparer=forbidden,
+        reporter=report,
+    )
+
+    assert status == 0
+    assert calls == [(REVISION, prepared.runtime.workspace_root)]
+    assert json.loads(capsys.readouterr().out) == {
+        "json_path": str(output_directory / "study.report.json"),
+        "markdown_path": str(output_directory / "study.report.md"),
+        "report_sha256": "f" * 64,
+        "status": "completed",
+        "study_sha256": prepared.study.sha256,
+    }
+
+
+@pytest.mark.parametrize(
+    ("error", "status", "code"),
+    [
+        (
+            BenchmarkReportConfigurationError("bad configuration"),
+            2,
+            "benchmark_report_preflight_failed",
+        ),
+        (ValueError("missing evidence"), 1, "benchmark_report_failed"),
+    ],
+)
+def test_report_classifies_configuration_and_evidence_failures(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    error: ValueError,
+    status: int,
+    code: str,
+) -> None:
+    prepared = prepared_benchmark(tmp_path)
+    study_path, runtime_path = write_contracts(tmp_path, prepared)
+
+    def reject(*_args: object, **_kwargs: object) -> RetainedBenchmarkReport:
+        raise error
+
+    actual = main(
+        [
+            "report",
+            "--study",
+            str(study_path),
+            "--runtime",
+            str(runtime_path),
+            "--output",
+            str(tmp_path / "reports"),
+        ],
+        current_revision=REVISION,
+        reporter=reject,
+    )
+
+    assert actual == status
+    assert json.loads(capsys.readouterr().out) == {
+        "code": code,
+        "status": "rejected" if status == 2 else "failed",
+    }
 
 
 def test_preflight_rejection_returns_two_without_running_cells(
