@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from hashlib import sha256
 from importlib import import_module
 from pathlib import Path
-from typing import Annotated, Any, Literal, Protocol
+from typing import Annotated, Any, Literal, Protocol, cast
 from uuid import uuid4
 
 from pydantic import Field, ValidationInfo, field_validator, model_validator
@@ -36,10 +36,11 @@ from dsa.evaluation import (
     agent_failure,
     conditional_exact_json,
     end_to_end_exact_success,
+    exact_json_equal,
     infrastructure_failure,
 )
 from dsa.pack import LoadedEvaluationPack, load_huggingface_evaluation_pack
-from dsa.record import FailureStage
+from dsa.record import FailureStage, RunFailure, RunSuccess, TerminalRecord
 from dsa.reporting import MlflowReporting
 
 Sha256 = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
@@ -75,6 +76,8 @@ _REPORT_JSON_BYTES = 256 * 1024 * 1024
 _REPORT_MARKDOWN_BYTES = 64 * 1024 * 1024
 _MAX_REPORT_CASE_EXECUTIONS = 100_000
 _RECEIPT_BYTES = 64 * 1024 * 1024
+_TERMINAL_BYTES = 64 * 1024 * 1024
+_MAX_CELL_ATTEMPTS = 10_000
 
 
 class BenchmarkReportConfigurationError(ValueError):
@@ -431,6 +434,8 @@ class BenchmarkMlflowRun(ContractModel):
     """Narrow safe projection of one exact MLflow run."""
 
     run_id: SafeRemoteId
+    status: str = Field(pattern=r"^[A-Z][A-Z_]{0,31}$")
+    lifecycle_stage: Literal["active", "deleted"]
     metrics: dict[str, float] = Field(default_factory=dict)
     params: dict[str, str] = Field(default_factory=dict)
     tags: dict[str, str] = Field(default_factory=dict)
@@ -763,6 +768,7 @@ def _verify_and_compute_cell(
     evidence_reader: BenchmarkEvidenceReader,
 ) -> tuple[_CaseComputation, ...]:
     evaluation_run = _read_remote_run(evidence_reader, receipt.evaluation_run_id)
+    _require_completed_run(evaluation_run, "evaluation")
     expected_tags = {
         "dsa.benchmark.agent_revision": receipt.agent_revision,
         "dsa.benchmark.cell_id": receipt.cell_id,
@@ -791,6 +797,7 @@ def _verify_and_compute_cell(
                 evidence_reader,
                 tracking_run_id,
             )
+            _require_completed_run(tracking, "analysis")
             expected_outcome = "succeeded" if prediction.accepted else "failed"
             if (
                 tracking.tags.get("dsa.run_id") != prediction.run_id
@@ -1117,6 +1124,7 @@ def _read_receipt_at(root_descriptor: int, cell_id: str) -> BenchmarkCellReceipt
         receipt = BenchmarkCellReceipt.model_validate_json(content)
         if content != receipt.canonical_json.encode():
             raise ValueError("benchmark report requires canonical cell receipts")
+        _verify_terminal_records_at(cell_descriptor, receipt)
         return receipt
     except ValueError:
         raise
@@ -1127,6 +1135,138 @@ def _read_receipt_at(root_descriptor: int, cell_id: str) -> BenchmarkCellReceipt
             os.close(receipt_descriptor)
         if cell_descriptor is not None:
             os.close(cell_descriptor)
+
+
+def _verify_terminal_records_at(
+    cell_descriptor: int,
+    receipt: BenchmarkCellReceipt,
+) -> None:
+    attempts_descriptor: int | None = None
+    attempt_descriptor: int | None = None
+    runs_descriptor: int | None = None
+    try:
+        attempts_descriptor = os.open(
+            "attempts",
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=cell_descriptor,
+        )
+        attempt_names: list[str] = []
+        with os.scandir(attempts_descriptor) as entries:
+            for entry in entries:
+                if len(attempt_names) >= _MAX_CELL_ATTEMPTS:
+                    raise ValueError("benchmark report has too many cell attempts")
+                if not entry.is_dir(follow_symlinks=False):
+                    raise ValueError("benchmark report requires managed cell attempts")
+                attempt_names.append(entry.name)
+        expected_names = [
+            f"attempt-{index:04d}" for index in range(1, len(attempt_names) + 1)
+        ]
+        if not attempt_names or sorted(attempt_names) != expected_names:
+            raise ValueError("benchmark report requires sequential cell attempts")
+        attempt_descriptor = os.open(
+            expected_names[-1],
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=attempts_descriptor,
+        )
+        runs_descriptor = os.open(
+            "runs",
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=attempt_descriptor,
+        )
+        expected_run_ids = {prediction.run_id for prediction in receipt.predictions}
+        if len(expected_run_ids) != len(receipt.predictions):
+            raise ValueError("benchmark report requires unique terminal run identities")
+        actual_run_ids: set[str] = set()
+        with os.scandir(runs_descriptor) as entries:
+            for entry in entries:
+                if len(actual_run_ids) >= len(expected_run_ids) + 1:
+                    raise ValueError("benchmark report requires exact terminal records")
+                if (
+                    entry.name not in expected_run_ids
+                    or not entry.is_dir(follow_symlinks=False)
+                ):
+                    raise ValueError("benchmark report requires exact terminal records")
+                actual_run_ids.add(entry.name)
+        if actual_run_ids != expected_run_ids:
+            raise ValueError("benchmark report requires exact terminal records")
+        for prediction in receipt.predictions:
+            _verify_terminal_record_at(runs_descriptor, prediction)
+    except ValueError:
+        raise
+    except Exception:
+        raise ValueError("benchmark report requires exact terminal records") from None
+    finally:
+        if runs_descriptor is not None:
+            os.close(runs_descriptor)
+        if attempt_descriptor is not None:
+            os.close(attempt_descriptor)
+        if attempts_descriptor is not None:
+            os.close(attempts_descriptor)
+
+
+def _verify_terminal_record_at(
+    runs_descriptor: int,
+    prediction: MlflowEvaluationPrediction,
+) -> None:
+    run_descriptor: int | None = None
+    terminal_descriptor: int | None = None
+    try:
+        run_descriptor = os.open(
+            prediction.run_id,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=runs_descriptor,
+        )
+        terminal_descriptor = os.open(
+            "terminal.json",
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=run_descriptor,
+        )
+        metadata = os.fstat(terminal_descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_size <= 0
+            or metadata.st_size > _TERMINAL_BYTES
+        ):
+            raise ValueError("benchmark report requires bounded terminal records")
+        with os.fdopen(terminal_descriptor, "rb") as source:
+            terminal_descriptor = None
+            content = source.read(_TERMINAL_BYTES + 1)
+        if sha256(content).hexdigest() != prediction.terminal_sha256:
+            raise ValueError("benchmark report terminal digest does not match its receipt")
+        terminal = TerminalRecord.model_validate_json(content)
+        canonical = _canonical_json(terminal.model_dump(mode="json")).encode() + b"\n"
+        if content != canonical:
+            raise ValueError("benchmark report requires canonical terminal records")
+        if terminal.run_id != prediction.run_id:
+            raise ValueError("benchmark report terminal run identity does not match its receipt")
+        if prediction.accepted:
+            if not isinstance(terminal.outcome, RunSuccess) or not exact_json_equal(
+                terminal.outcome.answer,
+                prediction.answer,
+            ):
+                raise ValueError("benchmark report terminal outcome does not match its receipt")
+        elif not isinstance(terminal.outcome, RunFailure) or (
+            terminal.outcome.failure.stage != prediction.failure_stage
+            or terminal.outcome.failure.code != prediction.failure_code
+        ):
+            raise ValueError("benchmark report terminal outcome does not match its receipt")
+    except ValueError:
+        raise
+    except Exception:
+        raise ValueError("benchmark report requires exact terminal records") from None
+    finally:
+        if terminal_descriptor is not None:
+            os.close(terminal_descriptor)
+        if run_descriptor is not None:
+            os.close(run_descriptor)
 
 
 def _dataset_evidence(
@@ -1268,6 +1408,11 @@ class MlflowBenchmarkEvidenceReader:
             tags = {name: str(raw_tags[name]) for name in _RUN_TAGS if name in raw_tags}
             return BenchmarkMlflowRun(
                 run_id=run_id,
+                status=str(raw.info.status),
+                lifecycle_stage=cast(
+                    Literal["active", "deleted"],
+                    str(raw.info.lifecycle_stage),
+                ),
                 metrics=metrics,
                 params=params,
                 tags=tags,
@@ -1288,6 +1433,11 @@ def _read_remote_run(
     if selected.run_id != run_id:
         raise ValueError("MLflow returned a foreign run identity")
     return selected
+
+
+def _require_completed_run(run: BenchmarkMlflowRun, kind: str) -> None:
+    if run.status != "FINISHED" or run.lifecycle_stage != "active":
+        raise ValueError(f"MLflow {kind} run is not completed active evidence")
 
 
 def _metric_table_header() -> str:

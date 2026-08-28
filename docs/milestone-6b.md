@@ -54,13 +54,17 @@ Before deriving any result, the publisher:
 3. Requires exactly one canonical `cell.json` for every planned cell and rejects extra,
    missing, malformed, non-regular, conflicting, or mismatched receipts.
 4. Verifies every receipt digest and its study, cell, pack, model, repetition, agent,
-   image, dataset, evaluation-run, case-order, run, and terminal-record identities.
-5. Reads each exact MLflow evaluation run by the ID retained in its receipt and requires
-   its benchmark tags to agree with the receipt and study.
+   image, dataset, evaluation-run, case-order, and run identities. For every prediction,
+   it reads the exact bounded canonical terminal record from the final successful local
+   attempt, hashes those bytes, and requires the digest, run identity, and projected
+   outcome to agree with the receipt.
+5. Reads each exact MLflow evaluation run by the ID retained in its receipt, requires
+   an active `FINISHED` lifecycle state, and requires its benchmark tags to agree with
+   the receipt and study.
 6. Reads each successfully reported analysis run by its retained tracking-run ID and
-   requires its safe DSA run identity to agree with the prediction. A prediction whose
-   reporting projection itself failed remains a valid infrastructure observation and
-   is not required to have a completed tracking run.
+   requires an active `FINISHED` lifecycle state and its safe DSA run identity to agree
+   with the prediction. A prediction whose reporting projection itself failed remains
+   a valid infrastructure observation and is not required to have a tracking run.
 7. Recomputes scorer outcomes with the existing DSA scorer functions using the retained
    prediction and the expectation from the verified pinned pack, then cross-checks the
    corresponding finite aggregate metrics exposed by the MLflow evaluation run. A
@@ -182,9 +186,10 @@ cannot change the evidence inventory or break an idempotent rerun.
 
 Deterministic tests cover strict report models, canonical ordering and identity,
 mutation resistance, complete-matrix enforcement, receipt and pack verification,
-remote-ID correlation, MLflow mismatch rejection, all metric denominators, zero accepted
-answers, task-weighted aggregation, repetition handling, observation coverage, secret
-and answer exclusion, deterministic Markdown, atomic no-overwrite publication,
+terminal-byte hashing and run correlation, remote-ID correlation, completed active
+MLflow lifecycle enforcement, MLflow mismatch rejection, all metric denominators, zero
+accepted answers, task-weighted aggregation, repetition handling, observation coverage,
+secret and answer exclusion, deterministic Markdown, atomic no-overwrite publication,
 idempotent recovery, bounded reads, CLI framing, and zero model execution.
 
 Offline tests use fixed packs, receipts, and a narrow fake of the pinned MLflow client

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -10,6 +11,7 @@ import pytest
 
 from dsa.benchmark import (
     BenchmarkCellInvocation,
+    BenchmarkCellReceipt,
     PreparedBenchmark,
     retain_benchmark_cell_receipt,
 )
@@ -22,7 +24,9 @@ from dsa.benchmark_report import (
     create_benchmark_report,
     publish_benchmark_report,
 )
+from dsa.contract import RunRequest
 from dsa.evaluation import MlflowEvaluationPrediction
+from dsa.record import Failure, RunFailure, RunSuccess, TerminalRecord, write_terminal_record
 from dsa.reporting import MlflowReporting
 
 from .test_benchmark_execution import prepared_benchmark, receipt
@@ -54,6 +58,67 @@ def evaluation_tags(invocation: BenchmarkCellInvocation) -> dict[str, str]:
     }
 
 
+def retain_receipt_with_terminals(
+    prepared: PreparedBenchmark,
+    invocation: BenchmarkCellInvocation,
+    selected_receipt: BenchmarkCellReceipt,
+    *,
+    terminal_run_id: str | None = None,
+    terminal_sha256: str | None = None,
+) -> BenchmarkCellReceipt:
+    selected = BenchmarkCellReceipt.model_validate_json(selected_receipt.model_dump_json())
+    cases = {
+        case.case_id: case
+        for pack_id, pack in prepared.packs
+        if pack_id == selected.pack_id
+        for case in pack.cases
+    }
+    predictions: list[MlflowEvaluationPrediction] = []
+    started_at = datetime(2026, 1, 1, tzinfo=UTC)
+    for prediction in selected.predictions:
+        case = cases[prediction.case_id]
+        run_directory = invocation.attempt_directory / "runs" / prediction.run_id
+        run_directory.mkdir(parents=True)
+        if prediction.accepted:
+            outcome = RunSuccess(answer=prediction.answer)
+        else:
+            if prediction.failure_stage is None or prediction.failure_code is None:
+                raise AssertionError("failed test prediction must be classified")
+            outcome = RunFailure(
+                failure=Failure(
+                    stage=prediction.failure_stage,
+                    code=prediction.failure_code,
+                    message="classified benchmark failure",
+                )
+            )
+        terminal = TerminalRecord(
+            run_id=terminal_run_id or prediction.run_id,
+            started_at=started_at,
+            finished_at=started_at + timedelta(seconds=1),
+            request=RunRequest(
+                database_path=next(
+                    pack.database_path
+                    for pack_id, pack in prepared.packs
+                    if pack_id == selected.pack_id
+                ),
+                question=case.question,
+                answer_schema=case.answer_schema,
+                model=invocation.model_configuration,
+                policy=invocation.policy,
+            ),
+            outcome=outcome,
+        )
+        retained = write_terminal_record(terminal, run_directory)
+        predictions.append(
+            prediction.model_copy(
+                update={"terminal_sha256": terminal_sha256 or retained.sha256}
+            )
+        )
+    selected = selected.model_copy(update={"predictions": tuple(predictions)})
+    retain_benchmark_cell_receipt(selected, invocation.receipt_path)
+    return selected
+
+
 def complete_report_evidence(
     tmp_path: Path,
     *,
@@ -69,11 +134,17 @@ def complete_report_evidence(
         selected_receipt = selected_receipt.model_copy(
             update={"predictions": (prediction,)}
         )
-    retain_benchmark_cell_receipt(selected_receipt, invocation.receipt_path)
+    selected_receipt = retain_receipt_with_terminals(
+        prepared,
+        invocation,
+        selected_receipt,
+    )
     exact = accepted_answer in (None, {"count": 3})
     runs = {
         selected_receipt.evaluation_run_id: BenchmarkMlflowRun(
             run_id=selected_receipt.evaluation_run_id,
+            status="FINISHED",
+            lifecycle_stage="active",
             metrics={
                 "agent_failure/mean": 0.0 if exact else 1.0,
                 "conditional_exact_json/mean": 1.0 if exact else 0.0,
@@ -84,6 +155,8 @@ def complete_report_evidence(
         ),
         "tracking-run": BenchmarkMlflowRun(
             run_id="tracking-run",
+            status="FINISHED",
+            lifecycle_stage="active",
             metrics={
                 "dsa.elapsed_seconds": 2.5,
                 "dsa.usage.input_tokens": 100,
@@ -186,6 +259,79 @@ def test_report_rejects_mlflow_metric_or_identity_mismatch(tmp_path: Path) -> No
         )
 
 
+@pytest.mark.parametrize(
+    ("run_id", "update"),
+    (
+        ("evaluation-run", {"status": "RUNNING"}),
+        ("evaluation-run", {"lifecycle_stage": "deleted"}),
+        ("tracking-run", {"status": "FAILED"}),
+    ),
+)
+def test_report_requires_completed_active_mlflow_runs(
+    tmp_path: Path,
+    run_id: str,
+    update: dict[str, str],
+) -> None:
+    prepared, reader = complete_report_evidence(tmp_path)
+    reader.runs[run_id] = reader.runs[run_id].model_copy(update=update)
+
+    with pytest.raises(ValueError, match="completed active evidence"):
+        build_benchmark_report(
+            prepared.study,
+            prepared.runtime,
+            reporter_revision=REPORTER_REVISION,
+            pack_loader=lambda _reference: prepared.packs[0][1],
+            evidence_reader=reader,
+        )
+
+
+def test_report_rejects_an_unverified_terminal_digest(tmp_path: Path) -> None:
+    prepared = prepared_benchmark(tmp_path)
+    invocation = BenchmarkCellInvocation.from_prepared(prepared, prepared.cells[0], 1)
+    selected = retain_receipt_with_terminals(
+        prepared,
+        invocation,
+        receipt(invocation),
+        terminal_sha256="0" * 64,
+    )
+    reader = EvidenceReader({})
+
+    with pytest.raises(ValueError, match="terminal digest"):
+        build_benchmark_report(
+            prepared.study,
+            prepared.runtime,
+            reporter_revision=REPORTER_REVISION,
+            pack_loader=lambda _reference: prepared.packs[0][1],
+            evidence_reader=reader,
+        )
+
+    assert selected.predictions[0].terminal_sha256 == "0" * 64
+    assert reader.requested == []
+
+
+def test_report_rejects_a_foreign_terminal_run_identity(tmp_path: Path) -> None:
+    prepared = prepared_benchmark(tmp_path)
+    invocation = BenchmarkCellInvocation.from_prepared(prepared, prepared.cells[0], 1)
+    retain_receipt_with_terminals(
+        prepared,
+        invocation,
+        receipt(invocation),
+        terminal_run_id="foreign-run",
+    )
+    reader = EvidenceReader({})
+
+    with pytest.raises(ValueError, match="terminal run identity"):
+        build_benchmark_report(
+            prepared.study,
+            prepared.runtime,
+            reporter_revision=REPORTER_REVISION,
+            pack_loader=lambda _reference: prepared.packs[0][1],
+            evidence_reader=reader,
+        )
+
+    assert reader.requested == []
+
+
 def test_report_revalidates_mutated_typed_inputs(tmp_path: Path) -> None:
     prepared, reader = complete_report_evidence(tmp_path)
     prepared.study.models[0].configuration.settings["api_key"] = "SECRET"
@@ -286,9 +432,11 @@ def test_report_aggregates_multiple_cells_from_case_counts(tmp_path: Path) -> No
                 "predictions": (prediction,),
             }
         )
-        retain_benchmark_cell_receipt(selected, invocation.receipt_path)
+        selected = retain_receipt_with_terminals(prepared, invocation, selected)
         runs[selected.evaluation_run_id] = BenchmarkMlflowRun(
             run_id=selected.evaluation_run_id,
+            status="FINISHED",
+            lifecycle_stage="active",
             metrics={
                 "agent_failure/mean": 0.0 if exact else 1.0,
                 "conditional_exact_json/mean": 1.0 if exact else 0.0,
@@ -299,6 +447,8 @@ def test_report_aggregates_multiple_cells_from_case_counts(tmp_path: Path) -> No
         )
         runs[tracking_id] = BenchmarkMlflowRun(
             run_id=tracking_id,
+            status="FINISHED",
+            lifecycle_stage="active",
             metrics={"dsa.usage.total_tokens": float(100 + index)},
             params={"dsa.model_name": invocation.model_configuration.name},
             tags={
@@ -393,11 +543,17 @@ def test_failed_reporting_has_no_conditional_mlflow_exception(
         ),
     )
     failed_receipt = base.model_copy(update={"predictions": (prediction,)})
-    retain_benchmark_cell_receipt(failed_receipt, invocation.receipt_path)
+    failed_receipt = retain_receipt_with_terminals(
+        prepared,
+        invocation,
+        failed_receipt,
+    )
     reader = EvidenceReader(
         {
             "evaluation-run": BenchmarkMlflowRun(
                 run_id="evaluation-run",
+                status="FINISHED",
+                lifecycle_stage="active",
                 metrics={
                     "agent_failure/mean": 0.0,
                     "end_to_end_exact_success/mean": 0.0,
@@ -425,7 +581,11 @@ def test_failed_reporting_has_no_conditional_mlflow_exception(
 
 def test_mlflow_reader_retains_only_the_bounded_safe_projection() -> None:
     raw = SimpleNamespace(
-        info=SimpleNamespace(run_id="evaluation-run"),
+        info=SimpleNamespace(
+            run_id="evaluation-run",
+            status="FINISHED",
+            lifecycle_stage="active",
+        ),
         data=SimpleNamespace(
             metrics={
                 "end_to_end_exact_success/mean": 1.0,
@@ -450,6 +610,8 @@ def test_mlflow_reader_retains_only_the_bounded_safe_projection() -> None:
     selected = MlflowBenchmarkEvidenceReader(Client()).get_run("evaluation-run")
 
     assert selected.metrics == {"end_to_end_exact_success/mean": 1.0}
+    assert selected.status == "FINISHED"
+    assert selected.lifecycle_stage == "active"
     assert selected.params == {"dsa.model_name": "test"}
     assert selected.tags == {"dsa.benchmark.cell_id": "cell-" + "a" * 64}
     assert "SECRET" not in selected.model_dump_json()
