@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable, Coroutine, Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from dsa.cli import HelpRequested, Parser, canonical_json, emit, read_contract
 from dsa.contract import RunRequest
@@ -17,6 +17,12 @@ from dsa.runner import RunCompletion, run_analysis
 Runner = Callable[..., Coroutine[Any, Any, RunCompletion]]
 ExecutorFactory = Callable[[str], PythonExecutor]
 _MAX_INLINE_ANSWER_BYTES = 1024 * 1024
+
+
+class _RunInterrupted(Exception):
+    def __init__(self, completion: RunCompletion | None) -> None:
+        super().__init__("standalone run interrupted")
+        self.completion = completion
 
 
 def main(
@@ -41,13 +47,21 @@ def main(
 
     try:
         completion = asyncio.run(
-            runner(
-                request,
-                runs_directory=runs_directory,
-                python_executor=python_executor,
-                report_to_mlflow=parsed.report_to_mlflow,
+            _preserve_cancellation(
+                runner(
+                    request,
+                    runs_directory=runs_directory,
+                    python_executor=python_executor,
+                    report_to_mlflow=parsed.report_to_mlflow,
+                )
             )
         )
+    except _RunInterrupted as interrupted:
+        if interrupted.completion is None:
+            emit({"code": "run_cancelled", "status": "failed"})
+        else:
+            emit(_result_projection(interrupted.completion))
+        return 130
     except KeyboardInterrupt:
         return 130
     except Exception:
@@ -56,6 +70,29 @@ def main(
 
     emit(_result_projection(completion))
     return 0 if isinstance(completion.outcome, RunSuccess) else 1
+
+
+async def _preserve_cancellation(
+    operation: Coroutine[Any, Any, RunCompletion],
+) -> RunCompletion:
+    try:
+        return await operation
+    except asyncio.CancelledError as error:
+        raise _RunInterrupted(_cancelled_completion(error)) from None
+
+
+def _cancelled_completion(error: asyncio.CancelledError) -> RunCompletion | None:
+    retained_error = cast(Any, error)
+    try:
+        return RunCompletion.model_validate(
+            {
+                "record": retained_error.terminal_record,
+                "retained_record": retained_error.retained_record,
+                "reporting": getattr(retained_error, "reporting", {}),
+            }
+        )
+    except Exception:
+        return None
 
 
 def _parser() -> Parser:

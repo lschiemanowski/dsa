@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 
@@ -263,6 +265,71 @@ def test_large_success_answer_remains_only_in_the_terminal_record(
     assert result["status"] == "succeeded"
     assert result["answer_inline"] is False
     assert "answer" not in result
+
+
+def test_cancellation_emits_retained_terminal_identity_before_returning_130(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    request_path = write_request(tmp_path)
+    runs_directory = tmp_path / "runs"
+
+    async def cancel(
+        request: RunRequest,
+        **kwargs: object,
+    ) -> RunCompletion:
+        del kwargs
+        terminalized = completion(
+            request,
+            runs_directory,
+            outcome=RunFailure(
+                failure=Failure(
+                    stage="cancelled",
+                    code="cancelled_by_caller",
+                    message="The caller cancelled the analysis run",
+                )
+            ),
+            reporting=MlflowReporting(
+                status="failed",
+                failure_code="mlflow_cancelled",
+            ),
+        )
+        error = asyncio.CancelledError()
+        retained_error = cast(Any, error)
+        retained_error.terminal_record = terminalized.record
+        retained_error.retained_record = terminalized.retained_record
+        retained_error.reporting = terminalized.reporting
+        raise error
+
+    status = main(
+        [
+            "--request",
+            str(request_path),
+            "--runs-directory",
+            str(runs_directory),
+            "--docker-image",
+            IMAGE,
+            "--report-to-mlflow",
+        ],
+        runner=cancel,
+        executor_factory=lambda _image: StubExecutor(),
+    )
+
+    assert status == 130
+    assert json.loads(capsys.readouterr().out) == {
+        "failure": {"code": "cancelled_by_caller", "stage": "cancelled"},
+        "reporting": {
+            "failure_code": "mlflow_cancelled",
+            "status": "failed",
+        },
+        "run_id": "run-001",
+        "status": "failed",
+        "terminal_record": {
+            "byte_length": 123,
+            "path": str(runs_directory / "run-001/terminal.json"),
+            "sha256": "f" * 64,
+        },
+    }
 
 
 @pytest.mark.parametrize("invalid_kind", ["noncanonical", "symlink"])
