@@ -612,6 +612,41 @@ def test_native_api_reuses_an_existing_dataset_and_only_creates_when_missing() -
     ]
 
 
+def test_native_api_creates_a_dataset_after_unity_catalog_reports_not_found(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class NotFound(Exception):
+        pass
+
+    evaluation_module = import_module("dsa.evaluation")
+    real_import_module = evaluation_module.import_module
+
+    def import_with_sdk_error(name: str) -> Any:
+        if name == "databricks.sdk.errors":
+            return SimpleNamespace(NotFound=NotFound)
+        return real_import_module(name)
+
+    monkeypatch.setattr(evaluation_module, "import_module", import_with_sdk_error)
+    created = SimpleNamespace(dataset_id="created", digest="created-digest")
+
+    class Datasets:
+        def get_dataset(self, *, name: str) -> object:
+            raise NotFound(f"missing table {name}")
+
+        def create_dataset(self, *, name: str, experiment_id: str) -> object:
+            assert name == "catalog.schema.dataset"
+            assert experiment_id == "123"
+            return created
+
+    api_type: Any = vars(evaluation_module)["_MlflowEvaluationApi"]
+    api = api_type.__new__(api_type)
+    api.datasets = Datasets()
+
+    assert api.create_dataset(
+        name="catalog.schema.dataset", experiment_id="123"
+    ) is created
+
+
 def test_native_api_does_not_hide_dataset_lookup_failures() -> None:
     class Datasets:
         def get_dataset(self, *, name: str) -> object:
