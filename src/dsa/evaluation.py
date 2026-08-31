@@ -584,7 +584,7 @@ class _MlflowEvaluationApi:
         try:
             existing = self.datasets.get_dataset(name=name)
         except Exception as error:
-            if getattr(error, "error_code", None) != "RESOURCE_DOES_NOT_EXIST":
+            if not _dataset_is_missing(error):
                 raise
         else:
             return cast(_NativeDataset, existing)
@@ -623,3 +623,13 @@ class _MlflowEvaluationApi:
         scorers: list[object],
     ) -> object:
         return self.genai.evaluate(data=data, predict_fn=predict_fn, scorers=scorers)
+
+
+def _dataset_is_missing(error: Exception) -> bool:
+    if getattr(error, "error_code", None) == "RESOURCE_DOES_NOT_EXIST":
+        return True
+    try:
+        not_found = import_module("databricks.sdk.errors").NotFound
+    except (AttributeError, ModuleNotFoundError):
+        return False
+    return isinstance(error, not_found)

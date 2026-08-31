@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
+from databricks.sdk.errors import NotFound
 from pydantic import JsonValue, ValidationError
 from pydantic_ai.models.test import TestModel
 
@@ -610,6 +611,27 @@ def test_native_api_reuses_an_existing_dataset_and_only_creates_when_missing() -
         ("catalog.schema.dataset", "123"),
         ("catalog.schema.dataset", "123"),
     ]
+
+
+def test_native_api_creates_a_dataset_after_unity_catalog_reports_not_found() -> None:
+    created = SimpleNamespace(dataset_id="created", digest="created-digest")
+
+    class Datasets:
+        def get_dataset(self, *, name: str) -> object:
+            raise NotFound(f"missing table {name}")
+
+        def create_dataset(self, *, name: str, experiment_id: str) -> object:
+            assert name == "catalog.schema.dataset"
+            assert experiment_id == "123"
+            return created
+
+    api_type: Any = vars(import_module("dsa.evaluation"))["_MlflowEvaluationApi"]
+    api = api_type.__new__(api_type)
+    api.datasets = Datasets()
+
+    assert api.create_dataset(
+        name="catalog.schema.dataset", experiment_id="123"
+    ) is created
 
 
 def test_native_api_does_not_hide_dataset_lookup_failures() -> None:
