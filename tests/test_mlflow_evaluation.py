@@ -19,7 +19,9 @@ from dsa.evaluation import (
     MlflowEvaluationPrediction,
     agent_failure,
     conditional_exact_json,
+    conditional_policy_match,
     end_to_end_exact_success,
+    end_to_end_policy_success,
     exact_json_equal,
     infrastructure_failure,
     json_answers_equal,
@@ -43,6 +45,7 @@ def case_metadata() -> EvaluationCaseMetadata:
 def evaluation_pack(
     tmp_path: Path,
     *cases: EvaluationPackCase,
+    scorer: dict[str, JsonValue] | None = None,
 ) -> LoadedEvaluationPack:
     request = valid_request(tmp_path)
     selected_cases = cases or (
@@ -85,7 +88,7 @@ def evaluation_pack(
                 "size_bytes": len(case_bytes),
                 "sha256": sha256(case_bytes).hexdigest(),
             },
-            "scorer": {"name": "exact-json", "version": "1"},
+            "scorer": scorer or {"name": "exact-json", "version": "1"},
             "provenance": {
                 "source_datasets": (
                     {
@@ -268,6 +271,14 @@ def test_numeric_tolerance_is_explicit_recursive_and_never_weakens_integers() ->
         {"count": 3, "ratio": 0.10000000001, "values": [1, True]},
         expectations,
     ) is True
+    tolerated = prediction(
+        answer={"count": 3, "ratio": 0.10000000001, "values": [1, True]}
+    )
+    assert conditional_exact_json(tolerated, expectations) is False
+    assert end_to_end_exact_success(tolerated, expectations) is False
+    assert conditional_policy_match(tolerated, expectations) is True
+    assert end_to_end_policy_success(tolerated, expectations) is True
+    assert agent_failure(tolerated, expectations) is False
     assert json_answers_equal(
         {"count": 3.0, "ratio": 0.1, "values": [1, True]},
         expectations,
@@ -368,7 +379,7 @@ def test_native_evaluation_uses_dataset_expectations_and_normal_reporting_path(
             scorers: list[object],
         ) -> Result:
             assert data is self.refreshed_dataset
-            assert len(scorers) == 4
+            assert len(scorers) == 6
             assert os.environ["MLFLOW_GENAI_EVAL_SKIP_TRACE_VALIDATION"] == "true"
             inputs = data.records[0]["inputs"]
             assert isinstance(inputs, dict)
@@ -413,6 +424,8 @@ def test_native_evaluation_uses_dataset_expectations_and_normal_reporting_path(
     assert api.scorer_names == [
         "end_to_end_exact_success",
         "conditional_exact_json",
+        "end_to_end_policy_success",
+        "conditional_policy_match",
         "agent_failure",
         "infrastructure_failure",
     ]
@@ -669,7 +682,7 @@ def test_native_mlflow_api_executes_one_analysis_per_dataset_row(
         run_id: str,
     ) -> Any:
         assert predict_fn is not None
-        assert len(scorers) == 4
+        assert len(scorers) == 6
         assert run_id == "native-evaluation-run"
         for inputs in reversed(eval_df["inputs"].tolist()):
             outputs.append(predict_fn(inputs))

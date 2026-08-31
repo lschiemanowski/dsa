@@ -35,7 +35,9 @@ from dsa.evaluation import (
     MlflowEvaluationPrediction,
     agent_failure,
     conditional_exact_json,
+    conditional_policy_match,
     end_to_end_exact_success,
+    end_to_end_policy_success,
     exact_json_equal,
     infrastructure_failure,
 )
@@ -50,7 +52,9 @@ NonNegativeFinite = Annotated[float, Field(ge=0, allow_inf_nan=False)]
 _EVALUATION_METRICS = (
     "agent_failure/mean",
     "conditional_exact_json/mean",
+    "conditional_policy_match/mean",
     "end_to_end_exact_success/mean",
+    "end_to_end_policy_success/mean",
     "infrastructure_failure/mean",
 )
 _ANALYSIS_METRICS = (
@@ -111,11 +115,13 @@ class BenchmarkRate(ContractModel):
 
 
 class BenchmarkMetrics(ContractModel):
-    """The five deterministic study metrics with explicit denominators."""
+    """The exact, policy, completion, and failure metrics with explicit denominators."""
 
     end_to_end_exact_success: BenchmarkRate
+    end_to_end_policy_success: BenchmarkRate
     completion_rate: BenchmarkRate
     conditional_exact_accuracy: BenchmarkRate
+    conditional_policy_accuracy: BenchmarkRate
     agent_failure: BenchmarkRate
     infrastructure_failure: BenchmarkRate
 
@@ -167,6 +173,7 @@ class BenchmarkAggregate(ContractModel):
     def denominators_match_case_count(self) -> BenchmarkAggregate:
         all_case_rates = (
             self.metrics.end_to_end_exact_success,
+            self.metrics.end_to_end_policy_success,
             self.metrics.completion_rate,
             self.metrics.agent_failure,
             self.metrics.infrastructure_failure,
@@ -175,6 +182,8 @@ class BenchmarkAggregate(ContractModel):
             raise ValueError("all-case metric denominator does not match case count")
         if (
             self.metrics.conditional_exact_accuracy.denominator
+            != self.metrics.completion_rate.numerator
+            or self.metrics.conditional_policy_accuracy.denominator
             != self.metrics.completion_rate.numerator
         ):
             raise ValueError("conditional metric denominator does not match completions")
@@ -199,7 +208,9 @@ class BenchmarkCaseOutcome(ContractModel):
     )
     reporting: MlflowReporting
     end_to_end_exact_success: bool
+    end_to_end_policy_success: bool
     conditional_exact_json: bool | None
+    conditional_policy_match: bool | None
     agent_failure: bool
     infrastructure_failure: bool
 
@@ -208,12 +219,16 @@ class BenchmarkCaseOutcome(ContractModel):
         if self.accepted:
             if self.failure_stage is not None or self.failure_code is not None:
                 raise ValueError("accepted case outcome contains failure state")
-            if self.conditional_exact_json is None:
-                raise ValueError("accepted case outcome requires conditional exactness")
+            if (
+                self.conditional_exact_json is None
+                or self.conditional_policy_match is None
+            ):
+                raise ValueError("accepted case outcome requires conditional scores")
         elif (
             self.failure_stage is None
             or self.failure_code is None
             or self.conditional_exact_json is not None
+            or self.conditional_policy_match is not None
         ):
             raise ValueError("failed case outcome has invalid classification state")
         projection = MlflowEvaluationPrediction(
@@ -228,17 +243,23 @@ class BenchmarkCaseOutcome(ContractModel):
         )
         expected_infrastructure = infrastructure_failure(projection)
         expected_agent = not expected_infrastructure and (
-            not self.accepted or self.conditional_exact_json is False
+            not self.accepted or self.conditional_policy_match is False
         )
-        expected_end_to_end = (
+        expected_end_to_end_exact = (
             self.accepted
             and self.conditional_exact_json is True
+            and self.reporting.status == "reported"
+        )
+        expected_end_to_end_policy = (
+            self.accepted
+            and self.conditional_policy_match is True
             and self.reporting.status == "reported"
         )
         if (
             self.infrastructure_failure != expected_infrastructure
             or self.agent_failure != expected_agent
-            or self.end_to_end_exact_success != expected_end_to_end
+            or self.end_to_end_exact_success != expected_end_to_end_exact
+            or self.end_to_end_policy_success != expected_end_to_end_policy
         ):
             raise ValueError("case scorer outcomes are inconsistent")
         return self
@@ -313,7 +334,7 @@ class BenchmarkUnavailableCost(ContractModel):
 class BenchmarkReport(ContractModel):
     """Canonical immutable report for one complete benchmark study."""
 
-    format: Literal["dsa-benchmark-report/v1"] = "dsa-benchmark-report/v1"
+    format: Literal["dsa-benchmark-report/v2"] = "dsa-benchmark-report/v2"
     reporter_revision: GitRevision
     study_sha256: Sha256
     study: BenchmarkStudy
@@ -714,8 +735,9 @@ def benchmark_report_markdown(
         "## Cells",
         "",
         "| Cell | Pack | Model | Repetition | E2E exact | Completion | "
-        "Conditional exact | Agent failure | Infrastructure failure | MLflow run |",
-        "|---|---|---|---:|---:|---:|---:|---:|---:|---|",
+        "Conditional exact | E2E policy | Conditional policy | Agent failure | "
+        "Infrastructure failure | MLflow run |",
+        "|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|",
         *(_cell_markdown_row(item) for item in selected.cells),
         "",
         "## Observed runtime",
@@ -786,6 +808,8 @@ def _verify_and_compute_cell(
         expectations = case.scoring_expectations(pack.manifest)
         exact = end_to_end_exact_success(prediction, expectations)
         conditional = conditional_exact_json(prediction, expectations)
+        policy = end_to_end_policy_success(prediction, expectations)
+        conditional_policy = conditional_policy_match(prediction, expectations)
         agent = agent_failure(prediction, expectations)
         infrastructure = infrastructure_failure(prediction)
         observations: dict[str, float] = {}
@@ -826,7 +850,9 @@ def _verify_and_compute_cell(
                     failure_code=prediction.failure_code,
                     reporting=prediction.reporting,
                     end_to_end_exact_success=exact,
+                    end_to_end_policy_success=policy,
                     conditional_exact_json=conditional,
+                    conditional_policy_match=conditional_policy,
                     agent_failure=agent,
                     infrastructure_failure=infrastructure,
                 ),
@@ -839,8 +865,14 @@ def _verify_and_compute_cell(
         "conditional_exact_json/mean": (
             aggregate.metrics.conditional_exact_accuracy.rate
         ),
+        "conditional_policy_match/mean": (
+            aggregate.metrics.conditional_policy_accuracy.rate
+        ),
         "end_to_end_exact_success/mean": (
             aggregate.metrics.end_to_end_exact_success.rate
+        ),
+        "end_to_end_policy_success/mean": (
+            aggregate.metrics.end_to_end_policy_success.rate
         ),
         "infrastructure_failure/mean": (
             aggregate.metrics.infrastructure_failure.rate
@@ -884,13 +916,19 @@ def _metrics_from_outcomes(
     case_count = len(outcomes)
     accepted = sum(item.accepted for item in outcomes)
     conditional_exact = sum(item.conditional_exact_json is True for item in outcomes)
+    conditional_policy = sum(item.conditional_policy_match is True for item in outcomes)
     return BenchmarkMetrics(
         end_to_end_exact_success=_rate(
             sum(item.end_to_end_exact_success for item in outcomes),
             case_count,
         ),
+        end_to_end_policy_success=_rate(
+            sum(item.end_to_end_policy_success for item in outcomes),
+            case_count,
+        ),
         completion_rate=_rate(accepted, case_count),
         conditional_exact_accuracy=_rate(conditional_exact, accepted),
+        conditional_policy_accuracy=_rate(conditional_policy, accepted),
         agent_failure=_rate(
             sum(item.agent_failure for item in outcomes),
             case_count,
@@ -930,8 +968,10 @@ def _combine_aggregates(
         case_count=case_count,
         metrics=BenchmarkMetrics(
             end_to_end_exact_success=combined_rate("end_to_end_exact_success"),
+            end_to_end_policy_success=combined_rate("end_to_end_policy_success"),
             completion_rate=combined_rate("completion_rate"),
             conditional_exact_accuracy=combined_rate("conditional_exact_accuracy"),
+            conditional_policy_accuracy=combined_rate("conditional_policy_accuracy"),
             agent_failure=combined_rate("agent_failure"),
             infrastructure_failure=combined_rate("infrastructure_failure"),
         ),
@@ -1442,9 +1482,9 @@ def _require_completed_run(run: BenchmarkMlflowRun, kind: str) -> None:
 
 def _metric_table_header() -> str:
     return (
-        "| Scope | Cases | E2E exact | Completion | Conditional exact | "
-        "Agent failure | Infrastructure failure |\n"
-        "|---|---:|---:|---:|---:|---:|---:|"
+        "| Scope | Cases | E2E exact | Completion | Conditional exact | E2E policy | "
+        "Conditional policy | Agent failure | Infrastructure failure |\n"
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|"
     )
 
 
@@ -1455,6 +1495,8 @@ def _metric_row(scope: str, result: BenchmarkAggregate) -> str:
         f"{_format_rate(metrics.end_to_end_exact_success)} | "
         f"{_format_rate(metrics.completion_rate)} | "
         f"{_format_rate(metrics.conditional_exact_accuracy)} | "
+        f"{_format_rate(metrics.end_to_end_policy_success)} | "
+        f"{_format_rate(metrics.conditional_policy_accuracy)} | "
         f"{_format_rate(metrics.agent_failure)} | "
         f"{_format_rate(metrics.infrastructure_failure)} |"
     )
@@ -1467,6 +1509,8 @@ def _cell_markdown_row(cell: BenchmarkCellReport) -> str:
         f"{cell.repetition} | {_format_rate(metrics.end_to_end_exact_success)} | "
         f"{_format_rate(metrics.completion_rate)} | "
         f"{_format_rate(metrics.conditional_exact_accuracy)} | "
+        f"{_format_rate(metrics.end_to_end_policy_success)} | "
+        f"{_format_rate(metrics.conditional_policy_accuracy)} | "
         f"{_format_rate(metrics.agent_failure)} | "
         f"{_format_rate(metrics.infrastructure_failure)} | "
         f"`{cell.evaluation_run_id}` |"

@@ -265,9 +265,10 @@ def end_to_end_exact_success(
     expectations: dict[str, JsonValue],
 ) -> bool:
     prediction = _prediction(outputs)
+    expected, _scorer = _decode_scoring_expectations(expectations)
     return (
         prediction.accepted
-        and json_answers_equal(prediction.answer, expectations)
+        and exact_json_equal(prediction.answer, expected)
         and prediction.reporting.status == "reported"
     )
 
@@ -276,6 +277,31 @@ def conditional_exact_json(
     outputs: MlflowEvaluationPrediction | dict[str, JsonValue],
     expectations: dict[str, JsonValue],
 ) -> bool | None:
+    prediction = _prediction(outputs)
+    if not prediction.accepted:
+        return None
+    expected, _scorer = _decode_scoring_expectations(expectations)
+    return exact_json_equal(prediction.answer, expected)
+
+
+def end_to_end_policy_success(
+    outputs: MlflowEvaluationPrediction | dict[str, JsonValue],
+    expectations: dict[str, JsonValue],
+) -> bool:
+    """Score accepted, reported answers under the pack comparison policy."""
+    prediction = _prediction(outputs)
+    return (
+        prediction.accepted
+        and json_answers_equal(prediction.answer, expectations)
+        and prediction.reporting.status == "reported"
+    )
+
+
+def conditional_policy_match(
+    outputs: MlflowEvaluationPrediction | dict[str, JsonValue],
+    expectations: dict[str, JsonValue],
+) -> bool | None:
+    """Score accepted answers under the pack policy without failures in the denominator."""
     prediction = _prediction(outputs)
     if not prediction.accepted:
         return None
@@ -516,12 +542,30 @@ def _native_scorers(api: _EvaluationApi) -> list[object]:
     ) -> bool:
         return agent_failure(outputs, expectations)
 
+    def score_end_to_end_policy(
+        outputs: dict[str, JsonValue], expectations: dict[str, JsonValue]
+    ) -> bool:
+        return end_to_end_policy_success(outputs, expectations)
+
+    def score_conditional_policy(
+        outputs: dict[str, JsonValue], expectations: dict[str, JsonValue]
+    ) -> object:
+        value = conditional_policy_match(outputs, expectations)
+        if value is None:
+            return api.invalid_feedback(
+                "conditional_policy_match",
+                "The analysis did not produce an accepted answer",
+            )
+        return value
+
     def score_infrastructure_failure(outputs: dict[str, JsonValue]) -> bool:
         return infrastructure_failure(outputs)
 
     return [
         api.scorer(score_end_to_end, name="end_to_end_exact_success"),
         api.scorer(score_conditional, name="conditional_exact_json"),
+        api.scorer(score_end_to_end_policy, name="end_to_end_policy_success"),
+        api.scorer(score_conditional_policy, name="conditional_policy_match"),
         api.scorer(score_agent_failure, name="agent_failure"),
         api.scorer(score_infrastructure_failure, name="infrastructure_failure"),
     ]

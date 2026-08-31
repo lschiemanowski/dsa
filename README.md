@@ -179,7 +179,9 @@ unverifiable receipt is reported as ambiguous and preserved for operator inspect
 `report` requires a complete matrix of verified receipts, reads only their exact
 Databricks MLflow runs, recomputes the existing scorers against the pinned packs, and
 atomically publishes canonical JSON plus deterministic Markdown without running a
-model or modifying remote state. The execution and publication contracts are recorded
+model or modifying remote state. Literal exactness and pack-policy matches are retained
+as separate metrics, so an allowed floating-point tolerance never inflates exact
+accuracy. The execution and publication contracts are recorded
 in `docs/milestone-6a.md` and `docs/milestone-6b.md`.
 
 `completion.reporting` is `disabled`, `reported`, or `failed`. A reporting failure does

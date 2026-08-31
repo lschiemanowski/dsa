@@ -34,6 +34,7 @@ from dsa.evaluation import (
     MlflowEvaluationPrediction,
     MlflowEvaluationResult,
 )
+from dsa.pack import LoadedEvaluationPack
 from dsa.reporting import MlflowReporting
 
 from .test_benchmark import IMAGE, runtime_value, study_value
@@ -47,14 +48,15 @@ def prepared_benchmark(
     cell_workers: int = 1,
     case_workers: int = 1,
     max_tool_calls: int = 40,
+    pack: LoadedEvaluationPack | None = None,
 ) -> PreparedBenchmark:
-    pack = evaluation_pack(tmp_path)
+    selected_evaluation_pack = pack or evaluation_pack(tmp_path)
     selected_pack = cast(dict[str, object], study_value()["packs"][0])
     value = study_value(
         packs=(
             {
                 **selected_pack,
-                "reference": pack.reference.model_dump(mode="json"),
+                "reference": selected_evaluation_pack.reference.model_dump(mode="json"),
             },
         ),
         models=tuple(study_value()["models"][:cells]),
@@ -79,7 +81,7 @@ def prepared_benchmark(
         study=study,
         runtime=runtime,
         cells=expand_benchmark_study(study),
-        packs=((study.packs[0].pack_id, pack),),
+        packs=((study.packs[0].pack_id, selected_evaluation_pack),),
     )
 
 
