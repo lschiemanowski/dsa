@@ -29,7 +29,12 @@ from dsa.benchmark import (
     stop_benchmark_cell_worker,
 )
 from dsa.docker import DockerCommandResult, DockerPythonExecutor
-from dsa.evaluation import MlflowEvaluationPrediction, MlflowEvaluationResult
+from dsa.evaluation import (
+    MlflowEvaluationError,
+    MlflowEvaluationPrediction,
+    MlflowEvaluationResult,
+)
+from dsa.pack import LoadedEvaluationPack
 from dsa.reporting import MlflowReporting
 
 from .test_benchmark import IMAGE, runtime_value, study_value
@@ -43,14 +48,15 @@ def prepared_benchmark(
     cell_workers: int = 1,
     case_workers: int = 1,
     max_tool_calls: int = 40,
+    pack: LoadedEvaluationPack | None = None,
 ) -> PreparedBenchmark:
-    pack = evaluation_pack(tmp_path)
+    selected_evaluation_pack = pack or evaluation_pack(tmp_path)
     selected_pack = cast(dict[str, object], study_value()["packs"][0])
     value = study_value(
         packs=(
             {
                 **selected_pack,
-                "reference": pack.reference.model_dump(mode="json"),
+                "reference": selected_evaluation_pack.reference.model_dump(mode="json"),
             },
         ),
         models=tuple(study_value()["models"][:cells]),
@@ -75,7 +81,7 @@ def prepared_benchmark(
         study=study,
         runtime=runtime,
         cells=expand_benchmark_study(study),
-        packs=((study.packs[0].pack_id, pack),),
+        packs=((study.packs[0].pack_id, selected_evaluation_pack),),
     )
 
 
@@ -399,6 +405,25 @@ def test_worker_classifies_uncertain_mlflow_outcomes_as_ambiguous(
 
     assert isinstance(result, BenchmarkWorkerAmbiguous)
     assert result.failure_code == "cell_evaluation_ambiguous"
+    assert not invocation.receipt_path.exists()
+
+
+def test_worker_retains_a_stable_mlflow_failure_phase(tmp_path: Path) -> None:
+    prepared = prepared_benchmark(tmp_path)
+    invocation = BenchmarkCellInvocation.from_prepared(prepared, prepared.cells[0], 1)
+    invocation.attempt_directory.mkdir(parents=True)
+
+    def failed(*_args: object, **_kwargs: object) -> MlflowEvaluationResult:
+        raise MlflowEvaluationError("mlflow_dataset_failed")
+
+    result = execute_benchmark_cell(
+        invocation,
+        pack_loader=lambda _reference: prepared.packs[0][1],
+        evaluation_runner=failed,
+    )
+
+    assert isinstance(result, BenchmarkWorkerAmbiguous)
+    assert result.failure_code == "cell_mlflow_dataset_failed"
     assert not invocation.receipt_path.exists()
 
 

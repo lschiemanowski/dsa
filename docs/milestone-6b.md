@@ -15,7 +15,7 @@ never inserted automatically.
 ## Publication unit and identity
 
 One exact `dsa-benchmark-study/v1` contract produces at most one
-`dsa-benchmark-report/v1` report for a given reporter revision. A report covers the
+`dsa-benchmark-report/v2` report for a given reporter revision. A report covers the
 study's complete pack-model-repetition matrix; reports are not split by model, pack, or
 repetition.
 
@@ -66,9 +66,10 @@ Before deriving any result, the publisher:
    with the prediction. A prediction whose reporting projection itself failed remains
    a valid infrastructure observation and is not required to have a tracking run.
 7. Recomputes scorer outcomes with the existing DSA scorer functions using the retained
-   prediction and the expectation from the verified pinned pack, then cross-checks the
-   corresponding finite aggregate metrics exposed by the MLflow evaluation run. A
-   missing conditional metric is permitted only when that metric has no denominator.
+   prediction plus the expected answer and scorer policy from the verified pinned pack,
+   then cross-checks the corresponding finite aggregate metrics exposed by the MLflow
+   evaluation run. A missing conditional metric is permitted only when that metric has
+   no denominator.
 
 Any unavailable required remote run, foreign record, identity contradiction, metric
 contradiction, or incomplete study rejects publication. The publisher never discovers
@@ -83,7 +84,7 @@ execution revision; the report separately retains the clean reporting revision.
 
 ## Canonical report content
 
-`dsa-benchmark-report/v1` contains:
+`dsa-benchmark-report/v2` contains:
 
 - the complete canonical study and its SHA-256 digest;
 - the clean reporter Git revision;
@@ -94,7 +95,7 @@ execution revision; the report separately retains the clean reporting revision.
   case count, and derived cell metrics;
 - one ordered case outcome per cell containing only the case, run, terminal-record, and
   safe MLflow identities; accepted state; stable failure stage and code when present;
-  reporting state; and the four scorer outcomes;
+  reporting state; and the six exact, policy, and failure scorer outcomes;
 - task-weighted aggregates for the complete study, for each model, for each pack-model
   pair, and for each cell; and
 - bounded observed latency and usage summaries read from the exact reported analysis
@@ -125,18 +126,24 @@ For each aggregation scope:
   Its denominator is every expected case execution.
 - **Conditional exact accuracy** counts exact answers among schema-valid accepted
   answers. Its denominator is accepted answers only.
+- **End-to-end policy success** counts accepted, successfully reported answers matching
+  the pack's comparison policy. Its denominator is every expected case execution.
+- **Conditional policy accuracy** counts policy matches among schema-valid accepted
+  answers. Its denominator is accepted answers only.
 - **Agent-failure rate** uses the existing `agent_failure` scorer. Its denominator is
   every expected case execution.
 - **Infrastructure-failure rate** uses the existing `infrastructure_failure` scorer.
   Its denominator is every expected case execution.
 
 Repetitions contribute separate case executions to these counts. Multiple packs are
-task-weighted by their case counts rather than given equal pack weight. The primary
-reported metric is complete-study end-to-end exact success. Completion, conditional
-accuracy, agent failure, and infrastructure failure are reported beside it and are not
-substitutes for the primary metric.
+task-weighted by their case counts rather than given equal pack weight. End-to-end policy
+success is the pack-declared acceptance metric; end-to-end exact success remains the
+strict cross-policy diagnostic. Completion, both conditional accuracies, agent failure,
+and infrastructure failure are reported beside them.
 
-The case-level scorer outcomes and aggregate counts must reproduce one another exactly.
+The exact metrics always mean canonical JSON identity. A tolerance match can therefore
+raise policy success without raising exact success. The case-level scorer outcomes and
+aggregate counts must reproduce one another exactly.
 An accepted answer may still coincide with an infrastructure failure when its reporting
 projection failed; the metrics intentionally need not form a single exclusive
 partition.

@@ -70,11 +70,29 @@ class PackCases(PackFile):
     case_count: Annotated[int, Field(gt=0, le=10_000)]
 
 
-class PackScorer(ContractModel):
-    """The deterministic scorer required by this pack format."""
+class ExactJsonScorer(ContractModel):
+    """Require structural JSON identity without numeric tolerance."""
 
     name: Literal["exact-json"]
     version: Literal["1"]
+
+
+class JsonNumericToleranceScorer(ContractModel):
+    """Compare expected floating-point leaves with explicit finite tolerances."""
+
+    name: Literal["json-numeric-tolerance"]
+    version: Literal["1"]
+    relative_tolerance: float = Field(ge=0.0, le=1.0, allow_inf_nan=False)
+    absolute_tolerance: float = Field(ge=0.0, allow_inf_nan=False)
+
+    @model_validator(mode="after")
+    def require_a_positive_tolerance(self) -> JsonNumericToleranceScorer:
+        if self.relative_tolerance == 0.0 and self.absolute_tolerance == 0.0:
+            raise ValueError("numeric comparison requires a positive tolerance")
+        return self
+
+
+type PackScorer = ExactJsonScorer | JsonNumericToleranceScorer
 
 
 class SourceDataset(ContractModel):
@@ -114,7 +132,7 @@ class EvaluationPackManifest(ContractModel):
     license: SafeName
     database: PackDatabase
     cases: PackCases
-    scorer: PackScorer
+    scorer: Annotated[PackScorer, Field(discriminator="name")]
     provenance: PackProvenance
 
     @model_validator(mode="after")
@@ -187,13 +205,25 @@ class EvaluationPackCase(ContractModel):
                 "question": self.question,
                 "answer_schema": deepcopy(self.answer_schema),
             },
-            "expectations": {"answer": deepcopy(self.expected_answer)},
+            "expectations": self.scoring_expectations(manifest),
             "tags": {
                 "family": self.metadata.family,
                 "pack": manifest.pack_id,
                 "pack_version": manifest.version,
                 "source_level": self.metadata.source_level,
             },
+        }
+
+    def scoring_expectations(
+        self,
+        manifest: EvaluationPackManifest,
+    ) -> dict[str, JsonValue]:
+        """Encode scorer inputs without lossy managed-dataset number coercion."""
+        return {
+            "answer": _canonical_json(self.expected_answer).decode("utf-8"),
+            "scorer": _canonical_json(
+                manifest.scorer.model_dump(mode="json")
+            ).decode("utf-8"),
         }
 
 

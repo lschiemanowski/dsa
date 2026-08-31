@@ -27,6 +27,7 @@ from dsa.docker import (
     default_docker_configuration,
 )
 from dsa.evaluation import (
+    MlflowEvaluationError,
     MlflowEvaluationPrediction,
     MlflowEvaluationResult,
     run_mlflow_evaluation,
@@ -1010,6 +1011,11 @@ def execute_benchmark_cell(
                 python_executor=executor,
                 run_tags=tags,
             )
+    except MlflowEvaluationError as error:
+        return BenchmarkWorkerAmbiguous(
+            cell_id=selected.cell.cell_id,
+            failure_code=f"cell_{error.code}",
+        )
     except Exception:
         return BenchmarkWorkerAmbiguous(
             cell_id=selected.cell.cell_id,

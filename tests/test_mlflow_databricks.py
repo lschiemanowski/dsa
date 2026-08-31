@@ -99,6 +99,8 @@ def test_tiny_native_databricks_evaluation_and_pydantic_ai_trace(
     assert prediction.reporting.status == "reported"
     assert result.metrics["end_to_end_exact_success/mean"] == 1.0
     assert result.metrics["conditional_exact_json/mean"] == 1.0
+    assert result.metrics["end_to_end_policy_success/mean"] == 1.0
+    assert result.metrics["conditional_policy_match/mean"] == 1.0
     assert result.metrics["agent_failure/mean"] == 0.0
     assert result.metrics["infrastructure_failure/mean"] == 0.0
 

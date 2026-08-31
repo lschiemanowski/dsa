@@ -19,9 +19,12 @@ from dsa.evaluation import (
     MlflowEvaluationPrediction,
     agent_failure,
     conditional_exact_json,
+    conditional_policy_match,
     end_to_end_exact_success,
+    end_to_end_policy_success,
     exact_json_equal,
     infrastructure_failure,
+    json_answers_equal,
     run_mlflow_evaluation,
 )
 from dsa.pack import (
@@ -42,6 +45,7 @@ def case_metadata() -> EvaluationCaseMetadata:
 def evaluation_pack(
     tmp_path: Path,
     *cases: EvaluationPackCase,
+    scorer: dict[str, JsonValue] | None = None,
 ) -> LoadedEvaluationPack:
     request = valid_request(tmp_path)
     selected_cases = cases or (
@@ -84,7 +88,7 @@ def evaluation_pack(
                 "size_bytes": len(case_bytes),
                 "sha256": sha256(case_bytes).hexdigest(),
             },
-            "scorer": {"name": "exact-json", "version": "1"},
+            "scorer": scorer or {"name": "exact-json", "version": "1"},
             "provenance": {
                 "source_datasets": (
                     {
@@ -153,7 +157,10 @@ def test_case_snapshots_expectation_and_keeps_it_out_of_inputs(tmp_path: Path) -
 
     row = case.dataset_record(pack.manifest)
 
-    assert row["expectations"] == {"answer": {"count": 3}}
+    assert row["expectations"] == {
+        "answer": '{"count":3}',
+        "scorer": '{"name":"exact-json","version":"1"}',
+    }
     inputs = row["inputs"]
     assert isinstance(inputs, dict)
     assert "expected_answer" not in inputs
@@ -184,7 +191,10 @@ def test_case_rejects_expectation_outside_answer_schema(tmp_path: Path) -> None:
 
 
 def test_exact_json_and_failure_scorers_cover_the_all_case_denominator() -> None:
-    expectations: dict[str, JsonValue] = {"answer": {"count": 3}}
+    expectations: dict[str, JsonValue] = {
+        "answer": '{"count":3}',
+        "scorer": '{"name":"exact-json","version":"1"}',
+    }
     exact = prediction()
     wrong = prediction(answer={"count": 4})
     provider = prediction(
@@ -245,6 +255,48 @@ def test_exact_json_and_failure_scorers_cover_the_all_case_denominator() -> None
     assert agent_failure(reporting_failed, expectations) is False
 
 
+def test_numeric_tolerance_is_explicit_recursive_and_never_weakens_integers() -> None:
+    scorer = {
+        "name": "json-numeric-tolerance",
+        "version": "1",
+        "relative_tolerance": 1e-9,
+        "absolute_tolerance": 1e-12,
+    }
+    expectations: dict[str, JsonValue] = {
+        "answer": '{"count":3,"ratio":0.1,"values":[1.0,true]}',
+        "scorer": json.dumps(scorer, sort_keys=True, separators=(",", ":")),
+    }
+
+    assert json_answers_equal(
+        {"count": 3, "ratio": 0.10000000001, "values": [1, True]},
+        expectations,
+    ) is True
+    tolerated = prediction(
+        answer={"count": 3, "ratio": 0.10000000001, "values": [1, True]}
+    )
+    assert conditional_exact_json(tolerated, expectations) is False
+    assert end_to_end_exact_success(tolerated, expectations) is False
+    assert conditional_policy_match(tolerated, expectations) is True
+    assert end_to_end_policy_success(tolerated, expectations) is True
+    assert agent_failure(tolerated, expectations) is False
+    assert json_answers_equal(
+        {"count": 3.0, "ratio": 0.1, "values": [1, True]},
+        expectations,
+    ) is False
+    assert json_answers_equal(
+        {"count": 3, "ratio": 0.1001, "values": [1, True]},
+        expectations,
+    ) is False
+    assert json_answers_equal(
+        {"count": 3, "ratio": 0.1, "values": [1, 1]},
+        expectations,
+    ) is False
+    assert json_answers_equal(
+        {"count": 3, "ratio": 10**1000, "values": [1, True]},
+        expectations,
+    ) is False
+
+
 def test_native_evaluation_uses_dataset_expectations_and_normal_reporting_path(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -290,6 +342,9 @@ def test_native_evaluation_uses_dataset_expectations_and_normal_reporting_path(
     class Api:
         def __init__(self) -> None:
             self.dataset = Dataset()
+            self.dataset.digest = "pre-merge-digest"
+            self.refreshed_dataset = Dataset()
+            self.refreshed_dataset.digest = "post-merge-digest"
             self.output: dict[str, Any] | None = None
             self.scorer_names: list[str] = []
             self.run_tags: dict[str, str] | None = None
@@ -298,6 +353,11 @@ def test_native_evaluation_uses_dataset_expectations_and_normal_reporting_path(
             assert name == "tiny-dataset"
             assert experiment_id == "123"
             return self.dataset
+
+        def get_dataset(self, *, name: str) -> Dataset:
+            assert name == "tiny-dataset"
+            self.refreshed_dataset.records = self.dataset.records
+            return self.refreshed_dataset
 
         def scorer(self, function: object, *, name: str) -> object:
             self.scorer_names.append(name)
@@ -318,8 +378,8 @@ def test_native_evaluation_uses_dataset_expectations_and_normal_reporting_path(
             predict_fn: Any,
             scorers: list[object],
         ) -> Result:
-            assert data is self.dataset
-            assert len(scorers) == 4
+            assert data is self.refreshed_dataset
+            assert len(scorers) == 6
             assert os.environ["MLFLOW_GENAI_EVAL_SKIP_TRACE_VALIDATION"] == "true"
             inputs = data.records[0]["inputs"]
             assert isinstance(inputs, dict)
@@ -357,13 +417,15 @@ def test_native_evaluation_uses_dataset_expectations_and_normal_reporting_path(
     )
 
     assert result.dataset_id == "dataset-1"
-    assert result.dataset_digest == "digest-1"
+    assert result.dataset_digest == "post-merge-digest"
     assert result.evaluation_run_id == "evaluation-run"
     assert len(result.predictions) == 1
     assert result.predictions[0].answer == {"count": 3}
     assert api.scorer_names == [
         "end_to_end_exact_success",
         "conditional_exact_json",
+        "end_to_end_policy_success",
+        "conditional_policy_match",
         "agent_failure",
         "infrastructure_failure",
     ]
@@ -371,7 +433,10 @@ def test_native_evaluation_uses_dataset_expectations_and_normal_reporting_path(
         "dsa.benchmark.cell_id": "cell-1",
         "dsa.benchmark.study_sha256": "a" * 64,
     }
-    assert api.dataset.records[0]["expectations"] == {"answer": {"count": 3}}
+    assert api.dataset.records[0]["expectations"] == {
+        "answer": '{"count":3}',
+        "scorer": '{"name":"exact-json","version":"1"}',
+    }
     assert api.output is not None
     assert api.output["accepted"] is True
     assert api.output["reporting"] == {
@@ -381,6 +446,84 @@ def test_native_evaluation_uses_dataset_expectations_and_normal_reporting_path(
         "failure_code": "mlflow_configuration_missing",
     }
     assert os.environ["MLFLOW_GENAI_EVAL_SKIP_TRACE_VALIDATION"] == "false"
+
+
+def test_evaluation_reserves_a_case_before_paid_or_persistent_work(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MLFLOW_EXPERIMENT_ID", "123")
+    monkeypatch.setenv("MLFLOW_TRACKING_URI", "databricks")
+    monkeypatch.setenv("DATABRICKS_HOST", "https://workspace.example")
+    monkeypatch.setenv("DATABRICKS_TOKEN", "test-token")
+
+    class Dataset:
+        dataset_id = "dataset-1"
+        digest = "digest-1"
+
+        def __init__(self) -> None:
+            self.records: list[dict[str, Any]] = []
+
+        def merge_records(self, records: list[dict[str, Any]]) -> Dataset:
+            self.records.extend(records)
+            return self
+
+    class Api:
+        def __init__(self) -> None:
+            self.dataset = Dataset()
+
+        def create_dataset(self, **_kwargs: object) -> Dataset:
+            return self.dataset
+
+        def get_dataset(self, **_kwargs: object) -> Dataset:
+            return self.dataset
+
+        def scorer(self, function: object, *, name: str) -> object:
+            return function
+
+        def invalid_feedback(self, name: str, rationale: str) -> object:
+            return {"name": name, "rationale": rationale, "valid": False}
+
+        def evaluate(
+            self,
+            *,
+            data: Dataset,
+            predict_fn: Any,
+            scorers: list[object],
+        ) -> object:
+            inputs = data.records[0]["inputs"]
+            assert isinstance(inputs, dict)
+            monkeypatch.delenv("DATABRICKS_TOKEN")
+
+            async def invoke_duplicate() -> None:
+                await predict_fn(**inputs)
+                await predict_fn(**inputs)
+
+            asyncio.run(invoke_duplicate())
+            raise AssertionError("duplicate invocation should have been rejected")
+
+    model_factory_calls = 0
+
+    def model_factory(_case: EvaluationPackCase) -> TestModel:
+        nonlocal model_factory_calls
+        model_factory_calls += 1
+        return TestModel(call_tools=[], custom_output_args={"count": 3})
+
+    request = valid_request(tmp_path)
+    with pytest.raises(MlflowEvaluationError) as caught:
+        run_mlflow_evaluation(
+            evaluation_pack(tmp_path),
+            dataset_name="tiny-dataset",
+            runs_directory=tmp_path / "runs",
+            model_configuration=request.model,
+            policy=request.policy,
+            model_factory=model_factory,
+            api=cast(Any, Api()),
+        )
+
+    assert caught.value.code == "mlflow_evaluation_failed"
+    assert model_factory_calls == 1
+    assert len(list((tmp_path / "runs").glob("*/terminal.json"))) == 1
 
 
 def test_evaluation_rejects_unsafe_benchmark_tags_before_mlflow_work(
@@ -415,6 +558,90 @@ def test_native_api_starts_the_evaluation_run_with_benchmark_tags() -> None:
         pass
 
     assert captured == [{"dsa.benchmark.cell_id": "cell-1"}]
+
+
+def test_native_api_reuses_an_existing_dataset_and_only_creates_when_missing() -> None:
+    class MissingDataset(Exception):
+        error_code = "RESOURCE_DOES_NOT_EXIST"
+
+    existing = SimpleNamespace(dataset_id="existing", digest="existing-digest")
+    created = SimpleNamespace(dataset_id="created", digest="created-digest")
+
+    class Datasets:
+        def __init__(self) -> None:
+            self.found = True
+            self.create_conflict = False
+            self.created: list[tuple[str, str]] = []
+
+        def get_dataset(self, *, name: str) -> object:
+            assert name == "catalog.schema.dataset"
+            if self.found:
+                return existing
+            raise MissingDataset
+
+        def create_dataset(self, *, name: str, experiment_id: str) -> object:
+            self.created.append((name, experiment_id))
+            if self.create_conflict:
+                self.found = True
+                raise RuntimeError("another worker created the dataset")
+            return created
+
+    api_type: Any = vars(import_module("dsa.evaluation"))["_MlflowEvaluationApi"]
+    api = api_type.__new__(api_type)
+    api.datasets = Datasets()
+
+    assert api.create_dataset(
+        name="catalog.schema.dataset", experiment_id="123"
+    ) is existing
+    assert api.datasets.created == []
+
+    api.datasets.found = False
+    assert api.create_dataset(
+        name="catalog.schema.dataset", experiment_id="123"
+    ) is created
+    assert api.datasets.created == [("catalog.schema.dataset", "123")]
+
+    api.datasets.found = False
+    api.datasets.create_conflict = True
+    assert api.create_dataset(
+        name="catalog.schema.dataset", experiment_id="123"
+    ) is existing
+    assert api.datasets.created == [
+        ("catalog.schema.dataset", "123"),
+        ("catalog.schema.dataset", "123"),
+    ]
+
+
+def test_native_api_does_not_hide_dataset_lookup_failures() -> None:
+    class Datasets:
+        def get_dataset(self, *, name: str) -> object:
+            raise RuntimeError(f"lookup failed for {name}")
+
+    api_type: Any = vars(import_module("dsa.evaluation"))["_MlflowEvaluationApi"]
+    api = api_type.__new__(api_type)
+    api.datasets = Datasets()
+
+    with pytest.raises(RuntimeError, match="lookup failed"):
+        api.create_dataset(name="catalog.schema.dataset", experiment_id="123")
+
+
+def test_native_api_does_not_hide_dataset_creation_failures() -> None:
+    class MissingDataset(Exception):
+        error_code = "RESOURCE_DOES_NOT_EXIST"
+
+    class Datasets:
+        def get_dataset(self, *, name: str) -> object:
+            raise MissingDataset(name)
+
+        def create_dataset(self, *, name: str, experiment_id: str) -> object:
+            raise RuntimeError(f"creation failed for {name} in {experiment_id}")
+
+    api_type: Any = vars(import_module("dsa.evaluation"))["_MlflowEvaluationApi"]
+    api = api_type.__new__(api_type)
+    api.datasets = Datasets()
+
+    with pytest.raises(RuntimeError, match="creation failed"):
+        api.create_dataset(name="catalog.schema.dataset", experiment_id="123")
 
 
 def test_native_mlflow_api_executes_one_analysis_per_dataset_row(
@@ -455,9 +682,9 @@ def test_native_mlflow_api_executes_one_analysis_per_dataset_row(
         run_id: str,
     ) -> Any:
         assert predict_fn is not None
-        assert len(scorers) == 4
+        assert len(scorers) == 6
         assert run_id == "native-evaluation-run"
-        for inputs in eval_df["inputs"].tolist():
+        for inputs in reversed(eval_df["inputs"].tolist()):
             outputs.append(predict_fn(inputs))
         return SimpleNamespace(
             run_id=run_id,
@@ -505,6 +732,10 @@ def test_native_mlflow_api_executes_one_analysis_per_dataset_row(
         def create_dataset(self, *, name: str, experiment_id: str) -> Dataset:
             assert name == "native-dataset"
             assert experiment_id == "123"
+            return self.dataset
+
+        def get_dataset(self, *, name: str) -> Dataset:
+            assert name == "native-dataset"
             return self.dataset
 
         def scorer(self, function: Any, *, name: str) -> object:
@@ -571,6 +802,10 @@ def test_native_mlflow_api_executes_one_analysis_per_dataset_row(
     assert len(outputs) == 2
     assert len(list((tmp_path / "runs").glob("*/terminal.json"))) == 2
     assert len(result.predictions) == 2
+    assert tuple(item.case_id for item in result.predictions) == (
+        "first-native-case",
+        "second-native-case",
+    )
     assert "MLFLOW_GENAI_EVAL_SKIP_TRACE_VALIDATION" not in os.environ
 
 

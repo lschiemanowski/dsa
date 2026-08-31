@@ -16,6 +16,7 @@ from dsa.benchmark import (
     retain_benchmark_cell_receipt,
 )
 from dsa.benchmark_report import (
+    BenchmarkCaseOutcome,
     BenchmarkMlflowRun,
     BenchmarkReport,
     BenchmarkReportConfigurationError,
@@ -26,10 +27,13 @@ from dsa.benchmark_report import (
 )
 from dsa.contract import RunRequest
 from dsa.evaluation import MlflowEvaluationPrediction
+from dsa.pack import EvaluationCaseMetadata, EvaluationPackCase
 from dsa.record import Failure, RunFailure, RunSuccess, TerminalRecord, write_terminal_record
 from dsa.reporting import MlflowReporting
 
 from .test_benchmark_execution import prepared_benchmark, receipt
+from .test_episode import valid_request
+from .test_mlflow_evaluation import evaluation_pack
 
 REPORTER_REVISION = "e" * 40
 
@@ -55,6 +59,22 @@ def evaluation_tags(invocation: BenchmarkCellInvocation) -> dict[str, str]:
         "dsa.benchmark.pack_id": invocation.cell.pack_id,
         "dsa.benchmark.repetition": str(invocation.cell.repetition),
         "dsa.benchmark.study_sha256": invocation.cell.study_sha256,
+    }
+
+
+def successful_evaluation_metrics(
+    *,
+    exact: bool,
+    policy: bool | None = None,
+) -> dict[str, float]:
+    selected_policy = exact if policy is None else policy
+    return {
+        "agent_failure/mean": 0.0 if selected_policy else 1.0,
+        "conditional_exact_json/mean": 1.0 if exact else 0.0,
+        "conditional_policy_match/mean": 1.0 if selected_policy else 0.0,
+        "end_to_end_exact_success/mean": 1.0 if exact else 0.0,
+        "end_to_end_policy_success/mean": 1.0 if selected_policy else 0.0,
+        "infrastructure_failure/mean": 0.0,
     }
 
 
@@ -145,12 +165,7 @@ def complete_report_evidence(
             run_id=selected_receipt.evaluation_run_id,
             status="FINISHED",
             lifecycle_stage="active",
-            metrics={
-                "agent_failure/mean": 0.0 if exact else 1.0,
-                "conditional_exact_json/mean": 1.0 if exact else 0.0,
-                "end_to_end_exact_success/mean": 1.0 if exact else 0.0,
-                "infrastructure_failure/mean": 0.0,
-            },
+            metrics=successful_evaluation_metrics(exact=exact),
             tags=evaluation_tags(invocation),
         ),
         "tracking-run": BenchmarkMlflowRun(
@@ -200,14 +215,17 @@ def test_report_recomputes_exact_counts_and_observed_usage(tmp_path: Path) -> No
         "numerator": 1,
         "rate": 1.0,
     }
+    assert report.overall.metrics.end_to_end_policy_success.numerator == 1
     assert report.overall.metrics.completion_rate.numerator == 1
     assert report.overall.metrics.conditional_exact_accuracy.denominator == 1
+    assert report.overall.metrics.conditional_policy_accuracy.denominator == 1
     assert report.overall.metrics.agent_failure.numerator == 0
     assert report.overall.metrics.infrastructure_failure.numerator == 0
     assert report.overall.observations.elapsed_seconds.total == 2.5
     assert report.overall.observations.total_tokens.total == 125.0
     assert report.provider_cost.status == "unavailable"
     assert report.cells[0].cases[0].end_to_end_exact_success is True
+    assert report.cells[0].cases[0].end_to_end_policy_success is True
     assert not hasattr(report.cells[0].cases[0], "answer")
     assert report.canonical_json.endswith("\n")
 
@@ -220,9 +238,89 @@ def test_report_uses_task_counts_instead_of_averaging_cell_rates(
     assert report.overall.metrics.end_to_end_exact_success.numerator == 0
     assert report.overall.metrics.completion_rate.numerator == 1
     assert report.overall.metrics.conditional_exact_accuracy.numerator == 0
+    assert report.overall.metrics.conditional_policy_accuracy.numerator == 0
     assert report.overall.metrics.agent_failure.numerator == 1
     assert report.overall.metrics.infrastructure_failure.numerator == 0
     assert report.cells[0].cases[0].conditional_exact_json is False
+
+
+def test_report_keeps_tolerance_policy_matches_distinct_from_exactness(
+    tmp_path: Path,
+) -> None:
+    request = valid_request(tmp_path)
+    pack = evaluation_pack(
+        tmp_path,
+        EvaluationPackCase(
+            case_id="tiny-count",
+            case_version="1",
+            question=request.question,
+            answer_schema={
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "type": "object",
+                "properties": {"ratio": {"type": "number"}},
+                "required": ["ratio"],
+                "additionalProperties": False,
+            },
+            expected_answer={"ratio": 0.1},
+            metadata=EvaluationCaseMetadata(family="counting", source_level="small"),
+        ),
+        scorer={
+            "name": "json-numeric-tolerance",
+            "version": "1",
+            "relative_tolerance": 1e-9,
+            "absolute_tolerance": 1e-12,
+        },
+    )
+    prepared = prepared_benchmark(tmp_path, pack=pack)
+    invocation = BenchmarkCellInvocation.from_prepared(prepared, prepared.cells[0], 1)
+    selected = receipt(invocation)
+    selected = selected.model_copy(
+        update={
+            "predictions": (
+                selected.predictions[0].model_copy(
+                    update={"answer": {"ratio": 0.10000000001}}
+                ),
+            )
+        }
+    )
+    selected = retain_receipt_with_terminals(prepared, invocation, selected)
+    reader = EvidenceReader(
+        {
+            selected.evaluation_run_id: BenchmarkMlflowRun(
+                run_id=selected.evaluation_run_id,
+                status="FINISHED",
+                lifecycle_stage="active",
+                metrics=successful_evaluation_metrics(exact=False, policy=True),
+                tags=evaluation_tags(invocation),
+            ),
+            "tracking-run": BenchmarkMlflowRun(
+                run_id="tracking-run",
+                status="FINISHED",
+                lifecycle_stage="active",
+                params={"dsa.model_name": invocation.model_configuration.name},
+                tags={
+                    "dsa.component": "analysis",
+                    "dsa.outcome": "succeeded",
+                    "dsa.run_id": "run-id",
+                },
+            ),
+        }
+    )
+
+    report = build_benchmark_report(
+        prepared.study,
+        prepared.runtime,
+        reporter_revision=REPORTER_REVISION,
+        pack_loader=lambda _reference: pack,
+        evidence_reader=reader,
+    )
+
+    assert report.overall.metrics.end_to_end_exact_success.numerator == 0
+    assert report.overall.metrics.end_to_end_policy_success.numerator == 1
+    assert report.overall.metrics.conditional_exact_accuracy.numerator == 0
+    assert report.overall.metrics.conditional_policy_accuracy.numerator == 1
+    assert report.cells[0].cases[0].conditional_exact_json is False
+    assert report.cells[0].cases[0].conditional_policy_match is True
 
 
 def test_report_rejects_incomplete_or_foreign_evidence_before_publication(
@@ -405,6 +503,27 @@ def test_report_model_rejects_cell_metrics_changed_after_derivation(
         BenchmarkReport.model_validate(value)
 
 
+def test_report_case_rejects_exact_success_without_a_policy_match() -> None:
+    with pytest.raises(ValueError, match="exact match must satisfy the pack policy"):
+        BenchmarkCaseOutcome(
+            case_id="case-1",
+            run_id="run-1",
+            terminal_sha256="a" * 64,
+            accepted=True,
+            reporting=MlflowReporting(
+                status="reported",
+                tracking_run_id="tracking-1",
+                trace_id="trace-1",
+            ),
+            end_to_end_exact_success=True,
+            end_to_end_policy_success=False,
+            conditional_exact_json=True,
+            conditional_policy_match=False,
+            agent_failure=True,
+            infrastructure_failure=False,
+        )
+
+
 def test_report_aggregates_multiple_cells_from_case_counts(tmp_path: Path) -> None:
     prepared = prepared_benchmark(tmp_path, cells=2)
     runs: dict[str, BenchmarkMlflowRun] = {}
@@ -437,12 +556,7 @@ def test_report_aggregates_multiple_cells_from_case_counts(tmp_path: Path) -> No
             run_id=selected.evaluation_run_id,
             status="FINISHED",
             lifecycle_stage="active",
-            metrics={
-                "agent_failure/mean": 0.0 if exact else 1.0,
-                "conditional_exact_json/mean": 1.0 if exact else 0.0,
-                "end_to_end_exact_success/mean": 1.0 if exact else 0.0,
-                "infrastructure_failure/mean": 0.0,
-            },
+            metrics=successful_evaluation_metrics(exact=exact),
             tags=evaluation_tags(invocation),
         )
         runs[tracking_id] = BenchmarkMlflowRun(
@@ -557,6 +671,7 @@ def test_failed_reporting_has_no_conditional_mlflow_exception(
                 metrics={
                     "agent_failure/mean": 0.0,
                     "end_to_end_exact_success/mean": 0.0,
+                    "end_to_end_policy_success/mean": 0.0,
                     "infrastructure_failure/mean": 1.0,
                 },
                 tags=evaluation_tags(invocation),
@@ -576,7 +691,7 @@ def test_failed_reporting_has_no_conditional_mlflow_exception(
     assert report.overall.metrics.conditional_exact_accuracy.rate is None
     assert report.overall.metrics.infrastructure_failure.numerator == 1
     assert reader.requested == ["evaluation-run"]
-    assert json.loads(report.canonical_json)["format"] == "dsa-benchmark-report/v1"
+    assert json.loads(report.canonical_json)["format"] == "dsa-benchmark-report/v2"
 
 
 def test_mlflow_reader_retains_only_the_bounded_safe_projection() -> None:
