@@ -280,6 +280,10 @@ def test_numeric_tolerance_is_explicit_recursive_and_never_weakens_integers() ->
         {"count": 3, "ratio": 0.1, "values": [1, 1]},
         expectations,
     ) is False
+    assert json_answers_equal(
+        {"count": 3, "ratio": 10**1000, "values": [1, True]},
+        expectations,
+    ) is False
 
 
 def test_native_evaluation_uses_dataset_expectations_and_normal_reporting_path(
@@ -327,6 +331,9 @@ def test_native_evaluation_uses_dataset_expectations_and_normal_reporting_path(
     class Api:
         def __init__(self) -> None:
             self.dataset = Dataset()
+            self.dataset.digest = "pre-merge-digest"
+            self.refreshed_dataset = Dataset()
+            self.refreshed_dataset.digest = "post-merge-digest"
             self.output: dict[str, Any] | None = None
             self.scorer_names: list[str] = []
             self.run_tags: dict[str, str] | None = None
@@ -335,6 +342,11 @@ def test_native_evaluation_uses_dataset_expectations_and_normal_reporting_path(
             assert name == "tiny-dataset"
             assert experiment_id == "123"
             return self.dataset
+
+        def get_dataset(self, *, name: str) -> Dataset:
+            assert name == "tiny-dataset"
+            self.refreshed_dataset.records = self.dataset.records
+            return self.refreshed_dataset
 
         def scorer(self, function: object, *, name: str) -> object:
             self.scorer_names.append(name)
@@ -355,7 +367,7 @@ def test_native_evaluation_uses_dataset_expectations_and_normal_reporting_path(
             predict_fn: Any,
             scorers: list[object],
         ) -> Result:
-            assert data is self.dataset
+            assert data is self.refreshed_dataset
             assert len(scorers) == 4
             assert os.environ["MLFLOW_GENAI_EVAL_SKIP_TRACE_VALIDATION"] == "true"
             inputs = data.records[0]["inputs"]
@@ -394,7 +406,7 @@ def test_native_evaluation_uses_dataset_expectations_and_normal_reporting_path(
     )
 
     assert result.dataset_id == "dataset-1"
-    assert result.dataset_digest == "digest-1"
+    assert result.dataset_digest == "post-merge-digest"
     assert result.evaluation_run_id == "evaluation-run"
     assert len(result.predictions) == 1
     assert result.predictions[0].answer == {"count": 3}
@@ -421,6 +433,84 @@ def test_native_evaluation_uses_dataset_expectations_and_normal_reporting_path(
         "failure_code": "mlflow_configuration_missing",
     }
     assert os.environ["MLFLOW_GENAI_EVAL_SKIP_TRACE_VALIDATION"] == "false"
+
+
+def test_evaluation_reserves_a_case_before_paid_or_persistent_work(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MLFLOW_EXPERIMENT_ID", "123")
+    monkeypatch.setenv("MLFLOW_TRACKING_URI", "databricks")
+    monkeypatch.setenv("DATABRICKS_HOST", "https://workspace.example")
+    monkeypatch.setenv("DATABRICKS_TOKEN", "test-token")
+
+    class Dataset:
+        dataset_id = "dataset-1"
+        digest = "digest-1"
+
+        def __init__(self) -> None:
+            self.records: list[dict[str, Any]] = []
+
+        def merge_records(self, records: list[dict[str, Any]]) -> Dataset:
+            self.records.extend(records)
+            return self
+
+    class Api:
+        def __init__(self) -> None:
+            self.dataset = Dataset()
+
+        def create_dataset(self, **_kwargs: object) -> Dataset:
+            return self.dataset
+
+        def get_dataset(self, **_kwargs: object) -> Dataset:
+            return self.dataset
+
+        def scorer(self, function: object, *, name: str) -> object:
+            return function
+
+        def invalid_feedback(self, name: str, rationale: str) -> object:
+            return {"name": name, "rationale": rationale, "valid": False}
+
+        def evaluate(
+            self,
+            *,
+            data: Dataset,
+            predict_fn: Any,
+            scorers: list[object],
+        ) -> object:
+            inputs = data.records[0]["inputs"]
+            assert isinstance(inputs, dict)
+            monkeypatch.delenv("DATABRICKS_TOKEN")
+
+            async def invoke_duplicate() -> None:
+                await predict_fn(**inputs)
+                await predict_fn(**inputs)
+
+            asyncio.run(invoke_duplicate())
+            raise AssertionError("duplicate invocation should have been rejected")
+
+    model_factory_calls = 0
+
+    def model_factory(_case: EvaluationPackCase) -> TestModel:
+        nonlocal model_factory_calls
+        model_factory_calls += 1
+        return TestModel(call_tools=[], custom_output_args={"count": 3})
+
+    request = valid_request(tmp_path)
+    with pytest.raises(MlflowEvaluationError) as caught:
+        run_mlflow_evaluation(
+            evaluation_pack(tmp_path),
+            dataset_name="tiny-dataset",
+            runs_directory=tmp_path / "runs",
+            model_configuration=request.model,
+            policy=request.policy,
+            model_factory=model_factory,
+            api=cast(Any, Api()),
+        )
+
+    assert caught.value.code == "mlflow_evaluation_failed"
+    assert model_factory_calls == 1
+    assert len(list((tmp_path / "runs").glob("*/terminal.json"))) == 1
 
 
 def test_evaluation_rejects_unsafe_benchmark_tags_before_mlflow_work(
@@ -629,6 +719,10 @@ def test_native_mlflow_api_executes_one_analysis_per_dataset_row(
         def create_dataset(self, *, name: str, experiment_id: str) -> Dataset:
             assert name == "native-dataset"
             assert experiment_id == "123"
+            return self.dataset
+
+        def get_dataset(self, *, name: str) -> Dataset:
+            assert name == "native-dataset"
             return self.dataset
 
         def scorer(self, function: Any, *, name: str) -> object:

@@ -81,6 +81,8 @@ class _NativeDataset(Protocol):
 class _EvaluationApi(Protocol):
     def create_dataset(self, *, name: str, experiment_id: str) -> _NativeDataset: ...
 
+    def get_dataset(self, *, name: str) -> _NativeDataset: ...
+
     def scorer(self, function: Callable[..., object], *, name: str) -> object: ...
 
     def invalid_feedback(self, name: str, rationale: str) -> object: ...
@@ -144,11 +146,13 @@ def run_mlflow_evaluation(
         dataset = dataset.merge_records(
             [case.dataset_record(canonical_pack.manifest) for case in canonical_cases]
         )
+        dataset = selected_api.get_dataset(name=dataset_name)
     except ModuleNotFoundError:
         raise MlflowEvaluationError("mlflow_dependency_missing") from None
     except Exception:
         raise MlflowEvaluationError("mlflow_dataset_failed") from None
     indexed = {case.case_id: case for case in canonical_cases}
+    reserved: set[str] = set()
     captured: dict[str, MlflowEvaluationPrediction] = {}
     capture_lock = Lock()
 
@@ -171,6 +175,10 @@ def run_mlflow_evaluation(
             or answer_schema != case.answer_schema
         ):
             raise ValueError("evaluation input does not match its verified pack case")
+        with capture_lock:
+            if case_id in reserved:
+                raise ValueError("evaluation invoked a case more than once")
+            reserved.add(case_id)
         canonical_request = RunRequest(
             database_path=canonical_pack.database_path,
             question=case.question,
@@ -188,8 +196,6 @@ def run_mlflow_evaluation(
         )
         prediction = evaluation_prediction(case_id, completion)
         with capture_lock:
-            if case_id in captured:
-                raise ValueError("evaluation invoked a case more than once")
             captured[case_id] = prediction
         return prediction.model_dump(mode="json")
 
@@ -373,12 +379,15 @@ def _tolerant_json_equal(
         if type(actual) not in (int, float):
             return False
         actual_number = cast(int | float, actual)
-        return math.isfinite(actual_number) and math.isclose(
-            actual_number,
-            expected,
-            rel_tol=scorer.relative_tolerance,
-            abs_tol=scorer.absolute_tolerance,
-        )
+        try:
+            return math.isfinite(actual_number) and math.isclose(
+                actual_number,
+                expected,
+                rel_tol=scorer.relative_tolerance,
+                abs_tol=scorer.absolute_tolerance,
+            )
+        except OverflowError:
+            return False
     return type(actual) is type(expected) and actual == expected
 
 
@@ -546,6 +555,9 @@ class _MlflowEvaluationApi:
             except Exception:
                 raise create_error from None
         return cast(_NativeDataset, created)
+
+    def get_dataset(self, *, name: str) -> _NativeDataset:
+        return cast(_NativeDataset, self.datasets.get_dataset(name=name))
 
     def scorer(self, function: Callable[..., object], *, name: str) -> object:
         return self.scorers.scorer(function, name=name)
