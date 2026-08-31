@@ -231,6 +231,11 @@ class BenchmarkCaseOutcome(ContractModel):
             or self.conditional_policy_match is not None
         ):
             raise ValueError("failed case outcome has invalid classification state")
+        if (
+            self.conditional_exact_json is True
+            and self.conditional_policy_match is not True
+        ):
+            raise ValueError("exact match must satisfy the pack policy")
         projection = MlflowEvaluationPrediction(
             case_id=self.case_id,
             run_id=self.run_id,

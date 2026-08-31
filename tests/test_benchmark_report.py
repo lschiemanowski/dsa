@@ -16,6 +16,7 @@ from dsa.benchmark import (
     retain_benchmark_cell_receipt,
 )
 from dsa.benchmark_report import (
+    BenchmarkCaseOutcome,
     BenchmarkMlflowRun,
     BenchmarkReport,
     BenchmarkReportConfigurationError,
@@ -500,6 +501,27 @@ def test_report_model_rejects_cell_metrics_changed_after_derivation(
 
     with pytest.raises(ValueError, match="cell metrics"):
         BenchmarkReport.model_validate(value)
+
+
+def test_report_case_rejects_exact_success_without_a_policy_match() -> None:
+    with pytest.raises(ValueError, match="exact match must satisfy the pack policy"):
+        BenchmarkCaseOutcome(
+            case_id="case-1",
+            run_id="run-1",
+            terminal_sha256="a" * 64,
+            accepted=True,
+            reporting=MlflowReporting(
+                status="reported",
+                tracking_run_id="tracking-1",
+                trace_id="trace-1",
+            ),
+            end_to_end_exact_success=True,
+            end_to_end_policy_success=False,
+            conditional_exact_json=True,
+            conditional_policy_match=False,
+            agent_failure=True,
+            infrastructure_failure=False,
+        )
 
 
 def test_report_aggregates_multiple_cells_from_case_counts(tmp_path: Path) -> None:
