@@ -11,14 +11,21 @@ from copy import deepcopy
 from hashlib import sha256
 from importlib import import_module
 from pathlib import Path
+from threading import Lock
 from typing import Any, Protocol, cast
 
-from pydantic import Field, JsonValue, model_validator
+from pydantic import Field, JsonValue, TypeAdapter, model_validator
 from pydantic_ai.models import Model
 
 from dsa.contract import ContractModel, ModelConfiguration, RunPolicy, RunRequest
 from dsa.environment import PythonExecutor
-from dsa.pack import EvaluationPackCase, LoadedEvaluationPack
+from dsa.pack import (
+    EvaluationPackCase,
+    ExactJsonScorer,
+    JsonNumericToleranceScorer,
+    LoadedEvaluationPack,
+    PackScorer,
+)
 from dsa.record import FailureStage, RunSuccess
 from dsa.reporting import MlflowReporting
 from dsa.runner import RunCompletion, run_analysis
@@ -93,6 +100,9 @@ class _EvaluationApi(Protocol):
 
 
 ModelFactory = Callable[[EvaluationPackCase], Model | str | None]
+_PACK_SCORER_ADAPTER: TypeAdapter[PackScorer] = TypeAdapter(
+    ExactJsonScorer | JsonNumericToleranceScorer
+)
 
 
 def run_mlflow_evaluation(
@@ -139,6 +149,8 @@ def run_mlflow_evaluation(
     except Exception:
         raise MlflowEvaluationError("mlflow_dataset_failed") from None
     indexed = {case.case_id: case for case in canonical_cases}
+    captured: dict[str, MlflowEvaluationPrediction] = {}
+    capture_lock = Lock()
 
     async def predict_fn(
         case_id: str,
@@ -174,7 +186,12 @@ def run_mlflow_evaluation(
             python_executor=python_executor,
             report_to_mlflow=True,
         )
-        return evaluation_prediction(case_id, completion).model_dump(mode="json")
+        prediction = evaluation_prediction(case_id, completion)
+        with capture_lock:
+            if case_id in captured:
+                raise ValueError("evaluation invoked a case more than once")
+            captured[case_id] = prediction
+        return prediction.model_dump(mode="json")
 
     scorers = _native_scorers(selected_api)
     try:
@@ -197,6 +214,10 @@ def run_mlflow_evaluation(
         if type(value) in (int, float) and math.isfinite(cast(float, value))
     }
     evaluation_run_id = getattr(raw_result, "run_id", None)
+    with capture_lock:
+        if set(captured) != set(indexed):
+            raise MlflowEvaluationError("mlflow_prediction_set_mismatch")
+        predictions = tuple(captured[case.case_id] for case in canonical_cases)
     return MlflowEvaluationResult(
         dataset_id=dataset.dataset_id,
         dataset_digest=dataset.digest,
@@ -204,7 +225,7 @@ def run_mlflow_evaluation(
             evaluation_run_id if isinstance(evaluation_run_id, str) else None
         ),
         metrics=metrics,
-        predictions=_result_predictions(raw_result),
+        predictions=predictions,
     )
 
 
@@ -238,10 +259,11 @@ def end_to_end_exact_success(
     expectations: dict[str, JsonValue],
 ) -> bool:
     prediction = _prediction(outputs)
-    return prediction.accepted and exact_json_equal(
-        prediction.answer,
-        expectations.get("answer"),
-    ) and prediction.reporting.status == "reported"
+    return (
+        prediction.accepted
+        and json_answers_equal(prediction.answer, expectations)
+        and prediction.reporting.status == "reported"
+    )
 
 
 def conditional_exact_json(
@@ -251,7 +273,7 @@ def conditional_exact_json(
     prediction = _prediction(outputs)
     if not prediction.accepted:
         return None
-    return exact_json_equal(prediction.answer, expectations.get("answer"))
+    return json_answers_equal(prediction.answer, expectations)
 
 
 def agent_failure(
@@ -263,7 +285,7 @@ def agent_failure(
         return False
     if not prediction.accepted:
         return True
-    return not exact_json_equal(prediction.answer, expectations.get("answer"))
+    return not json_answers_equal(prediction.answer, expectations)
 
 
 def infrastructure_failure(
@@ -292,6 +314,72 @@ def infrastructure_failure(
 def exact_json_equal(left: JsonValue, right: JsonValue) -> bool:
     """Compare finite JSON structurally while preserving numeric JSON values."""
     return _canonical_json(left) == _canonical_json(right)
+
+
+def json_answers_equal(
+    actual: JsonValue,
+    expectations: dict[str, JsonValue],
+) -> bool:
+    """Compare one answer under the canonical policy retained in the dataset."""
+    expected, scorer = _decode_scoring_expectations(expectations)
+    if isinstance(scorer, JsonNumericToleranceScorer):
+        return _tolerant_json_equal(actual, expected, scorer)
+    return exact_json_equal(actual, expected)
+
+
+def _decode_scoring_expectations(
+    value: dict[str, JsonValue],
+) -> tuple[JsonValue, PackScorer]:
+    if set(value) != {"answer", "scorer"}:
+        raise ValueError("evaluation expectations have an invalid shape")
+    answer_text = value["answer"]
+    scorer_text = value["scorer"]
+    if not isinstance(answer_text, str) or not isinstance(scorer_text, str):
+        raise ValueError("evaluation expectations must be canonical JSON strings")
+    try:
+        answer = cast(JsonValue, json.loads(answer_text))
+        scorer_value = json.loads(scorer_text)
+        scorer = _PACK_SCORER_ADAPTER.validate_python(scorer_value)
+    except Exception:
+        raise ValueError("evaluation expectations are invalid") from None
+    if answer_text != _canonical_json(answer) or scorer_text != _canonical_json(
+        cast(JsonValue, scorer.model_dump(mode="json"))
+    ):
+        raise ValueError("evaluation expectations must be canonical")
+    return answer, scorer
+
+
+def _tolerant_json_equal(
+    actual: JsonValue,
+    expected: JsonValue,
+    scorer: JsonNumericToleranceScorer,
+) -> bool:
+    if isinstance(expected, dict):
+        return isinstance(actual, dict) and set(actual) == set(expected) and all(
+            _tolerant_json_equal(actual[key], expected[key], scorer) for key in expected
+        )
+    if isinstance(expected, list):
+        return (
+            isinstance(actual, list)
+            and len(actual) == len(expected)
+            and all(
+                _tolerant_json_equal(left, right, scorer)
+                for left, right in zip(actual, expected, strict=True)
+            )
+        )
+    if type(expected) is int:
+        return type(actual) is int and actual == expected
+    if type(expected) is float:
+        if type(actual) not in (int, float):
+            return False
+        actual_number = cast(int | float, actual)
+        return math.isfinite(actual_number) and math.isclose(
+            actual_number,
+            expected,
+            rel_tol=scorer.relative_tolerance,
+            abs_tol=scorer.absolute_tolerance,
+        )
+    return type(actual) is type(expected) and actual == expected
 
 
 def _canonical_pack(value: LoadedEvaluationPack | object) -> LoadedEvaluationPack:
@@ -376,17 +464,6 @@ def _skip_mlflow_prediction_preflight() -> Generator[None]:
             os.environ[key] = original
 
 
-def _result_predictions(raw_result: object) -> tuple[MlflowEvaluationPrediction, ...]:
-    result_frame = getattr(raw_result, "result_df", None)
-    if result_frame is None or "outputs" not in result_frame:
-        return ()
-    predictions: list[MlflowEvaluationPrediction] = []
-    for raw in result_frame["outputs"].tolist():
-        value = json.loads(raw) if isinstance(raw, str) else raw
-        predictions.append(MlflowEvaluationPrediction.model_validate(value))
-    return tuple(predictions)
-
-
 def _prediction(
     value: MlflowEvaluationPrediction | dict[str, JsonValue],
 ) -> MlflowEvaluationPrediction:
@@ -451,10 +528,24 @@ class _MlflowEvaluationApi:
         self.feedback_type: Any = entities.Feedback
 
     def create_dataset(self, *, name: str, experiment_id: str) -> _NativeDataset:
-        return cast(
-            _NativeDataset,
-            self.datasets.create_dataset(name=name, experiment_id=experiment_id),
-        )
+        try:
+            existing = self.datasets.get_dataset(name=name)
+        except Exception as error:
+            if getattr(error, "error_code", None) != "RESOURCE_DOES_NOT_EXIST":
+                raise
+        else:
+            return cast(_NativeDataset, existing)
+        try:
+            created = self.datasets.create_dataset(
+                name=name,
+                experiment_id=experiment_id,
+            )
+        except Exception as create_error:
+            try:
+                created = self.datasets.get_dataset(name=name)
+            except Exception:
+                raise create_error from None
+        return cast(_NativeDataset, created)
 
     def scorer(self, function: Callable[..., object], *, name: str) -> object:
         return self.scorers.scorer(function, name=name)

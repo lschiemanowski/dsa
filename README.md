@@ -37,7 +37,7 @@ Hugging Face packs and native Databricks MLflow evaluation path:
 - direct final answers or same-run retained JSON final answers
 - an operator-only `report_to_mlflow` flag with context-local Pydantic AI tracing
 - exact terminal-record and artifact-manifest metadata export to Databricks
-- native MLflow Evaluation Datasets with host-only expectations and exact JSON scorers
+- native MLflow Evaluation Datasets with lossless host-only expectations and pack scorers
 - one immutable public Online Retail II pack containing twenty evaluation cases
 - exact Hugging Face repository revision, manifest, case-export, and database identities
 - immutable content-addressed benchmark studies and deterministic matrix expansion
@@ -150,9 +150,12 @@ result = run_mlflow_evaluation(
 ```
 
 Only case identity/version, database identity/digest, question, and answer schema enter
-MLflow dataset inputs. Reference answers remain evaluator-only expectations. Hugging Face
-cache paths, model configuration, run policy, and executor configuration remain host
-runtime bindings.
+MLflow dataset inputs. Reference answers and scorer policies remain evaluator-only
+expectations, encoded as canonical JSON strings so managed-dataset number coercion cannot
+change their meaning. Exact packs keep integers and floats exact; a pack may explicitly
+opt into bounded relative/absolute tolerance for expected floating-point leaves while
+integers remain type-exact. Hugging Face cache paths, model configuration, run policy,
+and executor configuration remain host runtime bindings.
 
 Benchmark studies bind exact pack references, model configurations, policy, Docker image,
 concurrency, repetitions, and the exact agent Git revision. Runtime files bind only a new

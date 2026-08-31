@@ -29,7 +29,11 @@ from dsa.benchmark import (
     stop_benchmark_cell_worker,
 )
 from dsa.docker import DockerCommandResult, DockerPythonExecutor
-from dsa.evaluation import MlflowEvaluationPrediction, MlflowEvaluationResult
+from dsa.evaluation import (
+    MlflowEvaluationError,
+    MlflowEvaluationPrediction,
+    MlflowEvaluationResult,
+)
 from dsa.reporting import MlflowReporting
 
 from .test_benchmark import IMAGE, runtime_value, study_value
@@ -399,6 +403,25 @@ def test_worker_classifies_uncertain_mlflow_outcomes_as_ambiguous(
 
     assert isinstance(result, BenchmarkWorkerAmbiguous)
     assert result.failure_code == "cell_evaluation_ambiguous"
+    assert not invocation.receipt_path.exists()
+
+
+def test_worker_retains_a_stable_mlflow_failure_phase(tmp_path: Path) -> None:
+    prepared = prepared_benchmark(tmp_path)
+    invocation = BenchmarkCellInvocation.from_prepared(prepared, prepared.cells[0], 1)
+    invocation.attempt_directory.mkdir(parents=True)
+
+    def failed(*_args: object, **_kwargs: object) -> MlflowEvaluationResult:
+        raise MlflowEvaluationError("mlflow_dataset_failed")
+
+    result = execute_benchmark_cell(
+        invocation,
+        pack_loader=lambda _reference: prepared.packs[0][1],
+        evaluation_runner=failed,
+    )
+
+    assert isinstance(result, BenchmarkWorkerAmbiguous)
+    assert result.failure_code == "cell_mlflow_dataset_failed"
     assert not invocation.receipt_path.exists()
 
 

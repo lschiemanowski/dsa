@@ -783,7 +783,7 @@ def _verify_and_compute_cell(
     computations: list[_CaseComputation] = []
     for prediction in receipt.predictions:
         case = cases[prediction.case_id]
-        expectations = {"answer": case.expected_answer}
+        expectations = case.scoring_expectations(pack.manifest)
         exact = end_to_end_exact_success(prediction, expectations)
         conditional = conditional_exact_json(prediction, expectations)
         agent = agent_failure(prediction, expectations)

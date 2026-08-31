@@ -66,9 +66,10 @@ Before deriving any result, the publisher:
    with the prediction. A prediction whose reporting projection itself failed remains
    a valid infrastructure observation and is not required to have a tracking run.
 7. Recomputes scorer outcomes with the existing DSA scorer functions using the retained
-   prediction and the expectation from the verified pinned pack, then cross-checks the
-   corresponding finite aggregate metrics exposed by the MLflow evaluation run. A
-   missing conditional metric is permitted only when that metric has no denominator.
+   prediction plus the expected answer and scorer policy from the verified pinned pack,
+   then cross-checks the corresponding finite aggregate metrics exposed by the MLflow
+   evaluation run. A missing conditional metric is permitted only when that metric has
+   no denominator.
 
 Any unavailable required remote run, foreign record, identity contradiction, metric
 contradiction, or incomplete study rejects publication. The publisher never discovers

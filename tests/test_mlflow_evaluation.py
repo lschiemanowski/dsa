@@ -22,6 +22,7 @@ from dsa.evaluation import (
     end_to_end_exact_success,
     exact_json_equal,
     infrastructure_failure,
+    json_answers_equal,
     run_mlflow_evaluation,
 )
 from dsa.pack import (
@@ -153,7 +154,10 @@ def test_case_snapshots_expectation_and_keeps_it_out_of_inputs(tmp_path: Path) -
 
     row = case.dataset_record(pack.manifest)
 
-    assert row["expectations"] == {"answer": {"count": 3}}
+    assert row["expectations"] == {
+        "answer": '{"count":3}',
+        "scorer": '{"name":"exact-json","version":"1"}',
+    }
     inputs = row["inputs"]
     assert isinstance(inputs, dict)
     assert "expected_answer" not in inputs
@@ -184,7 +188,10 @@ def test_case_rejects_expectation_outside_answer_schema(tmp_path: Path) -> None:
 
 
 def test_exact_json_and_failure_scorers_cover_the_all_case_denominator() -> None:
-    expectations: dict[str, JsonValue] = {"answer": {"count": 3}}
+    expectations: dict[str, JsonValue] = {
+        "answer": '{"count":3}',
+        "scorer": '{"name":"exact-json","version":"1"}',
+    }
     exact = prediction()
     wrong = prediction(answer={"count": 4})
     provider = prediction(
@@ -243,6 +250,36 @@ def test_exact_json_and_failure_scorers_cover_the_all_case_denominator() -> None
     assert conditional_exact_json(reporting_failed, expectations) is True
     assert infrastructure_failure(reporting_failed) is True
     assert agent_failure(reporting_failed, expectations) is False
+
+
+def test_numeric_tolerance_is_explicit_recursive_and_never_weakens_integers() -> None:
+    scorer = {
+        "name": "json-numeric-tolerance",
+        "version": "1",
+        "relative_tolerance": 1e-9,
+        "absolute_tolerance": 1e-12,
+    }
+    expectations: dict[str, JsonValue] = {
+        "answer": '{"count":3,"ratio":0.1,"values":[1.0,true]}',
+        "scorer": json.dumps(scorer, sort_keys=True, separators=(",", ":")),
+    }
+
+    assert json_answers_equal(
+        {"count": 3, "ratio": 0.10000000001, "values": [1, True]},
+        expectations,
+    ) is True
+    assert json_answers_equal(
+        {"count": 3.0, "ratio": 0.1, "values": [1, True]},
+        expectations,
+    ) is False
+    assert json_answers_equal(
+        {"count": 3, "ratio": 0.1001, "values": [1, True]},
+        expectations,
+    ) is False
+    assert json_answers_equal(
+        {"count": 3, "ratio": 0.1, "values": [1, 1]},
+        expectations,
+    ) is False
 
 
 def test_native_evaluation_uses_dataset_expectations_and_normal_reporting_path(
@@ -371,7 +408,10 @@ def test_native_evaluation_uses_dataset_expectations_and_normal_reporting_path(
         "dsa.benchmark.cell_id": "cell-1",
         "dsa.benchmark.study_sha256": "a" * 64,
     }
-    assert api.dataset.records[0]["expectations"] == {"answer": {"count": 3}}
+    assert api.dataset.records[0]["expectations"] == {
+        "answer": '{"count":3}',
+        "scorer": '{"name":"exact-json","version":"1"}',
+    }
     assert api.output is not None
     assert api.output["accepted"] is True
     assert api.output["reporting"] == {
@@ -417,6 +457,90 @@ def test_native_api_starts_the_evaluation_run_with_benchmark_tags() -> None:
     assert captured == [{"dsa.benchmark.cell_id": "cell-1"}]
 
 
+def test_native_api_reuses_an_existing_dataset_and_only_creates_when_missing() -> None:
+    class MissingDataset(Exception):
+        error_code = "RESOURCE_DOES_NOT_EXIST"
+
+    existing = SimpleNamespace(dataset_id="existing", digest="existing-digest")
+    created = SimpleNamespace(dataset_id="created", digest="created-digest")
+
+    class Datasets:
+        def __init__(self) -> None:
+            self.found = True
+            self.create_conflict = False
+            self.created: list[tuple[str, str]] = []
+
+        def get_dataset(self, *, name: str) -> object:
+            assert name == "catalog.schema.dataset"
+            if self.found:
+                return existing
+            raise MissingDataset
+
+        def create_dataset(self, *, name: str, experiment_id: str) -> object:
+            self.created.append((name, experiment_id))
+            if self.create_conflict:
+                self.found = True
+                raise RuntimeError("another worker created the dataset")
+            return created
+
+    api_type: Any = vars(import_module("dsa.evaluation"))["_MlflowEvaluationApi"]
+    api = api_type.__new__(api_type)
+    api.datasets = Datasets()
+
+    assert api.create_dataset(
+        name="catalog.schema.dataset", experiment_id="123"
+    ) is existing
+    assert api.datasets.created == []
+
+    api.datasets.found = False
+    assert api.create_dataset(
+        name="catalog.schema.dataset", experiment_id="123"
+    ) is created
+    assert api.datasets.created == [("catalog.schema.dataset", "123")]
+
+    api.datasets.found = False
+    api.datasets.create_conflict = True
+    assert api.create_dataset(
+        name="catalog.schema.dataset", experiment_id="123"
+    ) is existing
+    assert api.datasets.created == [
+        ("catalog.schema.dataset", "123"),
+        ("catalog.schema.dataset", "123"),
+    ]
+
+
+def test_native_api_does_not_hide_dataset_lookup_failures() -> None:
+    class Datasets:
+        def get_dataset(self, *, name: str) -> object:
+            raise RuntimeError(f"lookup failed for {name}")
+
+    api_type: Any = vars(import_module("dsa.evaluation"))["_MlflowEvaluationApi"]
+    api = api_type.__new__(api_type)
+    api.datasets = Datasets()
+
+    with pytest.raises(RuntimeError, match="lookup failed"):
+        api.create_dataset(name="catalog.schema.dataset", experiment_id="123")
+
+
+def test_native_api_does_not_hide_dataset_creation_failures() -> None:
+    class MissingDataset(Exception):
+        error_code = "RESOURCE_DOES_NOT_EXIST"
+
+    class Datasets:
+        def get_dataset(self, *, name: str) -> object:
+            raise MissingDataset(name)
+
+        def create_dataset(self, *, name: str, experiment_id: str) -> object:
+            raise RuntimeError(f"creation failed for {name} in {experiment_id}")
+
+    api_type: Any = vars(import_module("dsa.evaluation"))["_MlflowEvaluationApi"]
+    api = api_type.__new__(api_type)
+    api.datasets = Datasets()
+
+    with pytest.raises(RuntimeError, match="creation failed"):
+        api.create_dataset(name="catalog.schema.dataset", experiment_id="123")
+
+
 def test_native_mlflow_api_executes_one_analysis_per_dataset_row(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -457,7 +581,7 @@ def test_native_mlflow_api_executes_one_analysis_per_dataset_row(
         assert predict_fn is not None
         assert len(scorers) == 4
         assert run_id == "native-evaluation-run"
-        for inputs in eval_df["inputs"].tolist():
+        for inputs in reversed(eval_df["inputs"].tolist()):
             outputs.append(predict_fn(inputs))
         return SimpleNamespace(
             run_id=run_id,
@@ -571,6 +695,10 @@ def test_native_mlflow_api_executes_one_analysis_per_dataset_row(
     assert len(outputs) == 2
     assert len(list((tmp_path / "runs").glob("*/terminal.json"))) == 2
     assert len(result.predictions) == 2
+    assert tuple(item.case_id for item in result.predictions) == (
+        "first-native-case",
+        "second-native-case",
+    )
     assert "MLFLOW_GENAI_EVAL_SKIP_TRACE_VALIDATION" not in os.environ
 
 

@@ -14,9 +14,11 @@ The former core and generalization datasets survive only as migration provenance
 ## Pack and locator
 
 `pack.json` uses the strict format identifier `dsa-evaluation-pack/v1`. It records one
-pack identity and semantic version, the license, one exact-JSON scorer identity, one
-database identity/path/size/SHA-256, one canonical JSONL case path/count/size/SHA-256,
-and the two predecessor MLflow dataset identities and export digests.
+pack identity and semantic version, the license, one scorer policy, one database
+identity/path/size/SHA-256, one canonical JSONL case path/count/size/SHA-256, and the two
+predecessor MLflow dataset identities and export digests. A scorer is either exact JSON
+or an explicit finite, bounded relative/absolute tolerance for floating-point leaves;
+integer leaves always remain type-exact. The Online Retail II release uses exact JSON.
 
 Each case contains only a stable case identity and version, the exact analytical
 question, its Draft 2020-12 answer schema, the host-only expected answer, and descriptive
@@ -50,10 +52,12 @@ imports Python from the dataset repository, or permits a custom remote dataset s
 ## MLflow boundary
 
 Native MLflow dataset inputs contain only case identity/version, database identity and
-digest, question, and answer schema. Expectations remain in the native expectations
-field and descriptive pack metadata remains in record tags. The host prediction adapter
-binds the verified local database path, model configuration, run policy, and Python
-executor immediately before the ordinary `run_analysis` call.
+digest, question, and answer schema. The expected answer and scorer policy remain in the
+native expectations field as separate canonical JSON strings, preserving JSON number
+types across the managed Databricks dataset boundary. Descriptive pack metadata remains
+in record tags. The host prediction adapter binds the verified local database path,
+model configuration, run policy, and Python executor immediately before the ordinary
+`run_analysis` call.
 
 Consequently the same released evaluation dataset has stable record identity across
 machines, models, policies, and cache locations. The model sees the question and answer

@@ -315,6 +315,56 @@ def test_loader_rejects_unsafe_manifest_paths_before_downloading_content(
     assert len(downloader.calls) == 1
 
 
+def test_manifest_accepts_an_explicit_bounded_numeric_tolerance(tmp_path: Path) -> None:
+    reference, files = _write_pack(
+        tmp_path,
+        manifest_updates={
+            "scorer": {
+                "name": "json-numeric-tolerance",
+                "version": "1",
+                "relative_tolerance": 1e-9,
+                "absolute_tolerance": 1e-12,
+            }
+        },
+    )
+
+    pack = load_huggingface_evaluation_pack(reference, downloader=Downloader(files))
+
+    assert pack.manifest.scorer.name == "json-numeric-tolerance"
+
+
+@pytest.mark.parametrize(
+    "scorer",
+    [
+        {
+            "name": "json-numeric-tolerance",
+            "version": "1",
+            "relative_tolerance": -1e-9,
+            "absolute_tolerance": 1e-12,
+        },
+        {
+            "name": "json-numeric-tolerance",
+            "version": "1",
+            "relative_tolerance": 0.0,
+            "absolute_tolerance": 0.0,
+        },
+    ],
+)
+def test_manifest_rejects_unsafe_numeric_tolerances(
+    tmp_path: Path,
+    scorer: dict[str, object],
+) -> None:
+    reference, files = _write_pack(
+        tmp_path,
+        manifest_updates={"scorer": scorer},
+    )
+
+    with pytest.raises(EvaluationPackError) as caught:
+        load_huggingface_evaluation_pack(reference, downloader=Downloader(files))
+
+    assert caught.value.code == "pack_manifest_invalid"
+
+
 def test_loader_sanitizes_hub_and_local_file_failures(tmp_path: Path) -> None:
     """Remote URLs, tokens, and cache paths do not cross the pack boundary."""
     reference, files = _write_pack(tmp_path)

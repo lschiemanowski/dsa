@@ -77,6 +77,13 @@ uses four explicit scorers:
 - `infrastructure_failure`: true for provider, host-runtime, cancellation, or MLflow
   reporting failure
 
+Pack-backed evaluation transports the expected answer and comparison policy as canonical
+JSON strings inside `expectations`, preventing Databricks from changing integer JSON
+leaves into floating-point values. The default policy remains exact canonical JSON. An
+explicit numeric-tolerance policy applies only to expected floating-point leaves;
+expected integers, booleans, strings, nulls, object keys, and array structure remain
+exact.
+
 MLflow's prediction trace preflight is disabled only around the native evaluation call
 and its prior environment setting is restored afterward. The DSA prediction already emits
 an explicit trace, while the preflight would otherwise execute the first side-effecting
