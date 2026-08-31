@@ -4,15 +4,12 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import json
-import os
 import re
-import stat
 import subprocess
 import sys
 from collections.abc import Callable, Coroutine, Sequence
 from pathlib import Path
-from typing import Any, Never, Protocol
+from typing import Any, Protocol
 
 from dsa.benchmark import (
     BenchmarkCellRunResult,
@@ -28,6 +25,7 @@ from dsa.benchmark_report import (
     RetainedBenchmarkReport,
     create_benchmark_report,
 )
+from dsa.cli import HelpRequested, Parser, emit, read_contract
 
 Preparer = Callable[..., Coroutine[Any, Any, PreparedBenchmark]]
 Runner = Callable[
@@ -47,20 +45,6 @@ class Reporter(Protocol):
     ) -> RetainedBenchmarkReport: ...
 
 
-class _HelpRequested(Exception):
-    pass
-
-
-class _Parser(argparse.ArgumentParser):
-    def error(self, message: str) -> Never:
-        raise ValueError(message)
-
-    def exit(self, status: int = 0, message: str | None = None) -> Never:
-        if status == 0:
-            raise _HelpRequested
-        raise ValueError(message or "parser exit")
-
-
 def main(
     argv: Sequence[str] | None = None,
     *,
@@ -75,10 +59,10 @@ def main(
         study = _load_study(Path(parsed.study))
         runtime = _load_runtime(Path(parsed.runtime))
         revision = current_revision or _current_git_revision()
-    except _HelpRequested:
+    except HelpRequested:
         return 0
     except Exception:
-        _emit({"code": "benchmark_usage", "status": "rejected"})
+        emit({"code": "benchmark_usage", "status": "rejected"})
         return 2
     if parsed.command == "report":
         try:
@@ -91,7 +75,7 @@ def main(
         except KeyboardInterrupt:
             return 130
         except BenchmarkReportConfigurationError:
-            _emit(
+            emit(
                 {
                     "code": "benchmark_report_preflight_failed",
                     "status": "rejected",
@@ -99,9 +83,9 @@ def main(
             )
             return 2
         except Exception:
-            _emit({"code": "benchmark_report_failed", "status": "failed"})
+            emit({"code": "benchmark_report_failed", "status": "failed"})
             return 1
-        _emit(
+        emit(
             {
                 "json_path": str(retained.json_path),
                 "markdown_path": str(retained.markdown_path),
@@ -123,13 +107,13 @@ def main(
     except KeyboardInterrupt:
         return 130
     except Exception:
-        _emit({"code": "benchmark_preflight_failed", "status": "rejected"})
+        emit({"code": "benchmark_preflight_failed", "status": "rejected"})
         return 2
     if parsed.command == "plan":
         try:
             sys.stdout.write(benchmark_plan(prepared).canonical_json)
         except Exception:
-            _emit({"code": "benchmark_preflight_failed", "status": "rejected"})
+            emit({"code": "benchmark_preflight_failed", "status": "rejected"})
             return 2
         return 0
     try:
@@ -137,10 +121,10 @@ def main(
     except KeyboardInterrupt:
         return 130
     except Exception:
-        _emit({"code": "benchmark_execution_failed", "status": "failed"})
+        emit({"code": "benchmark_execution_failed", "status": "failed"})
         return 1
     complete = all(item.status in {"completed", "skipped"} for item in results)
-    _emit(
+    emit(
         {
             "cells": [item.model_dump(mode="json") for item in results],
             "status": "completed" if complete else "incomplete",
@@ -150,8 +134,8 @@ def main(
     return 0 if complete else 1
 
 
-def _parser() -> _Parser:
-    parser = _Parser(prog="dsa-benchmark", add_help=True)
+def _parser() -> Parser:
+    parser = Parser(prog="dsa-benchmark", add_help=True)
     commands = parser.add_subparsers(dest="command", required=True)
     plan = commands.add_parser("plan", add_help=True)
     _common_arguments(plan)
@@ -170,7 +154,7 @@ def _common_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 def _load_study(path: Path) -> BenchmarkStudy:
-    content = _read_contract(path)
+    content = read_contract(path)
     study = BenchmarkStudy.model_validate_json(content)
     if content != study.canonical_json.encode():
         raise ValueError("study must use canonical JSON")
@@ -178,7 +162,7 @@ def _load_study(path: Path) -> BenchmarkStudy:
 
 
 def _load_runtime(path: Path) -> BenchmarkRuntime:
-    content = _read_contract(path)
+    content = read_contract(path)
     runtime = BenchmarkRuntime.model_validate_json(content)
     if content != runtime.canonical_json.encode():
         raise ValueError("runtime must use canonical JSON")
@@ -191,32 +175,6 @@ def _load_runtime(path: Path) -> BenchmarkRuntime:
             "workspace_root": root,
         }
     )
-
-
-def _read_contract(path: Path) -> bytes:
-    descriptor: int | None = None
-    try:
-        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-        metadata = os.fstat(descriptor)
-        if (
-            not stat.S_ISREG(metadata.st_mode)
-            or metadata.st_size <= 0
-            or metadata.st_size > 1024 * 1024
-        ):
-            raise ValueError("benchmark contract size invalid")
-        with os.fdopen(descriptor, "rb") as source:
-            descriptor = None
-            content = source.read(1024 * 1024 + 1)
-    except ValueError:
-        raise
-    except OSError:
-        raise ValueError("benchmark contract unavailable") from None
-    finally:
-        if descriptor is not None:
-            os.close(descriptor)
-    if not content or len(content) > 1024 * 1024:
-        raise ValueError("benchmark contract size invalid")
-    return content
 
 
 def _current_git_revision() -> str:
@@ -260,18 +218,6 @@ def _current_git_revision() -> str:
     if status.returncode != 0 or status.stdout:
         raise ValueError("agent implementation does not match its Git revision")
     return revision
-
-
-def _emit(value: dict[str, Any]) -> None:
-    print(
-        json.dumps(
-            value,
-            ensure_ascii=False,
-            allow_nan=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        )
-    )
 
 
 if __name__ == "__main__":
