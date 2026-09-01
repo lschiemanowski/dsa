@@ -31,6 +31,12 @@ from dsa.benchmark import (
     expand_benchmark_study,
 )
 from dsa.contract import ContractModel
+from dsa.cost import (
+    ProviderCostSummary,
+    combine_provider_costs,
+    observed_provider_response_ids,
+    provider_cost_from_messages,
+)
 from dsa.evaluation import (
     MlflowEvaluationPrediction,
     agent_failure,
@@ -59,6 +65,8 @@ _EVALUATION_METRICS = (
 )
 _ANALYSIS_METRICS = (
     "dsa.elapsed_seconds",
+    "dsa.provider_cost_generations",
+    "dsa.provider_cost_usd",
     "dsa.usage.input_tokens",
     "dsa.usage.output_tokens",
     "dsa.usage.requests",
@@ -168,6 +176,7 @@ class BenchmarkAggregate(ContractModel):
     case_count: NonNegativeInt
     metrics: BenchmarkMetrics
     observations: BenchmarkObservations
+    provider_cost: ProviderCostSummary
 
     @model_validator(mode="after")
     def denominators_match_case_count(self) -> BenchmarkAggregate:
@@ -191,6 +200,12 @@ class BenchmarkAggregate(ContractModel):
             summary = BenchmarkObservedSummary.model_validate(item)
             if summary.observed_count + summary.unavailable_count != self.case_count:
                 raise ValueError("observation coverage does not match case count")
+        if (
+            self.provider_cost.complete_case_count
+            + self.provider_cost.incomplete_case_count
+            != self.case_count
+        ):
+            raise ValueError("provider cost coverage does not match case count")
         return self
 
 
@@ -213,9 +228,16 @@ class BenchmarkCaseOutcome(ContractModel):
     conditional_policy_match: bool | None
     agent_failure: bool
     infrastructure_failure: bool
+    provider_cost: ProviderCostSummary
 
     @model_validator(mode="after")
     def outcome_is_consistent(self) -> BenchmarkCaseOutcome:
+        if (
+            self.provider_cost.complete_case_count
+            + self.provider_cost.incomplete_case_count
+            != 1
+        ):
+            raise ValueError("case provider cost must cover exactly one execution")
         if self.accepted:
             if self.failure_stage is not None or self.failure_code is not None:
                 raise ValueError("accepted case outcome contains failure state")
@@ -303,6 +325,7 @@ class BenchmarkCellReport(ContractModel):
     cases: tuple[BenchmarkCaseOutcome, ...]
     metrics: BenchmarkMetrics
     observations: BenchmarkObservations
+    provider_cost: ProviderCostSummary
 
     @model_validator(mode="after")
     def cases_match_cell_summary(self) -> BenchmarkCellReport:
@@ -314,10 +337,16 @@ class BenchmarkCellReport(ContractModel):
             case_count=self.case_count,
             metrics=self.metrics,
             observations=self.observations,
+            provider_cost=self.provider_cost,
         )
         expected = _metrics_from_outcomes(self.cases)
         if self.metrics != expected:
             raise ValueError("cell metrics do not match its case outcomes")
+        expected_cost = combine_provider_costs(
+            item.provider_cost for item in self.cases
+        )
+        if self.provider_cost != expected_cost:
+            raise ValueError("cell provider cost does not match its case outcomes")
         return self
 
 
@@ -332,14 +361,10 @@ class BenchmarkPackModelAggregate(ContractModel):
     result: BenchmarkAggregate
 
 
-class BenchmarkUnavailableCost(ContractModel):
-    status: Literal["unavailable"] = "unavailable"
-
-
 class BenchmarkReport(ContractModel):
     """Canonical immutable report for one complete benchmark study."""
 
-    format: Literal["dsa-benchmark-report/v2"] = "dsa-benchmark-report/v2"
+    format: Literal["dsa-benchmark-report/v3"] = "dsa-benchmark-report/v3"
     reporter_revision: GitRevision
     study_sha256: Sha256
     study: BenchmarkStudy
@@ -349,7 +374,6 @@ class BenchmarkReport(ContractModel):
     overall: BenchmarkAggregate
     models: tuple[BenchmarkModelAggregate, ...]
     pack_models: tuple[BenchmarkPackModelAggregate, ...]
-    provider_cost: BenchmarkUnavailableCost = BenchmarkUnavailableCost()
 
     @model_validator(mode="after")
     def identities_match_study(self) -> BenchmarkReport:
@@ -509,6 +533,13 @@ class _CaseComputation:
     observations: dict[str, float]
 
 
+@dataclass(frozen=True)
+class _VerifiedCellEvidence:
+    receipt: BenchmarkCellReceipt
+    provider_costs: dict[str, ProviderCostSummary]
+    provider_response_ids: frozenset[str]
+
+
 def build_benchmark_report(
     study: BenchmarkStudy | object,
     runtime: BenchmarkRuntime | object,
@@ -537,24 +568,34 @@ def build_benchmark_report(
     total_cases = sum(pack_map[cell.pack_id].manifest.cases.case_count for cell in cells)
     if total_cases > _MAX_REPORT_CASE_EXECUTIONS:
         raise ValueError("benchmark report contains too many case executions")
-    receipts = _read_complete_receipts(
+    cell_evidence = _read_complete_cell_evidence(
         selected_study,
         selected_runtime,
         cells,
         pack_map,
     )
+    provider_response_ids: set[str] = set()
+    for evidence in cell_evidence:
+        if provider_response_ids.intersection(evidence.provider_response_ids):
+            raise ValueError(
+                "benchmark report provider response identities must be unique"
+            )
+        provider_response_ids.update(evidence.provider_response_ids)
+    receipts = tuple(item.receipt for item in cell_evidence)
     datasets = _dataset_evidence(selected_study, selected_runtime, receipts)
     model_names = {
         item.model_id: item.configuration.name for item in selected_study.models
     }
     all_computations: list[_CaseComputation] = []
     cell_reports: list[BenchmarkCellReport] = []
-    for cell, receipt in zip(cells, receipts, strict=True):
+    for cell, evidence in zip(cells, cell_evidence, strict=True):
+        receipt = evidence.receipt
         pack = pack_map[cell.pack_id]
         computations = _verify_and_compute_cell(
             cell,
             receipt,
             pack,
+            provider_costs=evidence.provider_costs,
             model_name=model_names[cell.model_id],
             evidence_reader=reader,
         )
@@ -572,6 +613,7 @@ def build_benchmark_report(
                 cases=tuple(item.outcome for item in computations),
                 metrics=aggregate.metrics,
                 observations=aggregate.observations,
+                provider_cost=aggregate.provider_cost,
             )
         )
     pack_evidence = tuple(
@@ -646,8 +688,8 @@ def publish_benchmark_report(
     except OSError:
         raise ValueError("benchmark report output directory is unavailable") from None
     basename = f"{selected.study.study_id}-{selected.study_sha256}"
-    json_name = f"{basename}.report.json"
-    markdown_name = f"{basename}.report.md"
+    json_name = f"{basename}.report-v3.json"
+    markdown_name = f"{basename}.report-v3.md"
     json_path = output_directory / json_name
     markdown_path = output_directory / markdown_name
     json_bytes = selected.canonical_json.encode()
@@ -741,8 +783,8 @@ def benchmark_report_markdown(
         "",
         "| Cell | Pack | Model | Repetition | E2E exact | Completion | "
         "Conditional exact | E2E policy | Conditional policy | Agent failure | "
-        "Infrastructure failure | MLflow run |",
-        "|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|",
+        "Infrastructure failure | Provider cost | MLflow run |",
+        "|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|",
         *(_cell_markdown_row(item) for item in selected.cells),
         "",
         "## Observed runtime",
@@ -752,7 +794,7 @@ def benchmark_report_markdown(
         _observation_line("Input tokens", selected.overall.observations.input_tokens),
         _observation_line("Output tokens", selected.overall.observations.output_tokens),
         _observation_line("Total tokens", selected.overall.observations.total_tokens),
-        "Provider cost: unavailable",
+        _provider_cost_line(selected.overall.provider_cost),
         "",
     ]
     return "\n".join(lines)
@@ -791,6 +833,7 @@ def _verify_and_compute_cell(
     receipt: BenchmarkCellReceipt,
     pack: LoadedEvaluationPack,
     *,
+    provider_costs: Mapping[str, ProviderCostSummary],
     model_name: str,
     evidence_reader: BenchmarkEvidenceReader,
 ) -> tuple[_CaseComputation, ...]:
@@ -809,6 +852,9 @@ def _verify_and_compute_cell(
     cases = {item.case_id: item for item in pack.cases}
     computations: list[_CaseComputation] = []
     for prediction in receipt.predictions:
+        provider_cost = provider_costs.get(prediction.run_id)
+        if provider_cost is None:
+            raise ValueError("benchmark report terminal evidence is incomplete")
         case = cases[prediction.case_id]
         expectations = case.scoring_expectations(pack.manifest)
         exact = end_to_end_exact_success(prediction, expectations)
@@ -841,9 +887,13 @@ def _verify_and_compute_cell(
                 value = tracking.metrics[key]
                 if value < 0:
                     raise ValueError("MLflow analysis metrics must be nonnegative")
-                if key != "dsa.elapsed_seconds" and not value.is_integer():
+                if key not in (
+                    "dsa.elapsed_seconds",
+                    "dsa.provider_cost_usd",
+                ) and not value.is_integer():
                     raise ValueError("MLflow usage metrics must be integral")
                 observations[key] = value
+            _verify_projected_provider_cost(provider_cost, observations)
         computations.append(
             _CaseComputation(
                 outcome=BenchmarkCaseOutcome(
@@ -860,6 +910,7 @@ def _verify_and_compute_cell(
                     conditional_policy_match=conditional_policy,
                     agent_failure=agent,
                     infrastructure_failure=infrastructure,
+                    provider_cost=provider_cost,
                 ),
                 observations=observations,
             )
@@ -912,7 +963,32 @@ def _aggregate(values: Iterable[_CaseComputation]) -> BenchmarkAggregate:
             output_tokens=_observed(selected, "dsa.usage.output_tokens"),
             total_tokens=_observed(selected, "dsa.usage.total_tokens"),
         ),
+        provider_cost=combine_provider_costs(
+            item.outcome.provider_cost for item in selected
+        ),
     )
+
+
+def _verify_projected_provider_cost(
+    provider_cost: ProviderCostSummary,
+    observations: Mapping[str, float],
+) -> None:
+    projected_amount = observations.get("dsa.provider_cost_usd")
+    projected_generations = observations.get("dsa.provider_cost_generations")
+    if (projected_amount is None) != (projected_generations is None):
+        raise ValueError("MLflow provider cost projection is incomplete")
+    if projected_amount is None:
+        return
+    amount = provider_cost.amount_decimal
+    if provider_cost.status != "observed" or amount is None:
+        raise ValueError("MLflow provider cost contradicts terminal evidence")
+    if not math.isclose(
+        projected_amount,
+        float(amount),
+        rel_tol=0.0,
+        abs_tol=1e-12,
+    ) or projected_generations != provider_cost.observed_generation_count:
+        raise ValueError("MLflow provider cost contradicts terminal evidence")
 
 
 def _metrics_from_outcomes(
@@ -950,6 +1026,7 @@ def _cell_aggregate(cell: BenchmarkCellReport) -> BenchmarkAggregate:
         case_count=cell.case_count,
         metrics=cell.metrics,
         observations=cell.observations,
+        provider_cost=cell.provider_cost,
     )
 
 
@@ -995,6 +1072,9 @@ def _combine_aggregates(
                 item.observations.total_tokens for item in selected
             ),
         ),
+        provider_cost=combine_provider_costs(
+            item.provider_cost for item in selected
+        ),
     )
 
 
@@ -1019,7 +1099,11 @@ def _aggregates_equivalent(
     left: BenchmarkAggregate,
     right: BenchmarkAggregate,
 ) -> bool:
-    if left.case_count != right.case_count or left.metrics != right.metrics:
+    if (
+        left.case_count != right.case_count
+        or left.metrics != right.metrics
+        or left.provider_cost != right.provider_cost
+    ):
         return False
     pairs = (
         (left.observations.elapsed_seconds, right.observations.elapsed_seconds),
@@ -1084,12 +1168,12 @@ def _cell_computations(
     return tuple(result)
 
 
-def _read_complete_receipts(
+def _read_complete_cell_evidence(
     study: BenchmarkStudy,
     runtime: BenchmarkRuntime,
     cells: tuple[BenchmarkCell, ...],
     packs: dict[str, LoadedEvaluationPack],
-) -> tuple[BenchmarkCellReceipt, ...]:
+) -> tuple[_VerifiedCellEvidence, ...]:
     root = runtime.workspace_root
     expected_names = {cell.cell_id for cell in cells}
     root_descriptor: int | None = None
@@ -1113,9 +1197,10 @@ def _read_complete_receipts(
         if actual_names != expected_names:
             raise ValueError("benchmark report requires complete cell receipts")
         dataset_names = {item.pack_id: item.dataset_name for item in runtime.datasets}
-        receipts: list[BenchmarkCellReceipt] = []
+        evidence: list[_VerifiedCellEvidence] = []
         for cell in cells:
-            receipt = _read_receipt_at(root_descriptor, cell.cell_id)
+            verified = _read_receipt_at(root_descriptor, cell.cell_id)
+            receipt = verified.receipt
             expected_cases = tuple(item.case_id for item in packs[cell.pack_id].cases)
             if (
                 receipt.study_sha256 != study.sha256
@@ -1129,8 +1214,8 @@ def _read_complete_receipts(
                 or tuple(item.case_id for item in receipt.predictions) != expected_cases
             ):
                 raise ValueError("benchmark report cell receipt does not match the study")
-            receipts.append(receipt)
-        return tuple(receipts)
+            evidence.append(verified)
+        return tuple(evidence)
     except ValueError:
         raise
     except OSError:
@@ -1140,7 +1225,7 @@ def _read_complete_receipts(
             os.close(root_descriptor)
 
 
-def _read_receipt_at(root_descriptor: int, cell_id: str) -> BenchmarkCellReceipt:
+def _read_receipt_at(root_descriptor: int, cell_id: str) -> _VerifiedCellEvidence:
     cell_descriptor: int | None = None
     receipt_descriptor: int | None = None
     try:
@@ -1169,8 +1254,15 @@ def _read_receipt_at(root_descriptor: int, cell_id: str) -> BenchmarkCellReceipt
         receipt = BenchmarkCellReceipt.model_validate_json(content)
         if content != receipt.canonical_json.encode():
             raise ValueError("benchmark report requires canonical cell receipts")
-        _verify_terminal_records_at(cell_descriptor, receipt)
-        return receipt
+        provider_costs, response_ids = _verify_terminal_records_at(
+            cell_descriptor,
+            receipt,
+        )
+        return _VerifiedCellEvidence(
+            receipt=receipt,
+            provider_costs=provider_costs,
+            provider_response_ids=response_ids,
+        )
     except ValueError:
         raise
     except Exception:
@@ -1185,7 +1277,7 @@ def _read_receipt_at(root_descriptor: int, cell_id: str) -> BenchmarkCellReceipt
 def _verify_terminal_records_at(
     cell_descriptor: int,
     receipt: BenchmarkCellReceipt,
-) -> None:
+) -> tuple[dict[str, ProviderCostSummary], frozenset[str]]:
     attempts_descriptor: int | None = None
     attempt_descriptor: int | None = None
     runs_descriptor: int | None = None
@@ -1240,8 +1332,21 @@ def _verify_terminal_records_at(
                 actual_run_ids.add(entry.name)
         if actual_run_ids != expected_run_ids:
             raise ValueError("benchmark report requires exact terminal records")
+        provider_costs: dict[str, ProviderCostSummary] = {}
+        response_ids: set[str] = set()
         for prediction in receipt.predictions:
-            _verify_terminal_record_at(runs_descriptor, prediction)
+            provider_cost, case_response_ids = _verify_terminal_record_at(
+                runs_descriptor,
+                prediction,
+            )
+            selected_ids = set(case_response_ids)
+            if response_ids.intersection(selected_ids):
+                raise ValueError(
+                    "benchmark report provider response identities must be unique"
+                )
+            response_ids.update(selected_ids)
+            provider_costs[prediction.run_id] = provider_cost
+        return provider_costs, frozenset(response_ids)
     except ValueError:
         raise
     except Exception:
@@ -1258,7 +1363,7 @@ def _verify_terminal_records_at(
 def _verify_terminal_record_at(
     runs_descriptor: int,
     prediction: MlflowEvaluationPrediction,
-) -> None:
+) -> tuple[ProviderCostSummary, tuple[str, ...]]:
     run_descriptor: int | None = None
     terminal_descriptor: int | None = None
     try:
@@ -1303,6 +1408,10 @@ def _verify_terminal_record_at(
             or terminal.outcome.failure.code != prediction.failure_code
         ):
             raise ValueError("benchmark report terminal outcome does not match its receipt")
+        return (
+            provider_cost_from_messages(terminal.messages),
+            observed_provider_response_ids(terminal.messages),
+        )
     except ValueError:
         raise
     except Exception:
@@ -1488,8 +1597,8 @@ def _require_completed_run(run: BenchmarkMlflowRun, kind: str) -> None:
 def _metric_table_header() -> str:
     return (
         "| Scope | Cases | E2E exact | Completion | Conditional exact | E2E policy | "
-        "Conditional policy | Agent failure | Infrastructure failure |\n"
-        "|---|---:|---:|---:|---:|---:|---:|---:|---:|"
+        "Conditional policy | Agent failure | Infrastructure failure | Provider cost |\n"
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|"
     )
 
 
@@ -1503,7 +1612,8 @@ def _metric_row(scope: str, result: BenchmarkAggregate) -> str:
         f"{_format_rate(metrics.end_to_end_policy_success)} | "
         f"{_format_rate(metrics.conditional_policy_accuracy)} | "
         f"{_format_rate(metrics.agent_failure)} | "
-        f"{_format_rate(metrics.infrastructure_failure)} |"
+        f"{_format_rate(metrics.infrastructure_failure)} | "
+        f"{_format_provider_cost(result.provider_cost, result.case_count)} |"
     )
 
 
@@ -1518,6 +1628,7 @@ def _cell_markdown_row(cell: BenchmarkCellReport) -> str:
         f"{_format_rate(metrics.conditional_policy_accuracy)} | "
         f"{_format_rate(metrics.agent_failure)} | "
         f"{_format_rate(metrics.infrastructure_failure)} | "
+        f"{_format_provider_cost(cell.provider_cost, cell.case_count)} | "
         f"`{cell.evaluation_run_id}` |"
     )
 
@@ -1526,6 +1637,31 @@ def _format_rate(value: BenchmarkRate) -> str:
     if value.rate is None:
         return "unavailable"
     return f"{value.numerator}/{value.denominator} ({value.rate:.6f})"
+
+
+def _format_provider_cost(value: ProviderCostSummary, case_count: int) -> str:
+    amount = value.amount_decimal
+    if amount is None:
+        return "unavailable"
+    prefix = "" if value.status == "observed" else "partial "
+    mean = amount / case_count if case_count else amount
+    mean_text = format(mean, ".12f").rstrip("0").rstrip(".")
+    generation_count = (
+        value.observed_generation_count + value.unavailable_generation_count
+    )
+    return (
+        f"{prefix}${value.observed_amount}; ${mean_text}/case; "
+        f"{value.observed_generation_count}/{generation_count} generations"
+    )
+
+
+def _provider_cost_line(value: ProviderCostSummary) -> str:
+    case_count = value.complete_case_count + value.incomplete_case_count
+    return (
+        "Provider inference cost (OpenRouter usage, USD): "
+        f"{_format_provider_cost(value, case_count)} "
+        f"({value.complete_case_count}/{case_count} cases complete)  "
+    )
 
 
 def _observation_line(name: str, value: BenchmarkObservedSummary) -> str:

@@ -174,6 +174,31 @@ async def test_terminal_export_uses_exact_bytes_and_safe_failure_codes(
     backend.param_type = Entity
     backend.tag_type = Entity
 
+    cost_record = completion.record.model_copy(
+        update={
+            "messages": (
+                {
+                    "kind": "response",
+                    "provider_name": "openrouter",
+                    "provider_response_id": "gen-cost-1",
+                    "provider_details": {"cost": 0.1},
+                },
+                {
+                    "kind": "response",
+                    "provider_name": "openrouter",
+                    "provider_response_id": "gen-cost-2",
+                    "provider_details": {"cost": 0.2},
+                },
+            )
+        }
+    )
+    metrics, _, tags = backend._run_metadata(cost_record)
+    metric_values = {item.values[0]: item.values[1] for item in metrics}
+    tag_values = {item.values[0]: item.values[1] for item in tags}
+    assert metric_values["dsa.provider_cost_usd"] == 0.3
+    assert metric_values["dsa.provider_cost_generations"] == 2
+    assert tag_values["dsa.provider_cost_status"] == "observed"
+
     client = Client()
     selected_client = client
 
