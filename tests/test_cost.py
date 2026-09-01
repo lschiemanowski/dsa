@@ -4,7 +4,11 @@ from __future__ import annotations
 
 from pydantic import JsonValue
 
-from dsa.cost import combine_provider_costs, provider_cost_from_messages
+from dsa.cost import (
+    combine_provider_costs,
+    provider_cost_from_messages,
+    safe_openrouter_response_ids,
+)
 
 
 def response(identity: str, cost: JsonValue = None) -> dict[str, JsonValue]:
@@ -65,6 +69,15 @@ def test_no_response_or_no_observed_cost_is_unavailable_not_zero() -> None:
     assert empty.unavailable_generation_count == 0
     assert missing.status == "unavailable"
     assert missing.unavailable_generation_count == 1
+
+
+def test_safe_response_identity_is_retained_when_cost_is_unavailable() -> None:
+    messages = (response("gen-missing"), response("gen-invalid", "not-a-number"))
+
+    assert safe_openrouter_response_ids(messages) == (
+        "gen-missing",
+        "gen-invalid",
+    )
 
 
 def test_combination_preserves_amount_and_case_and_generation_coverage() -> None:

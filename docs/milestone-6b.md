@@ -173,7 +173,9 @@ generation counts. `observed` means every response in every covered case supplie
 evidence, `partial` means only an observed subtotal is known, and `unavailable` means no
 amount was observed. MLflow receives a floating-point cost metric only for fully observed
 future analysis runs; the exact terminal/report decimal remains authoritative. When that
-metric exists, report publication cross-checks it against the terminal evidence.
+metric exists, report publication cross-checks it against the terminal evidence. A
+per-case mean is rendered only for fully observed cost; partial coverage exposes its
+known subtotal but never treats unavailable cases as zero-cost cases.
 
 ## Markdown projection
 

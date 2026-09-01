@@ -34,8 +34,8 @@ from dsa.contract import ContractModel
 from dsa.cost import (
     ProviderCostSummary,
     combine_provider_costs,
-    observed_provider_response_ids,
     provider_cost_from_messages,
+    safe_openrouter_response_ids,
 )
 from dsa.evaluation import (
     MlflowEvaluationPrediction,
@@ -1410,7 +1410,7 @@ def _verify_terminal_record_at(
             raise ValueError("benchmark report terminal outcome does not match its receipt")
         return (
             provider_cost_from_messages(terminal.messages),
-            observed_provider_response_ids(terminal.messages),
+            safe_openrouter_response_ids(terminal.messages),
         )
     except ValueError:
         raise
@@ -1643,14 +1643,18 @@ def _format_provider_cost(value: ProviderCostSummary, case_count: int) -> str:
     amount = value.amount_decimal
     if amount is None:
         return "unavailable"
-    prefix = "" if value.status == "observed" else "partial "
-    mean = amount / case_count if case_count else amount
-    mean_text = format(mean, ".12f").rstrip("0").rstrip(".")
     generation_count = (
         value.observed_generation_count + value.unavailable_generation_count
     )
+    if value.status != "observed":
+        return (
+            f"partial ${value.observed_amount} observed; per-case mean unavailable; "
+            f"{value.observed_generation_count}/{generation_count} generations"
+        )
+    mean = amount / case_count if case_count else amount
+    mean_text = format(mean, ".12f").rstrip("0").rstrip(".")
     return (
-        f"{prefix}${value.observed_amount}; ${mean_text}/case; "
+        f"${value.observed_amount}; ${mean_text}/case; "
         f"{value.observed_generation_count}/{generation_count} generations"
     )
 

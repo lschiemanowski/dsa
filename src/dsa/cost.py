@@ -122,21 +122,18 @@ def provider_cost_from_messages(
     )
 
 
-def observed_provider_response_ids(
+def safe_openrouter_response_ids(
     messages: Iterable[Mapping[str, JsonValue]],
 ) -> tuple[str, ...]:
-    """Return safe response identities that contribute observed cost."""
+    """Return safe OpenRouter response identities independently of cost validity."""
     result: list[str] = []
     for message in messages:
-        raw_details = message.get("provider_details")
         response_id = message.get("provider_response_id")
         if (
             message.get("kind") == "response"
             and message.get("provider_name") == "openrouter"
             and isinstance(response_id, str)
             and _SAFE_RESPONSE_ID.fullmatch(response_id) is not None
-            and isinstance(raw_details, dict)
-            and _provider_amount(raw_details.get("cost")) is not None
         ):
             result.append(response_id)
     return tuple(result)

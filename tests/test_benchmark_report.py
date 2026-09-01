@@ -21,6 +21,7 @@ from dsa.benchmark_report import (
     BenchmarkReport,
     BenchmarkReportConfigurationError,
     MlflowBenchmarkEvidenceReader,
+    benchmark_report_markdown,
     build_benchmark_report,
     create_benchmark_report,
     publish_benchmark_report,
@@ -87,6 +88,7 @@ def retain_receipt_with_terminals(
     terminal_run_id: str | None = None,
     terminal_sha256: str | None = None,
     provider_costs: tuple[float | None, ...] = (0.001, 0.002),
+    provider_response_ids: tuple[str, ...] | None = None,
 ) -> BenchmarkCellReceipt:
     selected = BenchmarkCellReceipt.model_validate_json(selected_receipt.model_dump_json())
     cases = {
@@ -113,6 +115,12 @@ def retain_receipt_with_terminals(
                     message="classified benchmark failure",
                 )
             )
+        response_ids = provider_response_ids or tuple(
+            f"gen-{prediction.run_id}-{index}"
+            for index in range(1, len(provider_costs) + 1)
+        )
+        if len(response_ids) != len(provider_costs):
+            raise AssertionError("test provider response evidence is misaligned")
         terminal = TerminalRecord(
             run_id=terminal_run_id or prediction.run_id,
             started_at=started_at,
@@ -132,14 +140,16 @@ def retain_receipt_with_terminals(
                 {
                     "kind": "response",
                     "provider_name": "openrouter",
-                    "provider_response_id": (
-                        f"gen-{prediction.run_id}-{index}"
-                    ),
+                    "provider_response_id": response_id,
                     "provider_details": (
                         {"cost": cost} if cost is not None else {}
                     ),
                 }
-                for index, cost in enumerate(provider_costs, start=1)
+                for response_id, cost in zip(
+                    response_ids,
+                    provider_costs,
+                    strict=True,
+                )
             ),
             outcome=outcome,
         )
@@ -287,6 +297,9 @@ def test_report_marks_incomplete_provider_cost_evidence_as_partial(
     assert report.overall.provider_cost.incomplete_case_count == 1
     assert report.overall.provider_cost.observed_generation_count == 1
     assert report.overall.provider_cost.unavailable_generation_count == 1
+    markdown = benchmark_report_markdown(report)
+    assert "partial $0.001 observed; per-case mean unavailable" in markdown
+    assert "$0.001/case" not in markdown
 
 
 def test_report_cross_checks_mlflow_provider_cost_when_present(tmp_path: Path) -> None:
@@ -326,6 +339,35 @@ def test_report_cross_checks_mlflow_provider_cost_when_present(tmp_path: Path) -
             reporter_revision=REPORTER_REVISION,
             pack_loader=lambda _reference: prepared.packs[0][1],
             evidence_reader=reader,
+        )
+
+
+def test_report_rejects_response_id_reuse_when_one_cost_is_unavailable(
+    tmp_path: Path,
+) -> None:
+    prepared = prepared_benchmark(tmp_path, cells=2)
+    for index, cell in enumerate(prepared.cells):
+        invocation = BenchmarkCellInvocation.from_prepared(prepared, cell, 1)
+        base = receipt(invocation)
+        prediction = base.predictions[0].model_copy(
+            update={"run_id": f"run-reused-provider-id-{index}"}
+        )
+        selected = base.model_copy(update={"predictions": (prediction,)})
+        retain_receipt_with_terminals(
+            prepared,
+            invocation,
+            selected,
+            provider_costs=(0.001 if index == 0 else None,),
+            provider_response_ids=("gen-reused",),
+        )
+
+    with pytest.raises(ValueError, match="provider response identities must be unique"):
+        build_benchmark_report(
+            prepared.study,
+            prepared.runtime,
+            reporter_revision=REPORTER_REVISION,
+            pack_loader=lambda _reference: prepared.packs[0][1],
+            evidence_reader=EvidenceReader({}),
         )
 
 
