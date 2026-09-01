@@ -982,12 +982,10 @@ def _verify_projected_provider_cost(
     amount = provider_cost.amount_decimal
     if provider_cost.status != "observed" or amount is None:
         raise ValueError("MLflow provider cost contradicts terminal evidence")
-    if not math.isclose(
-        projected_amount,
-        float(amount),
-        rel_tol=0.0,
-        abs_tol=1e-12,
-    ) or projected_generations != provider_cost.observed_generation_count:
+    if (
+        projected_amount != float(amount)
+        or projected_generations != provider_cost.observed_generation_count
+    ):
         raise ValueError("MLflow provider cost contradicts terminal evidence")
 
 
@@ -1652,7 +1650,7 @@ def _format_provider_cost(value: ProviderCostSummary, case_count: int) -> str:
             f"{value.observed_generation_count}/{generation_count} generations"
         )
     mean = amount / case_count if case_count else amount
-    mean_text = format(mean, ".12f").rstrip("0").rstrip(".")
+    mean_text = format(mean, ".18g")
     return (
         f"${value.observed_amount}; ${mean_text}/case; "
         f"{value.observed_generation_count}/{generation_count} generations"

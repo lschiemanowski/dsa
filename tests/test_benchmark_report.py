@@ -302,6 +302,14 @@ def test_report_marks_incomplete_provider_cost_evidence_as_partial(
     assert "$0.001/case" not in markdown
 
 
+def test_report_preserves_a_positive_tiny_cost_in_markdown(tmp_path: Path) -> None:
+    report = build_report(tmp_path, provider_costs=(1e-13,))
+
+    markdown = benchmark_report_markdown(report)
+    assert "$0.0000000000001; $1e-13/case" in markdown
+    assert "$0/case" not in markdown
+
+
 def test_report_cross_checks_mlflow_provider_cost_when_present(tmp_path: Path) -> None:
     prepared, reader = complete_report_evidence(tmp_path)
     tracking = reader.runs["tracking-run"]
@@ -329,6 +337,50 @@ def test_report_cross_checks_mlflow_provider_cost_when_present(tmp_path: Path) -
             "metrics": {
                 **reader.runs["tracking-run"].metrics,
                 "dsa.provider_cost_usd": 0.004,
+            }
+        }
+    )
+    with pytest.raises(ValueError, match="cost contradicts terminal evidence"):
+        build_benchmark_report(
+            prepared.study,
+            prepared.runtime,
+            reporter_revision=REPORTER_REVISION,
+            pack_loader=lambda _reference: prepared.packs[0][1],
+            evidence_reader=reader,
+        )
+
+
+def test_report_rejects_zero_projection_for_a_positive_tiny_cost(
+    tmp_path: Path,
+) -> None:
+    prepared, reader = complete_report_evidence(
+        tmp_path,
+        provider_costs=(1e-13,),
+    )
+    tracking = reader.runs["tracking-run"]
+    reader.runs["tracking-run"] = tracking.model_copy(
+        update={
+            "metrics": {
+                **tracking.metrics,
+                "dsa.provider_cost_usd": 1e-13,
+                "dsa.provider_cost_generations": 1.0,
+            }
+        }
+    )
+    report = build_benchmark_report(
+        prepared.study,
+        prepared.runtime,
+        reporter_revision=REPORTER_REVISION,
+        pack_loader=lambda _reference: prepared.packs[0][1],
+        evidence_reader=reader,
+    )
+    assert report.overall.provider_cost.observed_amount == "0.0000000000001"
+
+    reader.runs["tracking-run"] = reader.runs["tracking-run"].model_copy(
+        update={
+            "metrics": {
+                **reader.runs["tracking-run"].metrics,
+                "dsa.provider_cost_usd": 0.0,
             }
         }
     )
