@@ -21,11 +21,13 @@ from dsa.benchmark_report import (
     BenchmarkReport,
     BenchmarkReportConfigurationError,
     MlflowBenchmarkEvidenceReader,
+    benchmark_report_markdown,
     build_benchmark_report,
     create_benchmark_report,
     publish_benchmark_report,
 )
 from dsa.contract import RunRequest
+from dsa.cost import unavailable_provider_cost
 from dsa.evaluation import MlflowEvaluationPrediction
 from dsa.pack import EvaluationCaseMetadata, EvaluationPackCase
 from dsa.record import Failure, RunFailure, RunSuccess, TerminalRecord, write_terminal_record
@@ -85,6 +87,8 @@ def retain_receipt_with_terminals(
     *,
     terminal_run_id: str | None = None,
     terminal_sha256: str | None = None,
+    provider_costs: tuple[float | None, ...] = (0.001, 0.002),
+    provider_response_ids: tuple[str, ...] | None = None,
 ) -> BenchmarkCellReceipt:
     selected = BenchmarkCellReceipt.model_validate_json(selected_receipt.model_dump_json())
     cases = {
@@ -111,6 +115,12 @@ def retain_receipt_with_terminals(
                     message="classified benchmark failure",
                 )
             )
+        response_ids = provider_response_ids or tuple(
+            f"gen-{prediction.run_id}-{index}"
+            for index in range(1, len(provider_costs) + 1)
+        )
+        if len(response_ids) != len(provider_costs):
+            raise AssertionError("test provider response evidence is misaligned")
         terminal = TerminalRecord(
             run_id=terminal_run_id or prediction.run_id,
             started_at=started_at,
@@ -125,6 +135,21 @@ def retain_receipt_with_terminals(
                 answer_schema=case.answer_schema,
                 model=invocation.model_configuration,
                 policy=invocation.policy,
+            ),
+            messages=tuple(
+                {
+                    "kind": "response",
+                    "provider_name": "openrouter",
+                    "provider_response_id": response_id,
+                    "provider_details": (
+                        {"cost": cost} if cost is not None else {}
+                    ),
+                }
+                for response_id, cost in zip(
+                    response_ids,
+                    provider_costs,
+                    strict=True,
+                )
             ),
             outcome=outcome,
         )
@@ -143,6 +168,7 @@ def complete_report_evidence(
     tmp_path: Path,
     *,
     accepted_answer: object = None,
+    provider_costs: tuple[float | None, ...] = (0.001, 0.002),
 ) -> tuple[PreparedBenchmark, EvidenceReader]:
     prepared = prepared_benchmark(tmp_path)
     invocation = BenchmarkCellInvocation.from_prepared(prepared, prepared.cells[0], 1)
@@ -158,6 +184,7 @@ def complete_report_evidence(
         prepared,
         invocation,
         selected_receipt,
+        provider_costs=provider_costs,
     )
     exact = accepted_answer in (None, {"count": 3})
     runs = {
@@ -190,10 +217,16 @@ def complete_report_evidence(
     return prepared, EvidenceReader(runs)
 
 
-def build_report(tmp_path: Path, *, accepted_answer: object = None) -> BenchmarkReport:
+def build_report(
+    tmp_path: Path,
+    *,
+    accepted_answer: object = None,
+    provider_costs: tuple[float | None, ...] = (0.001, 0.002),
+) -> BenchmarkReport:
     prepared, reader = complete_report_evidence(
         tmp_path,
         accepted_answer=accepted_answer,
+        provider_costs=provider_costs,
     )
     return build_benchmark_report(
         prepared.study,
@@ -223,7 +256,16 @@ def test_report_recomputes_exact_counts_and_observed_usage(tmp_path: Path) -> No
     assert report.overall.metrics.infrastructure_failure.numerator == 0
     assert report.overall.observations.elapsed_seconds.total == 2.5
     assert report.overall.observations.total_tokens.total == 125.0
-    assert report.provider_cost.status == "unavailable"
+    assert report.overall.provider_cost.model_dump() == {
+        "status": "observed",
+        "observed_amount": "0.003",
+        "currency": "USD",
+        "source": "openrouter_usage_cost",
+        "complete_case_count": 1,
+        "incomplete_case_count": 0,
+        "observed_generation_count": 2,
+        "unavailable_generation_count": 0,
+    }
     assert report.cells[0].cases[0].end_to_end_exact_success is True
     assert report.cells[0].cases[0].end_to_end_policy_success is True
     assert not hasattr(report.cells[0].cases[0], "answer")
@@ -242,6 +284,143 @@ def test_report_uses_task_counts_instead_of_averaging_cell_rates(
     assert report.overall.metrics.agent_failure.numerator == 1
     assert report.overall.metrics.infrastructure_failure.numerator == 0
     assert report.cells[0].cases[0].conditional_exact_json is False
+
+
+def test_report_marks_incomplete_provider_cost_evidence_as_partial(
+    tmp_path: Path,
+) -> None:
+    report = build_report(tmp_path, provider_costs=(0.001, None))
+
+    assert report.overall.provider_cost.status == "partial"
+    assert report.overall.provider_cost.observed_amount == "0.001"
+    assert report.overall.provider_cost.complete_case_count == 0
+    assert report.overall.provider_cost.incomplete_case_count == 1
+    assert report.overall.provider_cost.observed_generation_count == 1
+    assert report.overall.provider_cost.unavailable_generation_count == 1
+    markdown = benchmark_report_markdown(report)
+    assert "partial $0.001 observed; per-case mean unavailable" in markdown
+    assert "$0.001/case" not in markdown
+
+
+def test_report_preserves_a_positive_tiny_cost_in_markdown(tmp_path: Path) -> None:
+    report = build_report(tmp_path, provider_costs=(1e-13,))
+
+    markdown = benchmark_report_markdown(report)
+    assert "$0.0000000000001; $1e-13/case" in markdown
+    assert "$0/case" not in markdown
+
+
+def test_report_cross_checks_mlflow_provider_cost_when_present(tmp_path: Path) -> None:
+    prepared, reader = complete_report_evidence(tmp_path)
+    tracking = reader.runs["tracking-run"]
+    reader.runs["tracking-run"] = tracking.model_copy(
+        update={
+            "metrics": {
+                **tracking.metrics,
+                "dsa.provider_cost_usd": 0.003,
+                "dsa.provider_cost_generations": 2.0,
+            }
+        }
+    )
+
+    report = build_benchmark_report(
+        prepared.study,
+        prepared.runtime,
+        reporter_revision=REPORTER_REVISION,
+        pack_loader=lambda _reference: prepared.packs[0][1],
+        evidence_reader=reader,
+    )
+    assert report.overall.provider_cost.observed_amount == "0.003"
+
+    reader.runs["tracking-run"] = reader.runs["tracking-run"].model_copy(
+        update={
+            "metrics": {
+                **reader.runs["tracking-run"].metrics,
+                "dsa.provider_cost_usd": 0.004,
+            }
+        }
+    )
+    with pytest.raises(ValueError, match="cost contradicts terminal evidence"):
+        build_benchmark_report(
+            prepared.study,
+            prepared.runtime,
+            reporter_revision=REPORTER_REVISION,
+            pack_loader=lambda _reference: prepared.packs[0][1],
+            evidence_reader=reader,
+        )
+
+
+def test_report_rejects_zero_projection_for_a_positive_tiny_cost(
+    tmp_path: Path,
+) -> None:
+    prepared, reader = complete_report_evidence(
+        tmp_path,
+        provider_costs=(1e-13,),
+    )
+    tracking = reader.runs["tracking-run"]
+    reader.runs["tracking-run"] = tracking.model_copy(
+        update={
+            "metrics": {
+                **tracking.metrics,
+                "dsa.provider_cost_usd": 1e-13,
+                "dsa.provider_cost_generations": 1.0,
+            }
+        }
+    )
+    report = build_benchmark_report(
+        prepared.study,
+        prepared.runtime,
+        reporter_revision=REPORTER_REVISION,
+        pack_loader=lambda _reference: prepared.packs[0][1],
+        evidence_reader=reader,
+    )
+    assert report.overall.provider_cost.observed_amount == "0.0000000000001"
+
+    reader.runs["tracking-run"] = reader.runs["tracking-run"].model_copy(
+        update={
+            "metrics": {
+                **reader.runs["tracking-run"].metrics,
+                "dsa.provider_cost_usd": 0.0,
+            }
+        }
+    )
+    with pytest.raises(ValueError, match="cost contradicts terminal evidence"):
+        build_benchmark_report(
+            prepared.study,
+            prepared.runtime,
+            reporter_revision=REPORTER_REVISION,
+            pack_loader=lambda _reference: prepared.packs[0][1],
+            evidence_reader=reader,
+        )
+
+
+def test_report_rejects_response_id_reuse_when_one_cost_is_unavailable(
+    tmp_path: Path,
+) -> None:
+    prepared = prepared_benchmark(tmp_path, cells=2)
+    for index, cell in enumerate(prepared.cells):
+        invocation = BenchmarkCellInvocation.from_prepared(prepared, cell, 1)
+        base = receipt(invocation)
+        prediction = base.predictions[0].model_copy(
+            update={"run_id": f"run-reused-provider-id-{index}"}
+        )
+        selected = base.model_copy(update={"predictions": (prediction,)})
+        retain_receipt_with_terminals(
+            prepared,
+            invocation,
+            selected,
+            provider_costs=(0.001 if index == 0 else None,),
+            provider_response_ids=("gen-reused",),
+        )
+
+    with pytest.raises(ValueError, match="provider response identities must be unique"):
+        build_benchmark_report(
+            prepared.study,
+            prepared.runtime,
+            reporter_revision=REPORTER_REVISION,
+            pack_loader=lambda _reference: prepared.packs[0][1],
+            evidence_reader=EvidenceReader({}),
+        )
 
 
 def test_report_keeps_tolerance_policy_matches_distinct_from_exactness(
@@ -471,7 +650,9 @@ def test_publication_is_deterministic_idempotent_and_no_overwrite(
     markdown = first.markdown_path.read_text()
     assert f"Report JSON SHA-256: `{report.sha256}`" in markdown
     assert "1/1 (1.000000)" in markdown
-    assert "Provider cost: unavailable" in markdown
+    assert "Provider inference cost (OpenRouter usage, USD): $0.003" in markdown
+    assert first.json_path.name.endswith(".report-v3.json")
+    assert first.markdown_path.name.endswith(".report-v3.md")
     assert str(tmp_path) not in markdown
 
     first.markdown_path.write_text("different\n")
@@ -503,6 +684,17 @@ def test_report_model_rejects_cell_metrics_changed_after_derivation(
         BenchmarkReport.model_validate(value)
 
 
+def test_report_model_rejects_cell_cost_changed_after_derivation(
+    tmp_path: Path,
+) -> None:
+    report = build_report(tmp_path)
+    value = report.model_dump(mode="python")
+    value["cells"][0]["provider_cost"]["observed_amount"] = "0.004"
+
+    with pytest.raises(ValueError, match="cell provider cost"):
+        BenchmarkReport.model_validate(value)
+
+
 def test_report_case_rejects_exact_success_without_a_policy_match() -> None:
     with pytest.raises(ValueError, match="exact match must satisfy the pack policy"):
         BenchmarkCaseOutcome(
@@ -521,6 +713,7 @@ def test_report_case_rejects_exact_success_without_a_policy_match() -> None:
             conditional_policy_match=False,
             agent_failure=True,
             infrastructure_failure=False,
+            provider_cost=unavailable_provider_cost(),
         )
 
 
@@ -589,6 +782,11 @@ def test_report_aggregates_multiple_cells_from_case_counts(tmp_path: Path) -> No
     ]
     assert report.overall.observations.total_tokens.total == 201.0
     assert report.overall.observations.total_tokens.observed_count == 2
+    assert report.overall.provider_cost.observed_amount == "0.006"
+    assert [item.result.provider_cost.observed_amount for item in report.models] == [
+        "0.003",
+        "0.003",
+    ]
 
 
 def test_report_rejects_a_symlinked_cell_directory(tmp_path: Path) -> None:
@@ -691,7 +889,7 @@ def test_failed_reporting_has_no_conditional_mlflow_exception(
     assert report.overall.metrics.conditional_exact_accuracy.rate is None
     assert report.overall.metrics.infrastructure_failure.numerator == 1
     assert reader.requested == ["evaluation-run"]
-    assert json.loads(report.canonical_json)["format"] == "dsa-benchmark-report/v2"
+    assert json.loads(report.canonical_json)["format"] == "dsa-benchmark-report/v3"
 
 
 def test_mlflow_reader_retains_only_the_bounded_safe_projection() -> None:

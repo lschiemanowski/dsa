@@ -16,6 +16,7 @@ from typing import Any, Literal, Protocol, Self, cast
 from pydantic import JsonValue, field_validator, model_validator
 
 from dsa.contract import ContractModel, RunRequest
+from dsa.cost import provider_cost_from_messages
 from dsa.record import RetainedTerminalRecord, RunFailure, TerminalRecord
 
 
@@ -387,6 +388,27 @@ class _MlflowBackend:
             value = record.usage.get(key)
             if type(value) in (int, float):
                 metrics.append(self.metric_type(f"dsa.usage.{key}", value, timestamp, 0))
+        provider_cost = provider_cost_from_messages(record.messages)
+        if (
+            provider_cost.status == "observed"
+            and provider_cost.observed_amount is not None
+        ):
+            metrics.extend(
+                [
+                    self.metric_type(
+                        "dsa.provider_cost_usd",
+                        float(provider_cost.observed_amount),
+                        timestamp,
+                        0,
+                    ),
+                    self.metric_type(
+                        "dsa.provider_cost_generations",
+                        provider_cost.observed_generation_count,
+                        timestamp,
+                        0,
+                    ),
+                ]
+            )
         params = [
             self.param_type("dsa.model_name", record.request.model.name),
             self.param_type("dsa.schema_version", record.schema_version),
@@ -394,6 +416,7 @@ class _MlflowBackend:
         tags = [
             self.tag_type("dsa.run_id", record.run_id),
             self.tag_type("dsa.outcome", record.outcome.status),
+            self.tag_type("dsa.provider_cost_status", provider_cost.status),
         ]
         if isinstance(record.outcome, RunFailure):
             tags.extend(

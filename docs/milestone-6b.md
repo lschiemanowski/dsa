@@ -15,7 +15,7 @@ never inserted automatically.
 ## Publication unit and identity
 
 One exact `dsa-benchmark-study/v1` contract produces at most one
-`dsa-benchmark-report/v2` report for a given reporter revision. A report covers the
+`dsa-benchmark-report/v3` report for a given reporter revision. A report covers the
 study's complete pack-model-repetition matrix; reports are not split by model, pack, or
 repetition.
 
@@ -32,7 +32,8 @@ Publication time belongs to the later repository commit or release, not the benc
 result identity.
 
 The output basename is the safe study identity followed by the full study digest. The
-publisher writes `<basename>.report.json` and `<basename>.report.md`. Each file is
+publisher writes `<basename>.report-v3.json` and `<basename>.report-v3.md`. The
+versioned names allow publication beside an earlier immutable report. Each file is
 published atomically without overwriting different existing bytes. An interrupted
 publication may be resumed only when every already-published file exactly matches the
 bytes being produced; a conflict fails closed. Command success requires both complete
@@ -84,7 +85,7 @@ execution revision; the report separately retains the clean reporting revision.
 
 ## Canonical report content
 
-`dsa-benchmark-report/v2` contains:
+`dsa-benchmark-report/v3` contains:
 
 - the complete canonical study and its SHA-256 digest;
 - the clean reporter Git revision;
@@ -95,7 +96,8 @@ execution revision; the report separately retains the clean reporting revision.
   case count, and derived cell metrics;
 - one ordered case outcome per cell containing only the case, run, terminal-record, and
   safe MLflow identities; accepted state; stable failure stage and code when present;
-  reporting state; and the six exact, policy, and failure scorer outcomes;
+  reporting state; the six exact, policy, and failure scorer outcomes; and a bounded
+  provider-cost summary derived from that case's verified terminal record;
 - task-weighted aggregates for the complete study, for each model, for each pack-model
   pair, and for each cell; and
 - bounded observed latency and usage summaries read from the exact reported analysis
@@ -156,11 +158,24 @@ receipts. Every summary states how many case executions supplied an observation 
 many did not. Totals and arithmetic means are calculated only over observed values;
 missing observations are never treated as zero.
 
-Provider cost is never estimated from a pricing table. A cost summary may contain a
-value only when a future stable retained telemetry field identifies the observed amount,
-currency, and source unambiguously. The current reporting boundary retains no such
-field, so Milestone 6B reports provider cost as unavailable and does not scrape raw trace
-payloads to approximate it.
+Provider cost is never estimated from a pricing table or scraped from raw trace
+payloads. Report v3 derives it from the billed `cost` value that Pydantic AI retains in
+each OpenRouter model response. Amounts are summed as exact decimal USD values from the
+same canonical terminal bytes whose digest and outcome were already verified. Response
+identities must be safe; reuse across terminal records rejects the report. Non-OpenRouter
+responses, missing or invalid amounts, and duplicates within one case reduce explicit
+coverage rather than becoming zero-cost generations. Parsed message histories are
+discarded after this bounded evidence is extracted.
+
+Each case, cell, model, pack-model pair, and complete study retains the observed subtotal,
+source, currency, complete and incomplete case counts, and observed and unavailable
+generation counts. `observed` means every response in every covered case supplied valid
+evidence, `partial` means only an observed subtotal is known, and `unavailable` means no
+amount was observed. MLflow receives a floating-point cost metric only for fully observed
+future analysis runs; the exact terminal/report decimal remains authoritative. When that
+metric exists, report publication cross-checks it against the terminal evidence. A
+per-case mean is rendered only for fully observed cost; partial coverage exposes its
+known subtotal but never treats unavailable cases as zero-cost cases.
 
 ## Markdown projection
 
@@ -196,7 +211,8 @@ mutation resistance, complete-matrix enforcement, receipt and pack verification,
 terminal-byte hashing and run correlation, remote-ID correlation, completed active
 MLflow lifecycle enforcement, MLflow mismatch rejection, all metric denominators, zero
 accepted answers, task-weighted aggregation, repetition handling, observation coverage,
-secret and answer exclusion, deterministic Markdown, atomic no-overwrite publication,
+exact provider-cost aggregation and coverage, secret and answer exclusion,
+deterministic Markdown, atomic no-overwrite publication,
 idempotent recovery, bounded reads, CLI framing, and zero model execution.
 
 Offline tests use fixed packs, receipts, and a narrow fake of the pinned MLflow client
