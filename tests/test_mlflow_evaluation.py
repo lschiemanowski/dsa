@@ -844,7 +844,7 @@ def test_native_mlflow_api_executes_one_analysis_per_dataset_row(
     assert "MLFLOW_GENAI_EVAL_SKIP_TRACE_VALIDATION" not in os.environ
 
 
-def test_native_evaluation_rejects_local_or_incomplete_tracking_configuration(
+def test_native_evaluation_rejects_unsupported_tracking_configuration(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

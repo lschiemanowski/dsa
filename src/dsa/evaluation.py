@@ -19,6 +19,7 @@ from pydantic_ai.models import Model
 
 from dsa.contract import ContractModel, ModelConfiguration, RunPolicy, RunRequest
 from dsa.environment import PythonExecutor
+from dsa.mlflow_config import mlflow_configuration_failure
 from dsa.pack import (
     EvaluationPackCase,
     ExactJsonScorer,
@@ -455,12 +456,7 @@ def _verify_pack_database(pack: LoadedEvaluationPack) -> None:
 
 
 def _evaluation_configuration_failure() -> str | None:
-    if os.environ.get("MLFLOW_TRACKING_URI") != "databricks":
-        return "mlflow_tracking_uri_invalid"
-    required = ("MLFLOW_EXPERIMENT_ID", "DATABRICKS_HOST", "DATABRICKS_TOKEN")
-    if any(not os.environ.get(key, "").strip() for key in required):
-        return "mlflow_configuration_missing"
-    return None
+    return mlflow_configuration_failure(os.environ)
 
 
 def _canonical_run_tags(value: dict[str, str] | None) -> dict[str, str]:

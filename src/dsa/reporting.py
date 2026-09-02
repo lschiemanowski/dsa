@@ -1,4 +1,4 @@
-"""Optional Databricks MLflow projection of canonical DSA runs."""
+"""Optional MLflow projection of canonical DSA runs."""
 
 from __future__ import annotations
 
@@ -17,6 +17,11 @@ from pydantic import JsonValue, field_validator, model_validator
 
 from dsa.contract import ContractModel, RunRequest
 from dsa.cost import provider_cost_from_messages
+from dsa.mlflow_config import (
+    MlflowConfigurationError,
+    load_mlflow_configuration,
+    mlflow_configuration_failure,
+)
 from dsa.record import RetainedTerminalRecord, RunFailure, TerminalRecord
 
 
@@ -160,13 +165,14 @@ class _MlflowBackend:
                 raise
             return completion.with_reporting(MlflowReporting())
 
-        failure_code = _configuration_failure()
-        if failure_code is not None:
-            return await self._run_without_export(operation, failure_code)
+        try:
+            configuration = load_mlflow_configuration(os.environ)
+        except MlflowConfigurationError as error:
+            return await self._run_without_export(operation, error.code)
 
         try:
             _ensure_autolog(self.pydantic_ai)
-            experiment_id = os.environ["MLFLOW_EXPERIMENT_ID"]
+            experiment_id = configuration.experiment_id
             destination = self.location_type(experiment_id=experiment_id)
         except Exception:
             return await self._run_without_export(operation, "mlflow_setup_failed")
@@ -233,6 +239,7 @@ class _MlflowBackend:
                 experiment_id,
                 trace_id,
                 completion,
+                tracking_uri=configuration.tracking_uri,
             )
         except asyncio.CancelledError as error:
             retained_error = cast(Any, error)
@@ -296,6 +303,7 @@ class _MlflowBackend:
         trace_id: str,
         completion: _ReportableCompletion,
         *,
+        tracking_uri: str | None = None,
         terminal_status: str = "FINISHED",
     ) -> MlflowReporting:
         try:
@@ -314,7 +322,7 @@ class _MlflowBackend:
             tracking_run_id: str | None = None
             created_run_id: str | None = None
             try:
-                client = self.client_type(tracking_uri="databricks")
+                client = self.client_type(tracking_uri=tracking_uri or "databricks")
                 tracking_run = client.create_run(
                     experiment_id,
                     tags={
@@ -438,12 +446,7 @@ def _ensure_autolog(pydantic_ai_integration: Any) -> None:
 
 
 def _configuration_failure() -> str | None:
-    if os.environ.get("MLFLOW_TRACKING_URI") != "databricks":
-        return "mlflow_tracking_uri_invalid"
-    required = ("MLFLOW_EXPERIMENT_ID", "DATABRICKS_HOST", "DATABRICKS_TOKEN")
-    if any(not os.environ.get(key, "").strip() for key in required):
-        return "mlflow_configuration_missing"
-    return None
+    return mlflow_configuration_failure(os.environ)
 
 
 def _verified_terminal_text(retained: RetainedTerminalRecord) -> str:

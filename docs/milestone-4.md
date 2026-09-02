@@ -1,8 +1,8 @@
-# Milestone 4: opt-in Databricks MLflow observability
+# Milestone 4: opt-in MLflow observability
 
 ## Objective
 
-Any analysis run may opt into Databricks MLflow observability through the operator-level
+Any analysis run may opt into MLflow observability through the operator-level
 `report_to_mlflow=True` argument. Reporting is a projection of an already canonical DSA
 run: it never changes the request seen by the model, the analysis outcome, or the retained
 `terminal.json` bytes.
@@ -17,15 +17,19 @@ MLflow support is an optional `dsa[mlflow]` dependency pinned to the version exe
 this milestone. Disabled runs do not require MLflow. An enabled run reads only these
 operator-owned environment variables:
 
-- `MLFLOW_TRACKING_URI`, which must be exactly `databricks`
+- `MLFLOW_TRACKING_URI`, either exactly `databricks`, a loopback HTTP tracking server,
+  or an HTTPS tracking server
 - `MLFLOW_EXPERIMENT_ID`
-- `DATABRICKS_HOST`
-- `DATABRICKS_TOKEN`
+- `DATABRICKS_HOST`, required only for the Databricks backend
+- `DATABRICKS_TOKEN`, required only for the Databricks backend
 
-There is no local tracking server, local MLflow database, implicit experiment creation,
-or fallback tracking destination. Missing dependencies, invalid configuration, Databricks
-unavailability, and export failures produce a stable safe reporting failure code. They do
-not convert a completed DSA analysis success into an analysis failure.
+There is no implicit experiment creation or fallback tracking destination. Direct
+filesystem and SQLite tracking URIs are rejected: local operation goes through an HTTP
+tracking server so concurrent benchmark workers share one service boundary. Plain HTTP
+is accepted only for `localhost`, `127.0.0.1`, or `::1`; remote tracking servers require
+HTTPS. Missing dependencies, invalid configuration, backend unavailability, and export
+failures produce a stable safe reporting failure code. They do not convert a completed
+DSA analysis success into an analysis failure.
 
 Pydantic AI autologging is initialized once per process. Every analysis enters an
 async-context-local MLflow tracing policy from its beginning, including disabled runs, so
@@ -39,12 +43,12 @@ tool child spans. The implementation does not use MLflow's process-global active
 `RunCompletion` includes one operator-visible reporting result:
 
 - `disabled`
-- `reported`, with the Databricks tracking run ID and trace ID
+- `reported`, with the MLflow tracking run ID and trace ID
 - `failed`, with a stable safe failure code
 
 This result is deliberately absent from `RunRequest`, the model prompt and tools,
 `RunPolicy`, and `TerminalRecord`. The canonical local terminal file remains the source of
-truth even when Databricks reporting fails.
+truth even when MLflow reporting fails.
 
 An enabled successful export includes:
 
@@ -54,9 +58,9 @@ An enabled successful export includes:
 - bounded safe run tags and numeric metrics
 
 It never uploads retained artifact contents, the DuckDB database, the private run
-workspace, provider credentials, Databricks credentials, or raw reporting exceptions.
-The flag constitutes an explicit operator choice to send the trace and terminal record to
-the configured Databricks workspace.
+workspace, provider credentials, backend credentials, or raw reporting exceptions. The
+flag constitutes an explicit operator choice to send the trace and terminal record to the
+configured MLflow destination.
 
 ## Native evaluation slice
 
@@ -81,7 +85,7 @@ uses six explicit scorers:
   reporting failure
 
 Pack-backed evaluation transports the expected answer and comparison policy as canonical
-JSON strings inside `expectations`, preventing Databricks from changing integer JSON
+JSON strings inside `expectations`, preventing a dataset transport from changing integer JSON
 leaves into floating-point values. The default policy remains exact canonical JSON. An
 explicit numeric-tolerance policy applies only to expected floating-point leaves;
 expected integers, booleans, strings, nulls, object keys, and array structure remain
@@ -94,11 +98,11 @@ analysis twice. Native MLflow evaluation is itself documented as not thread-safe
 run-timeout, model-usage-limit, and tool-result-limit terminal codes count as
 infrastructure failures alongside internal orchestration errors.
 
-The live acceptance case uses a generated tiny DuckDB database and a deterministic
-scripted Pydantic AI model. It proves native Databricks dataset creation, one evaluation,
-one DSA tracking run in addition to the native evaluation run, the expected trace shape,
-exact scoring, and exact terminal-record upload. It is opt-in and is reported as skipped
-when credentials are unavailable.
+The live acceptance cases use a generated tiny DuckDB database and a deterministic
+scripted Pydantic AI model. They prove native dataset creation, one evaluation, one DSA
+tracking run in addition to the native evaluation run, the expected trace shape, exact
+scoring, and exact terminal-record upload. Each backend test is opt-in and is reported as
+skipped when its explicit environment is unavailable.
 
 ## Acceptance evidence
 
@@ -108,11 +112,10 @@ and manifest projection, concurrency-local tracing choice, expectation separatio
 JSON comparison, and failure classification. Existing tests continue to prove the local
 canonical lifecycle.
 
-The separately invoked Databricks tier is the only evidence for the real remote boundary.
-A skipped live test is not reported as Databricks evidence. The Pydantic AI trace is
-inspected explicitly because the MLflow integration's published compatibility range may
-lag the pinned Pydantic AI version.
+The separately invoked Databricks and local-server tiers are the evidence for their real
+backend boundaries. A skipped live test is not reported as backend evidence. The Pydantic
+AI trace is inspected explicitly because the MLflow integration's published compatibility
+range may lag the pinned Pydantic AI version.
 
 Hugging Face evaluation packs, Online Retail II, live model providers, benchmark matrices,
-CLI orchestration, local MLflow backends, and custom tracing instrumentation remain outside
-this milestone.
+CLI orchestration, and custom tracing instrumentation remain outside this milestone.

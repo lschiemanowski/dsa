@@ -11,7 +11,7 @@ conversational task-definition system.
 ## Current milestone
 
 Milestone 6A adds isolated, resumable benchmark orchestration over the content-pinned
-Hugging Face packs and native Databricks MLflow evaluation path:
+Hugging Face packs and native MLflow evaluation path:
 
 - strict, serializable request and policy models
 - JSON Schema Draft 2020-12 validation
@@ -36,20 +36,21 @@ Hugging Face packs and native Databricks MLflow evaluation path:
 - default cleanup of private working databases with an operator-only debug override
 - direct final answers or same-run retained JSON final answers
 - an operator-only `report_to_mlflow` flag with context-local Pydantic AI tracing
-- exact terminal-record and artifact-manifest metadata export to Databricks
+- exact terminal-record and artifact-manifest metadata export to MLflow
 - native MLflow Evaluation Datasets with lossless host-only expectations and pack scorers
 - one immutable public Online Retail II pack containing twenty evaluation cases
 - exact Hugging Face repository revision, manifest, case-export, and database identities
 - immutable content-addressed benchmark studies and deterministic matrix expansion
 - fresh subprocesses and private attempts for every pack-model-repetition cell
 - separate explicit MLflow case-worker and benchmark cell-worker bounds
-- atomic no-overwrite local receipts correlated to tagged Databricks evaluation runs
+- atomic no-overwrite local receipts correlated to tagged MLflow evaluation runs
 - conservative explicit resume that never guesses about ambiguous remote work
-- runtime-only workspace paths, Databricks dataset names, and secrets outside study identity
+- runtime-only workspace paths, MLflow dataset names, and secrets outside study identity
 
 Model-authored Python is never executed on the host. The `run_python` tool is
-registered only when the host injects an executor. MLflow reporting uses Databricks
-only; a local MLflow server or tracking database is not part of the design.
+registered only when the host injects an executor. MLflow reporting supports either
+Databricks or a configured MLflow tracking server. See
+[`docs/local-mlflow.md`](docs/local-mlflow.md) for the loopback server setup.
 
 ## Public boundary
 
@@ -104,8 +105,10 @@ executor = DockerPythonExecutor(default_docker_configuration("sha256:<64 hex dig
 completion = await run_analysis(request, python_executor=executor)
 ```
 
-Install the optional dependencies and provide operator-owned Databricks runtime
-configuration to resolve packs and report any ordinary run:
+Install the optional dependencies and provide operator-owned MLflow runtime
+configuration to resolve packs and report any ordinary run. This example uses
+Databricks; the [local MLflow guide](docs/local-mlflow.md) provides the equivalent
+tracking-server configuration:
 
 ```text
 uv sync --all-groups --extra huggingface --extra mlflow --frozen
@@ -142,7 +145,7 @@ reference = HuggingFacePackReference.model_validate_json(
 pack = load_huggingface_evaluation_pack(reference)
 result = run_mlflow_evaluation(
     pack,
-    dataset_name="<databricks-unity-catalog-dataset>",
+    dataset_name="<mlflow-dataset-name>",
     runs_directory=Path("runs"),
     model_configuration=request.model,
     policy=request.policy,
@@ -159,12 +162,13 @@ and executor configuration remain host runtime bindings.
 
 Benchmark studies bind exact pack references, model configurations, policy, Docker image,
 concurrency, repetitions, and the exact agent Git revision. Runtime files bind only a new
-local workspace and one distinct `catalog.schema.table` Databricks dataset per pack. Both
-inputs must be canonical JSON. Preflight resolves every pack, checks the already-present
-immutable Docker image, requires Databricks configuration, and verifies the running Git
-revision before starting any cell. Tracked or untracked implementation changes under
-`src/dsa`, `pyproject.toml`, or `uv.lock` are rejected because they are not represented by
-that revision:
+local workspace and one distinct MLflow dataset per pack. Databricks uses a
+`catalog.schema.table` Unity Catalog name; a tracking server accepts a safe plain name.
+Both inputs must be canonical JSON. Preflight resolves every pack, checks the
+already-present immutable Docker image, requires the selected MLflow configuration, and
+verifies the running Git revision before starting any cell. Tracked or untracked changes
+under `src/dsa`, `pyproject.toml`, or `uv.lock` are rejected because they are not
+represented by that revision:
 
 ```text
 dsa-benchmark plan --study study.json --runtime runtime.json
@@ -177,7 +181,7 @@ dsa-benchmark report --study study.json --runtime runtime.json --output reports
 write. `--resume` skips only a locally verified completed receipt. A partial attempt or
 unverifiable receipt is reported as ambiguous and preserved for operator inspection.
 `report` requires a complete matrix of verified receipts, reads only their exact
-Databricks MLflow runs, recomputes the existing scorers against the pinned packs, and
+MLflow runs, recomputes the existing scorers against the pinned packs, and
 atomically publishes canonical JSON plus deterministic Markdown without running a
 model or modifying remote state. Literal exactness and pack-policy matches are retained
 as separate metrics, so an allowed floating-point tolerance never inflates exact
