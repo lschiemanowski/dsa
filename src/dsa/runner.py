@@ -25,6 +25,7 @@ from pydantic import Field, JsonValue, model_validator
 from pydantic import ValidationError as PydanticValidationError
 from pydantic_ai import (
     Agent,
+    InlineDefsJsonSchemaTransformer,
     ModelAPIError,
     ModelHTTPError,
     ModelRequestNode,
@@ -678,7 +679,7 @@ def _framework_schema(
         return {
             "type": "object",
             "properties": {
-                "answer": deepcopy(caller_schema),
+                "answer": _inlined_answer_schema(caller_schema),
                 "derivation": _derivation_schema(),
             },
             "required": ["answer", "derivation"],
@@ -692,6 +693,10 @@ def _framework_schema(
         "required": ["value"],
         "additionalProperties": False,
     }
+
+
+def _inlined_answer_schema(caller_schema: dict[str, JsonValue]) -> dict[str, Any]:
+    return InlineDefsJsonSchemaTransformer(deepcopy(caller_schema)).walk()
 
 
 def _derivation_schema() -> dict[str, Any]:

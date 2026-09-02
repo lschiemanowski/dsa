@@ -21,7 +21,7 @@ from pydantic_ai.models.test import TestModel
 from dsa import RunFailure, RunRequest, RunSuccess, run_analysis
 from dsa.environment import PythonExecutionRequest, PythonExecutionResult
 
-from .test_contract import DRAFT_2020_12, request_value
+from .test_contract import DRAFT_2020_12, local_reference_answer_schema, request_value
 from .test_derivation import ClassifiedFailureExecutor, ResultExecutor, sample_derivation
 
 
@@ -160,6 +160,40 @@ async def test_opted_in_derivation_is_replayed_and_retained_with_a_notebook(
     assert retained["request"]["derivation"] == {"format": "dsa-derivation/v1"}
     assert retained["outcome"]["derivation"]["cells"][0]["type"] == "markdown"
     assert retained["outcome"]["derivation_verification"]["status"] == "verified"
+
+
+async def test_derivation_envelope_preserves_local_answer_schema_references(
+    tmp_path: Path,
+) -> None:
+    request = valid_request(tmp_path)
+    caller_schema = local_reference_answer_schema()
+    request = RunRequest.model_validate(
+        {
+            **request.model_dump(mode="python", round_trip=True),
+            "answer_schema": caller_schema,
+            "derivation": {"format": "dsa-derivation/v1"},
+        }
+    )
+
+    completion = await run_analysis(
+        request,
+        runs_directory=tmp_path / "runs",
+        model=TestModel(
+            call_tools=[],
+            custom_output_args={
+                "answer": {"count": 3},
+                "derivation": sample_derivation().model_dump(mode="json"),
+            },
+        ),
+        python_executor=ResultExecutor({"count": 3}),
+        identity_factory=lambda: "run-derived-local-reference",
+        clock=clock(),
+    )
+
+    assert isinstance(completion.outcome, RunSuccess)
+    assert completion.outcome.answer == {"count": 3}
+    assert completion.record.request.answer_schema == caller_schema
+    assert "$id" not in completion.record.request.answer_schema
 
 
 async def test_answer_only_run_keeps_legacy_terminal_and_creates_no_notebook(

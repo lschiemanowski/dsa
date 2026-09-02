@@ -11,6 +11,18 @@ from pydantic import JsonValue, ValidationError
 from dsa import Derivation, ModelConfiguration, RunPolicy, RunRequest
 
 DRAFT_2020_12 = "https://json-schema.org/draft/2020-12/schema"
+
+
+def local_reference_answer_schema() -> dict[str, object]:
+    return {
+        "$schema": DRAFT_2020_12,
+        "$defs": {"count": {"type": "integer", "minimum": 0}},
+        "type": "object",
+        "properties": {"count": {"$ref": "#/$defs/count"}},
+        "required": ["count"],
+    }
+
+
 ANSWER_SCHEMA = {
     "$schema": DRAFT_2020_12,
     "type": "object",
@@ -164,13 +176,7 @@ def test_answer_contract_must_be_valid_draft_2020_12(
 
 def test_answer_contract_allows_local_refs_but_rejects_external_refs(tmp_path: Path) -> None:
     local = request_value(tmp_path / "source.duckdb")
-    local["answer_schema"] = {
-        "$schema": DRAFT_2020_12,
-        "$defs": {"count": {"type": "integer", "minimum": 0}},
-        "type": "object",
-        "properties": {"count": {"$ref": "#/$defs/count"}},
-        "required": ["count"],
-    }
+    local["answer_schema"] = local_reference_answer_schema()
     external = deepcopy(local)
     external_schema = external["answer_schema"]
     assert isinstance(external_schema, dict)
