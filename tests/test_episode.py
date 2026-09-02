@@ -17,6 +17,7 @@ from pydantic_ai import ModelAPIError, ModelHTTPError
 from pydantic_ai.messages import ModelResponse, ToolCallPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.models.test import TestModel
+from pydantic_ai.profiles.openai import OpenAIJsonSchemaTransformer
 
 from dsa import RunFailure, RunRequest, RunSuccess, run_analysis
 from dsa.environment import PythonExecutionRequest, PythonExecutionResult
@@ -194,6 +195,130 @@ async def test_derivation_envelope_preserves_local_answer_schema_references(
     assert completion.outcome.answer == {"count": 3}
     assert completion.record.request.answer_schema == caller_schema
     assert "$id" not in completion.record.request.answer_schema
+
+
+@pytest.mark.parametrize(
+    ("caller_schema", "answer"),
+    [
+        (
+            {
+                "$schema": DRAFT_2020_12,
+                "type": "object",
+                "properties": {
+                    "count_schema": {"type": "integer", "minimum": 0},
+                    "count": {"$ref": "#/properties/count_schema"},
+                },
+                "required": ["count"],
+            },
+            {"count": 3},
+        ),
+        (
+            {
+                "$schema": DRAFT_2020_12,
+                "type": "object",
+                "properties": {
+                    "count_schema": {
+                        "$anchor": "count",
+                        "type": "integer",
+                        "minimum": 0,
+                    },
+                    "count": {"$ref": "#count"},
+                },
+                "required": ["count"],
+            },
+            {"count": 3},
+        ),
+        (
+            {
+                "$schema": DRAFT_2020_12,
+                "type": "object",
+                "properties": {
+                    "count_schema": {
+                        "$dynamicAnchor": "count",
+                        "type": "integer",
+                        "minimum": 0,
+                    },
+                    "count": {"$dynamicRef": "#count"},
+                },
+                "required": ["count"],
+            },
+            {"count": 3},
+        ),
+    ],
+    ids=("json-pointer", "anchor", "dynamic-anchor"),
+)
+async def test_derivation_envelope_preserves_other_local_reference_forms(
+    tmp_path: Path,
+    caller_schema: dict[str, object],
+    answer: dict[str, JsonValue],
+) -> None:
+    request = valid_request(tmp_path)
+    request = RunRequest.model_validate(
+        {
+            **request.model_dump(mode="python", round_trip=True),
+            "answer_schema": caller_schema,
+            "derivation": {"format": "dsa-derivation/v1"},
+        }
+    )
+
+    completion = await run_analysis(
+        request,
+        runs_directory=tmp_path / "runs",
+        model=TestModel(
+            call_tools=[],
+            custom_output_args={
+                "answer": answer,
+                "derivation": sample_derivation().model_dump(mode="json"),
+            },
+        ),
+        python_executor=ResultExecutor(answer),
+        identity_factory=lambda: "run-derived-other-local-reference",
+        clock=clock(),
+    )
+
+    assert isinstance(completion.outcome, RunSuccess)
+    assert completion.outcome.answer == answer
+    assert completion.record.request.answer_schema == caller_schema
+
+
+async def test_derivation_output_schema_prepares_for_openai(tmp_path: Path) -> None:
+    async def respond(_messages: list[Any], info: AgentInfo) -> ModelResponse:
+        schema = info.output_tools[0].parameters_json_schema
+        prepared = OpenAIJsonSchemaTransformer(schema, strict=True).walk()
+        derivation = prepared["properties"]["derivation"]
+        assert isinstance(derivation, dict)
+        assert derivation["required"] == ["format", "cells"]
+        assert derivation["additionalProperties"] is False
+        return ModelResponse(
+            parts=[
+                ToolCallPart(
+                    "final_answer",
+                    {
+                        "answer": {"count": 3},
+                        "derivation": sample_derivation().model_dump(mode="json"),
+                    },
+                    "answer",
+                )
+            ]
+        )
+
+    request = valid_request(tmp_path)
+    request = RunRequest.model_validate(
+        {
+            **request.model_dump(mode="python", round_trip=True),
+            "derivation": {"format": "dsa-derivation/v1"},
+        }
+    )
+    completion = await run_analysis(
+        request,
+        runs_directory=tmp_path / "runs",
+        model=FunctionModel(respond, model_name="test"),
+        python_executor=ResultExecutor({"count": 3}),
+        identity_factory=lambda: "run-derived-openai-schema",
+        clock=clock(),
+    )
+
+    assert isinstance(completion.outcome, RunSuccess)
 
 
 async def test_answer_only_run_keeps_legacy_terminal_and_creates_no_notebook(

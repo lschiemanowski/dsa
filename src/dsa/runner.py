@@ -25,7 +25,6 @@ from pydantic import Field, JsonValue, model_validator
 from pydantic import ValidationError as PydanticValidationError
 from pydantic_ai import (
     Agent,
-    InlineDefsJsonSchemaTransformer,
     ModelAPIError,
     ModelHTTPError,
     ModelRequestNode,
@@ -42,6 +41,8 @@ from pydantic_ai.models import Model
 from pydantic_ai.settings import ModelSettings
 from pydantic_ai.usage import RunUsage, UsageLimits
 from pydantic_graph import End
+from referencing import Registry, Resource
+from referencing.jsonschema import DRAFT202012
 
 from dsa.contract import ContractModel, Derivation, RunRequest
 from dsa.derivation import DerivationError, VerifiedDerivation, verify_derivation
@@ -87,6 +88,20 @@ The derivation is replayed independently and must reproduce the submitted answer
 
 class _AnswerValidator(Protocol):
     def iter_errors(self, instance: JsonValue) -> Iterable[JsonSchemaValidationError]: ...
+
+
+type _SchemaNode = dict[str, JsonValue] | bool
+
+
+class _ResolvedSchema(Protocol):
+    contents: _SchemaNode
+    resolver: _SchemaResolver
+
+
+class _SchemaResolver(Protocol):
+    def lookup(self, reference: str) -> _ResolvedSchema: ...
+
+    def in_subresource(self, subresource: Resource[_SchemaNode]) -> _SchemaResolver: ...
 
 
 class _ValidationAttemptsExceeded(Exception):
@@ -679,7 +694,7 @@ def _framework_schema(
         return {
             "type": "object",
             "properties": {
-                "answer": _inlined_answer_schema(caller_schema),
+                "answer": _dereferenced_answer_schema(caller_schema),
                 "derivation": _derivation_schema(),
             },
             "required": ["answer", "derivation"],
@@ -695,8 +710,108 @@ def _framework_schema(
     }
 
 
-def _inlined_answer_schema(caller_schema: dict[str, JsonValue]) -> dict[str, Any]:
-    return InlineDefsJsonSchemaTransformer(deepcopy(caller_schema)).walk()
+def _dereferenced_answer_schema(
+    caller_schema: dict[str, JsonValue],
+) -> dict[str, JsonValue]:
+    """Build an equivalent reference-free copy for the nested provider schema.
+
+    The untouched caller schema remains the authoritative runtime validator and
+    retained contract. ``StructuredDict`` cannot resolve references after that
+    schema is nested beneath the derivation envelope, so resolve them while the
+    caller schema is still the root resource.
+    """
+    root = deepcopy(caller_schema)
+    resource = cast(Resource[_SchemaNode], DRAFT202012.create_resource(root))
+    registry: Registry[_SchemaNode] = Registry()
+    registry = registry.with_resource(resource.id() or "", resource).crawl()
+    resolver = cast(_SchemaResolver, registry.resolver_with_root(resource))
+    resolved = _dereference_schema(root, resolver, ())
+    assert isinstance(resolved, dict)
+    return resolved
+
+
+def _dereference_schema(
+    schema: _SchemaNode,
+    resolver: _SchemaResolver,
+    stack: tuple[int, ...],
+) -> _SchemaNode:
+    identity = id(schema)
+    if identity in stack:
+        raise ValueError("recursive local references are not supported")
+    stack = (*stack, identity)
+
+    if isinstance(schema, bool):
+        return schema
+
+    referenced: list[_SchemaNode] = []
+    for keyword in ("$ref", "$dynamicRef"):
+        reference = schema.get(keyword)
+        if isinstance(reference, str):
+            target = resolver.lookup(reference)
+            contents = target.contents
+            referenced.append(
+                _dereference_schema(contents, target.resolver, stack)
+            )
+
+    remainder = {
+        key: value
+        for key, value in schema.items()
+        if key
+        not in {
+            "$anchor",
+            "$defs",
+            "$dynamicAnchor",
+            "$dynamicRef",
+            "$id",
+            "$ref",
+            "$schema",
+            "definitions",
+        }
+    }
+    remainder = _dereference_subschemas(remainder, resolver, stack)
+    if not referenced:
+        return remainder
+    if remainder:
+        referenced.append(remainder)
+    if len(referenced) == 1:
+        return referenced[0]
+    return {"allOf": cast(list[JsonValue], referenced)}
+
+
+def _dereference_subschemas(
+    schema: dict[str, JsonValue],
+    resolver: _SchemaResolver,
+    stack: tuple[int, ...],
+) -> dict[str, JsonValue]:
+    resource = cast(Resource[_SchemaNode], DRAFT202012.create_resource(schema))
+    replacements: dict[int, JsonValue] = {}
+    # The dialect supplies the schema-bearing children, avoiding traversal into
+    # literal JSON held by keywords such as const, enum, and examples.
+    for subresource in resource.subresources():
+        contents = subresource.contents
+        replacements[id(contents)] = cast(
+            JsonValue,
+            _dereference_schema(
+                contents,
+                resolver.in_subresource(subresource),
+                stack,
+            ),
+        )
+    return cast(dict[str, JsonValue], _replace_schema_nodes(schema, replacements))
+
+
+def _replace_schema_nodes(value: JsonValue, replacements: dict[int, JsonValue]) -> JsonValue:
+    replacement = replacements.get(id(value))
+    if replacement is not None:
+        return replacement
+    if isinstance(value, dict):
+        return {
+            key: _replace_schema_nodes(child, replacements)
+            for key, child in value.items()
+        }
+    if isinstance(value, list):
+        return [_replace_schema_nodes(child, replacements) for child in value]
+    return value
 
 
 def _derivation_schema() -> dict[str, Any]:
@@ -732,8 +847,6 @@ def _derivation_schema() -> dict[str, Any]:
                     ]
                 },
             },
-            "required": ["format", "cells"],
-            "additionalProperties": False,
         },
         "required": ["format", "cells"],
         "additionalProperties": False,
