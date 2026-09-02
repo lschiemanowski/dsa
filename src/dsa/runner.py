@@ -752,7 +752,10 @@ def _rebase_local_references(
 ) -> None:
     if isinstance(schema, bool):
         return
-    if "$id" in schema:
+    resource = cast(Resource[_SchemaNode], DRAFT202012.create_resource(schema))
+    # Resource.id() returns the resolved resource identifier without its fragment.
+    # Empty and fragment-only IDs therefore keep the enclosing resource scope.
+    if resource.id():
         rebase = False
     if rebase:
         for keyword in ("$ref", "$dynamicRef"):
@@ -762,7 +765,6 @@ def _rebase_local_references(
             elif isinstance(reference, str) and reference.startswith("#/"):
                 schema[keyword] = f"#/properties/answer{reference[1:]}"
 
-    resource = cast(Resource[_SchemaNode], DRAFT202012.create_resource(schema))
     # The dialect supplies the schema-bearing children, avoiding traversal into
     # literal JSON held by keywords such as const, enum, and examples.
     for subresource in resource.subresources():

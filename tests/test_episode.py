@@ -272,8 +272,18 @@ async def test_derivation_envelope_preserves_local_answer_schema_references(
             },
             {"count": 3},
         ),
+        (local_reference_answer_schema() | {"$id": ""}, {"count": 3}),
+        (local_reference_answer_schema() | {"$id": "#"}, {"count": 3}),
     ],
-    ids=("json-pointer", "anchor", "dynamic-anchor", "recursive", "boolean-true"),
+    ids=(
+        "json-pointer",
+        "anchor",
+        "dynamic-anchor",
+        "recursive",
+        "boolean-true",
+        "empty-id",
+        "fragment-only-id",
+    ),
 )
 async def test_derivation_envelope_preserves_other_local_reference_forms(
     tmp_path: Path,
