@@ -244,14 +244,60 @@ async def test_derivation_envelope_preserves_local_answer_schema_references(
             },
             {"count": 3},
         ),
+        (
+            {
+                "$schema": DRAFT_2020_12,
+                "$defs": {
+                    "node": {
+                        "type": "object",
+                        "properties": {
+                            "value": {"type": "integer"},
+                            "children": {
+                                "type": "array",
+                                "items": {"$ref": "#/$defs/node"},
+                            },
+                        },
+                        "required": ["value", "children"],
+                    }
+                },
+                "$ref": "#/$defs/node",
+            },
+            {"value": 3, "children": []},
+        ),
+        (
+            {
+                "$schema": DRAFT_2020_12,
+                "$defs": {"anything": True},
+                "$ref": "#/$defs/anything",
+            },
+            {"count": 3},
+        ),
     ],
-    ids=("json-pointer", "anchor", "dynamic-anchor"),
+    ids=("json-pointer", "anchor", "dynamic-anchor", "recursive", "boolean-true"),
 )
 async def test_derivation_envelope_preserves_other_local_reference_forms(
     tmp_path: Path,
     caller_schema: dict[str, object],
     answer: dict[str, JsonValue],
 ) -> None:
+    async def respond(_messages: list[Any], info: AgentInfo) -> ModelResponse:
+        OpenAIJsonSchemaTransformer(
+            info.output_tools[0].parameters_json_schema,
+            strict=True,
+        ).walk()
+        return ModelResponse(
+            parts=[
+                ToolCallPart(
+                    "final_answer",
+                    {
+                        "answer": answer,
+                        "derivation": sample_derivation().model_dump(mode="json"),
+                    },
+                    "answer",
+                )
+            ]
+        )
+
     request = valid_request(tmp_path)
     request = RunRequest.model_validate(
         {
@@ -264,13 +310,7 @@ async def test_derivation_envelope_preserves_other_local_reference_forms(
     completion = await run_analysis(
         request,
         runs_directory=tmp_path / "runs",
-        model=TestModel(
-            call_tools=[],
-            custom_output_args={
-                "answer": answer,
-                "derivation": sample_derivation().model_dump(mode="json"),
-            },
-        ),
+        model=FunctionModel(respond, model_name="test"),
         python_executor=ResultExecutor(answer),
         identity_factory=lambda: "run-derived-other-local-reference",
         clock=clock(),
@@ -279,6 +319,53 @@ async def test_derivation_envelope_preserves_other_local_reference_forms(
     assert isinstance(completion.outcome, RunSuccess)
     assert completion.outcome.answer == answer
     assert completion.record.request.answer_schema == caller_schema
+
+
+async def test_false_boolean_reference_terminalizes_validation_failure(
+    tmp_path: Path,
+) -> None:
+    async def respond(_messages: list[Any], info: AgentInfo) -> ModelResponse:
+        schema = info.output_tools[0].parameters_json_schema
+        answer_schema = schema["properties"]["answer"]
+        assert answer_schema["$ref"] == "#/properties/answer/$defs/never"
+        OpenAIJsonSchemaTransformer(schema, strict=True).walk()
+        return ModelResponse(
+            parts=[
+                ToolCallPart(
+                    "final_answer",
+                    {
+                        "answer": {"count": 3},
+                        "derivation": sample_derivation().model_dump(mode="json"),
+                    },
+                    "answer",
+                )
+            ]
+        )
+
+    request = valid_request(tmp_path, max_validation_attempts=1)
+    request = RunRequest.model_validate(
+        {
+            **request.model_dump(mode="python", round_trip=True),
+            "answer_schema": {
+                "$schema": DRAFT_2020_12,
+                "$defs": {"never": False},
+                "$ref": "#/$defs/never",
+            },
+            "derivation": {"format": "dsa-derivation/v1"},
+        }
+    )
+    completion = await run_analysis(
+        request,
+        runs_directory=tmp_path / "runs",
+        model=FunctionModel(respond, model_name="test"),
+        python_executor=ResultExecutor({"count": 3}),
+        identity_factory=lambda: "run-derived-boolean-false-reference",
+        clock=clock(),
+    )
+
+    assert isinstance(completion.outcome, RunFailure)
+    assert completion.outcome.failure.stage == "answer_validation"
+    assert completion.retained_record.path.is_file()
 
 
 async def test_derivation_output_schema_prepares_for_openai(tmp_path: Path) -> None:
