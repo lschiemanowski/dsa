@@ -29,6 +29,7 @@ from dsa.record import (
     RetainedTerminalRecord,
     RunFailure,
     TerminalRecord,
+    validate_retained_derivation_notebook,
 )
 
 
@@ -315,6 +316,11 @@ class _MlflowBackend:
         terminal_status: str = "FINISHED",
     ) -> MlflowReporting:
         try:
+            validate_retained_derivation_notebook(
+                completion.record,
+                completion.retained_record,
+                completion.retained_notebook,
+            )
             terminal_text = _verified_terminal_text(completion.retained_record)
             notebook_text = (
                 _verified_notebook_text(completion.retained_notebook)

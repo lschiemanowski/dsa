@@ -28,6 +28,8 @@ _INFRASTRUCTURE_CODES = frozenset(
     {
         "python_backend_error",
         "python_backend_unavailable",
+        "python_container_cleanup",
+        "python_failed",
         "python_workspace_cleanup_failed",
         "python_workspace_invalid",
     }
@@ -147,28 +149,34 @@ async def verify_derivation(
 
     derivation_bytes = _canonical_json_bytes(derivation.model_dump(mode="json"))
     try:
+        derivation_sha256 = sha256(derivation_bytes).hexdigest()
         notebook_bytes = _notebook_bytes(
             derivation,
             question=question,
             source_database_sha256=source_database_sha256,
             runtime_identity=runtime_identity,
-            derivation_sha256=sha256(derivation_bytes).hexdigest(),
+            derivation_sha256=derivation_sha256,
         )
-        notebook = _write_notebook(run_directory, notebook_bytes)
+        notebook = RetainedDerivationNotebook(
+            path=run_directory / "derivation.ipynb",
+            sha256=sha256(notebook_bytes).hexdigest(),
+            byte_length=len(notebook_bytes),
+        )
+        verification = DerivationVerification(
+            derivation_sha256=derivation_sha256,
+            result_sha256=sha256(answer_bytes).hexdigest(),
+            source_database_sha256=source_database_sha256,
+            runtime_identity=runtime_identity,
+            notebook_sha256=notebook.sha256,
+            notebook_byte_length=notebook.byte_length,
+        )
+        _write_notebook(run_directory, notebook_bytes)
     except (OSError, ValueError) as error:
         raise DerivationError(
             "derivation_notebook_failed",
             "The verified derivation notebook could not be retained",
             infrastructure=True,
         ) from error
-    verification = DerivationVerification(
-        derivation_sha256=sha256(derivation_bytes).hexdigest(),
-        result_sha256=sha256(answer_bytes).hexdigest(),
-        source_database_sha256=source_database_sha256,
-        runtime_identity=runtime_identity,
-        notebook_sha256=notebook.sha256,
-        notebook_byte_length=notebook.byte_length,
-    )
     return VerifiedDerivation(
         derivation=derivation,
         verification=verification,
@@ -348,7 +356,7 @@ def _notebook_cell(cell_type: str, source: str, index: int) -> dict[str, Any]:
     return cell
 
 
-def _write_notebook(directory: Path, content: bytes) -> RetainedDerivationNotebook:
+def _write_notebook(directory: Path, content: bytes) -> None:
     destination = directory / "derivation.ipynb"
     if destination.exists():
         raise FileExistsError("derivation notebook already exists")
@@ -376,11 +384,6 @@ def _write_notebook(directory: Path, content: bytes) -> RetainedDerivationNotebo
         if published:
             destination.unlink(missing_ok=True)
         raise
-    return RetainedDerivationNotebook(
-        path=destination,
-        sha256=sha256(content).hexdigest(),
-        byte_length=len(content),
-    )
 
 
 def _canonical_json_bytes(value: JsonValue) -> bytes:

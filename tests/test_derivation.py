@@ -86,6 +86,34 @@ class BackendFailureExecutor:
         )
 
 
+class ClassifiedFailureExecutor:
+    def __init__(self, code: str) -> None:
+        self.code = code
+        self.calls = 0
+
+    async def execute(self, request: PythonExecutionRequest) -> PythonExecutionResult:
+        del request
+        self.calls += 1
+        raise PythonExecutionError(self.code, "executor failure")
+
+
+class UnexpectedFailureExecutor:
+    async def execute(self, request: PythonExecutionRequest) -> PythonExecutionResult:
+        del request
+        raise RuntimeError("unexpected executor failure")
+
+
+class RuntimeIdentityExecutor(ResultExecutor):
+    def __init__(self, result: JsonValue, runtime_identity: str) -> None:
+        super().__init__(result)
+        self.runtime_identity = runtime_identity
+
+    async def execute(self, request: PythonExecutionRequest) -> PythonExecutionResult:
+        result = await super().execute(request)
+        del result
+        return PythonExecutionResult(runtime_identity=self.runtime_identity)
+
+
 async def test_verified_derivation_retains_a_deterministic_valid_notebook(
     tmp_path: Path,
 ) -> None:
@@ -183,6 +211,68 @@ async def test_derivation_requires_an_executor_and_classifies_backend_failure(
         )
     assert backend.value.code == "python_backend_unavailable"
     assert backend.value.infrastructure is True
+
+
+@pytest.mark.parametrize(
+    ("executor", "expected_code"),
+    [
+        (ClassifiedFailureExecutor("python_container_cleanup"), "python_container_cleanup"),
+        (UnexpectedFailureExecutor(), "python_failed"),
+    ],
+)
+async def test_derivation_classifies_executor_lifecycle_failures_as_infrastructure(
+    tmp_path: Path,
+    executor: object,
+    expected_code: str,
+) -> None:
+    source, source_digest = database(tmp_path)
+    run_directory = tmp_path / "run"
+    (run_directory / "work").mkdir(parents=True)
+
+    with pytest.raises(DerivationError) as captured:
+        await verify_derivation(
+            sample_derivation(),
+            {"count": 3},
+            question="How many rows are in events?",
+            source_database=source,
+            source_database_sha256=source_digest,
+            run_directory=run_directory,
+            policy=RunPolicy(),
+            python_executor=cast(Any, executor),
+        )
+
+    assert captured.value.code == expected_code
+    assert captured.value.infrastructure is True
+    assert not (run_directory / "derivation.ipynb").exists()
+
+
+@pytest.mark.parametrize("runtime_identity", ["", "x" * 513])
+async def test_invalid_runtime_identity_cannot_leave_a_published_notebook(
+    tmp_path: Path,
+    runtime_identity: str,
+) -> None:
+    source, source_digest = database(tmp_path)
+    run_directory = tmp_path / "run"
+    (run_directory / "work").mkdir(parents=True)
+
+    with pytest.raises(DerivationError) as captured:
+        await verify_derivation(
+            sample_derivation(),
+            {"count": 3},
+            question="How many rows are in events?",
+            source_database=source,
+            source_database_sha256=source_digest,
+            run_directory=run_directory,
+            policy=RunPolicy(),
+            python_executor=RuntimeIdentityExecutor(
+                {"count": 3},
+                runtime_identity,
+            ),
+        )
+
+    assert captured.value.code == "derivation_notebook_failed"
+    assert captured.value.infrastructure is True
+    assert not (run_directory / "derivation.ipynb").exists()
 
 
 @pytest.mark.integration

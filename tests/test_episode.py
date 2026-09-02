@@ -22,7 +22,7 @@ from dsa import RunFailure, RunRequest, RunSuccess, run_analysis
 from dsa.environment import PythonExecutionRequest, PythonExecutionResult
 
 from .test_contract import DRAFT_2020_12, request_value
-from .test_derivation import ResultExecutor, sample_derivation
+from .test_derivation import ClassifiedFailureExecutor, ResultExecutor, sample_derivation
 
 
 def valid_request(tmp_path: Path, **policy: int) -> RunRequest:
@@ -867,6 +867,39 @@ async def test_invalid_derivation_cell_sequence_uses_bounded_retries(
     assert completion.outcome.failure.stage == "derivation_validation"
     assert completion.outcome.failure.code == "attempts_exhausted"
     assert completion.outcome.failure.diagnostics == {"attempts": 2}
+
+
+async def test_derivation_container_cleanup_failure_is_not_retried(
+    tmp_path: Path,
+) -> None:
+    request = valid_request(tmp_path, max_validation_attempts=3)
+    request = RunRequest.model_validate(
+        {
+            **request.model_dump(mode="python", round_trip=True),
+            "derivation": {"format": "dsa-derivation/v1"},
+        }
+    )
+    executor = ClassifiedFailureExecutor("python_container_cleanup")
+    completion = await run_analysis(
+        request,
+        runs_directory=tmp_path / "runs",
+        model=TestModel(
+            call_tools=[],
+            custom_output_args={
+                "answer": {"count": 3},
+                "derivation": sample_derivation().model_dump(mode="json"),
+            },
+        ),
+        python_executor=executor,
+        identity_factory=lambda: "run-derivation-cleanup-failure",
+        clock=clock(),
+    )
+
+    assert executor.calls == 1
+    assert isinstance(completion.outcome, RunFailure)
+    assert completion.outcome.failure.stage == "analysis_environment"
+    assert completion.outcome.failure.code == "python_container_cleanup"
+    assert completion.retained_notebook is None
 
 
 async def test_derivation_can_accompany_a_retained_artifact_answer(

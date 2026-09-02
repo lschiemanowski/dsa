@@ -200,6 +200,32 @@ class RetainedDerivationNotebook(ContractModel):
     byte_length: Annotated[int, Field(gt=0)]
 
 
+def validate_retained_derivation_notebook(
+    record: TerminalRecord,
+    retained_record: RetainedTerminalRecord,
+    retained_notebook: RetainedDerivationNotebook | None,
+) -> None:
+    """Require one exact notebook reference for one verified derivation success."""
+    verification = (
+        record.outcome.derivation_verification
+        if isinstance(record.outcome, RunSuccess)
+        else None
+    )
+    if verification is None:
+        if retained_notebook is not None:
+            raise ValueError("terminal without verified derivation must not retain a notebook")
+        return
+    if retained_notebook is None:
+        raise ValueError("verified derivation terminal requires its retained notebook")
+    expected_path = retained_record.path.parent / verification.notebook_relative_path
+    if (
+        retained_notebook.path != expected_path
+        or retained_notebook.sha256 != verification.notebook_sha256
+        or retained_notebook.byte_length != verification.notebook_byte_length
+    ):
+        raise ValueError("retained notebook does not match terminal derivation evidence")
+
+
 def write_terminal_record(
     record: TerminalRecord,
     run_directory: Path,

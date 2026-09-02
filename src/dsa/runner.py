@@ -21,7 +21,7 @@ from uuid import uuid4
 import duckdb
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import ValidationError as JsonSchemaValidationError
-from pydantic import Field, JsonValue
+from pydantic import Field, JsonValue, model_validator
 from pydantic import ValidationError as PydanticValidationError
 from pydantic_ai import (
     Agent,
@@ -60,6 +60,7 @@ from dsa.record import (
     RunOutcome,
     RunSuccess,
     TerminalRecord,
+    validate_retained_derivation_notebook,
     write_terminal_record,
 )
 from dsa.reporting import MlflowReporting, run_with_mlflow_reporting
@@ -112,6 +113,15 @@ class RunCompletion(ContractModel):
         exclude_if=lambda value: value is None,
     )
     reporting: MlflowReporting = MlflowReporting()
+
+    @model_validator(mode="after")
+    def retained_notebook_matches_terminal(self) -> RunCompletion:
+        validate_retained_derivation_notebook(
+            self.record,
+            self.retained_record,
+            self.retained_notebook,
+        )
+        return self
 
     @property
     def outcome(self) -> RunOutcome:

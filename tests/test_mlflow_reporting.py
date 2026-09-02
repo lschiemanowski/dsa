@@ -17,6 +17,7 @@ from dsa import MlflowReporting, RetainedDerivationNotebook, RunSuccess, run_ana
 from dsa import reporting as reporting_module
 from dsa.record import ArtifactRecord
 
+from .test_derivation import ResultExecutor, sample_derivation
 from .test_episode import clock, valid_request
 
 
@@ -219,21 +220,35 @@ async def test_terminal_export_uses_exact_bytes_and_safe_failure_codes(
     }
     assert client.terminated == ["FINISHED"]
 
-    notebook_path = tmp_path / "derivation.ipynb"
-    notebook_text = '{"cells":[],"metadata":{},"nbformat":4,"nbformat_minor":5}\n'
-    notebook_path.write_text(notebook_text)
-    with_notebook = completion.model_copy(
-        update={
-            "retained_notebook": RetainedDerivationNotebook(
-                path=notebook_path,
-                sha256=sha256(notebook_text.encode()).hexdigest(),
-                byte_length=len(notebook_text.encode()),
-            )
+    derived_request = valid_request(tmp_path)
+    derived_request = derived_request.model_validate(
+        {
+            **derived_request.model_dump(mode="python", round_trip=True),
+            "derivation": {"format": "dsa-derivation/v1"},
         }
     )
+    derived_completion = await run_analysis(
+        derived_request,
+        runs_directory=tmp_path / "derived-runs",
+        model=TestModel(
+            call_tools=[],
+            custom_output_args={
+                "answer": {"count": 3},
+                "derivation": sample_derivation().model_dump(mode="json"),
+            },
+        ),
+        python_executor=ResultExecutor({"count": 3}),
+        identity_factory=lambda: "run-reporting-derived",
+        clock=clock(),
+    )
+    assert derived_completion.retained_notebook is not None
+    notebook_path = derived_completion.retained_notebook.path
+    notebook_text = notebook_path.read_text()
     notebook_client = Client()
     selected_client = notebook_client
-    notebook_result = await backend._export_completion("123", "trace", with_notebook)
+    notebook_result = await backend._export_completion(
+        "123", "trace", derived_completion
+    )
     assert notebook_result.status == "reported"
     assert [path for path, _text in notebook_client.text] == [
         "dsa/terminal.json",
@@ -242,11 +257,26 @@ async def test_terminal_export_uses_exact_bytes_and_safe_failure_codes(
     ]
     assert notebook_client.text[1][1] == notebook_text
 
+    forged_notebook = completion.model_copy(
+        update={
+            "retained_notebook": RetainedDerivationNotebook(
+                path=notebook_path,
+                sha256=sha256(notebook_text.encode()).hexdigest(),
+                byte_length=len(notebook_text.encode()),
+            )
+        }
+    )
+    forged_client = Client()
+    selected_client = forged_client
+    forged_result = await backend._export_completion("123", "trace", forged_notebook)
+    assert forged_result.failure_code == "mlflow_export_failed"
+    assert forged_client.text == []
+
     notebook_path.write_text("tampered\n")
     notebook_integrity_client = Client()
     selected_client = notebook_integrity_client
     notebook_integrity_failure = await backend._export_completion(
-        "123", "trace", with_notebook
+        "123", "trace", derived_completion
     )
     assert notebook_integrity_failure.failure_code == "mlflow_export_failed"
     assert notebook_integrity_client.text == []
