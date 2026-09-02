@@ -47,6 +47,7 @@ from dsa.evaluation import (
     exact_json_equal,
     infrastructure_failure,
 )
+from dsa.mlflow_config import MlflowConfigurationError, load_mlflow_configuration
 from dsa.pack import LoadedEvaluationPack, load_huggingface_evaluation_pack
 from dsa.record import FailureStage, RunFailure, RunSuccess, TerminalRecord
 from dsa.reporting import MlflowReporting
@@ -1516,17 +1517,16 @@ def _canonical_report(value: BenchmarkReport | object) -> BenchmarkReport:
 def _default_evidence_reader(
     environment: Mapping[str, str],
 ) -> BenchmarkEvidenceReader:
-    if environment.get("MLFLOW_TRACKING_URI") != "databricks" or any(
-        not environment.get(key, "").strip()
-        for key in ("DATABRICKS_HOST", "DATABRICKS_TOKEN")
-    ):
+    try:
+        configuration = load_mlflow_configuration(environment)
+    except MlflowConfigurationError:
         raise BenchmarkReportConfigurationError(
-            "benchmark report requires Databricks MLflow configuration"
-        )
+            "benchmark report requires complete MLflow configuration"
+        ) from None
     try:
         tracking = import_module("mlflow.tracking")
         client_type = tracking.MlflowClient
-        client = client_type(tracking_uri="databricks")
+        client = client_type(tracking_uri=configuration.tracking_uri)
     except Exception:
         raise BenchmarkReportConfigurationError(
             "benchmark report MLflow client is unavailable"

@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from dsa import benchmark_report as benchmark_report_module
 from dsa.benchmark import (
     BenchmarkCellInvocation,
     BenchmarkCellReceipt,
@@ -928,3 +929,38 @@ def test_mlflow_reader_retains_only_the_bounded_safe_projection() -> None:
     assert selected.params == {"dsa.model_name": "test"}
     assert selected.tags == {"dsa.benchmark.cell_id": "cell-" + "a" * 64}
     assert "SECRET" not in selected.model_dump_json()
+
+
+def test_default_evidence_reader_uses_configured_local_tracking_uri(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: list[str] = []
+
+    class Client:
+        pass
+
+    def client_type(*, tracking_uri: str) -> Client:
+        captured.append(tracking_uri)
+        return Client()
+
+    def import_tracking(name: str) -> object:
+        if name != "mlflow.tracking":
+            raise AssertionError("unexpected import")
+        return SimpleNamespace(MlflowClient=client_type)
+
+    monkeypatch.setattr(
+        benchmark_report_module,
+        "import_module",
+        import_tracking,
+    )
+    reader_factory = benchmark_report_module.__dict__["_default_evidence_reader"]
+
+    reader = reader_factory(
+        {
+            "MLFLOW_TRACKING_URI": "http://127.0.0.1:5000",
+            "MLFLOW_EXPERIMENT_ID": "1",
+        }
+    )
+
+    assert isinstance(reader, MlflowBenchmarkEvidenceReader)
+    assert captured == ["http://127.0.0.1:5000"]

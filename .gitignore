@@ -209,6 +209,9 @@ tempCodeRunnerFile.py
 # PyPI configuration file
 .pypirc
 
+# Local MLflow state when following docs/local-mlflow.md inside the checkout
+/.mlflow/
+
 # Marimo
 marimo/_static/
 marimo/_lsp/

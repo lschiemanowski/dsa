@@ -32,6 +32,12 @@ from dsa.evaluation import (
     MlflowEvaluationResult,
     run_mlflow_evaluation,
 )
+from dsa.mlflow_config import (
+    SAFE_DATASET_NAME_PATTERN,
+    MlflowConfigurationError,
+    dataset_name_matches_backend,
+    load_mlflow_configuration,
+)
 from dsa.pack import (
     HuggingFacePackReference,
     LoadedEvaluationPack,
@@ -44,13 +50,7 @@ SafeName = Annotated[
 ]
 SafeDatasetName = Annotated[
     str,
-    Field(
-        pattern=(
-            r"^[a-z0-9_][a-z0-9_-]{0,127}\."
-            r"[a-z0-9_][a-z0-9_-]{0,127}\."
-            r"[a-z0-9_][a-z0-9_-]{0,127}$"
-        )
-    ),
+    Field(pattern=SAFE_DATASET_NAME_PATTERN, max_length=386),
 ]
 SafeRemoteId = Annotated[
     str,
@@ -150,7 +150,7 @@ class BenchmarkStudy(ContractModel):
 
 
 class BenchmarkDatasetBinding(ContractModel):
-    """One host-selected Databricks dataset name for a study pack."""
+    """One host-selected MLflow dataset name for a study pack."""
 
     pack_id: SafeName
     dataset_name: SafeDatasetName
@@ -1162,8 +1162,15 @@ async def prepare_benchmark(
     selected_runtime = _canonical_runtime(runtime)
     if current_revision != selected_study.agent_revision:
         raise ValueError("benchmark agent revision does not match the current revision")
-    if _databricks_configuration_invalid(environment):
-        raise ValueError("benchmark requires complete Databricks MLflow configuration")
+    try:
+        mlflow_configuration = load_mlflow_configuration(environment)
+    except MlflowConfigurationError:
+        raise ValueError("benchmark requires complete MLflow configuration") from None
+    if any(
+        not dataset_name_matches_backend(item.dataset_name, mlflow_configuration)
+        for item in selected_runtime.datasets
+    ):
+        raise ValueError("benchmark dataset name does not match the MLflow backend")
     expected = tuple(item.pack_id for item in selected_study.packs)
     actual = tuple(item.pack_id for item in selected_runtime.datasets)
     if actual != expected:
@@ -1246,13 +1253,6 @@ def _canonical_runtime(value: BenchmarkRuntime | object) -> BenchmarkRuntime:
     if isinstance(value, BenchmarkRuntime):
         return BenchmarkRuntime.model_validate_json(value.model_dump_json())
     return BenchmarkRuntime.model_validate(value)
-
-
-def _databricks_configuration_invalid(environment: Mapping[str, str]) -> bool:
-    if environment.get("MLFLOW_TRACKING_URI") != "databricks":
-        return True
-    required = ("MLFLOW_EXPERIMENT_ID", "DATABRICKS_HOST", "DATABRICKS_TOKEN")
-    return any(not environment.get(key, "").strip() for key in required)
 
 
 def _canonical_json(value: object) -> str:
