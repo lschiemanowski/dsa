@@ -729,7 +729,7 @@ def _provider_derivation_schema(
     anchors and references inside nested resources retain their original scope.
     """
     answer_schema = deepcopy(caller_schema)
-    _rebase_local_references(answer_schema, rebase="$id" not in answer_schema)
+    _rebase_local_references(answer_schema, rebase=True)
     return _derivation_envelope(answer_schema)
 
 

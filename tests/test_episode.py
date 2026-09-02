@@ -12,6 +12,7 @@ from typing import Any, cast
 import duckdb
 import pyarrow.parquet as parquet
 import pytest
+from jsonschema import Draft202012Validator
 from pydantic import JsonValue, ValidationError
 from pydantic_ai import ModelAPIError, ModelHTTPError
 from pydantic_ai.messages import ModelResponse, ToolCallPart
@@ -291,6 +292,15 @@ async def test_derivation_envelope_preserves_other_local_reference_forms(
     answer: dict[str, JsonValue],
 ) -> None:
     async def respond(_messages: list[Any], info: AgentInfo) -> ModelResponse:
+        output = {
+            "answer": answer,
+            "derivation": sample_derivation().model_dump(mode="json"),
+        }
+        validator = cast(
+            Any,
+            Draft202012Validator(info.output_tools[0].parameters_json_schema),
+        )
+        validator.validate(output)
         OpenAIJsonSchemaTransformer(
             info.output_tools[0].parameters_json_schema,
             strict=True,
@@ -299,10 +309,7 @@ async def test_derivation_envelope_preserves_other_local_reference_forms(
             parts=[
                 ToolCallPart(
                     "final_answer",
-                    {
-                        "answer": answer,
-                        "derivation": sample_derivation().model_dump(mode="json"),
-                    },
+                    output,
                     "answer",
                 )
             ]
