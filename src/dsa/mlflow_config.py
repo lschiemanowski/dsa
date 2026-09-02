@@ -18,12 +18,18 @@ _LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 
 
 @dataclass(frozen=True)
-class MlflowConfiguration:
+class MlflowDestination:
     """One validated MLflow destination without retained credentials."""
 
     tracking_uri: str
-    experiment_id: str
     backend: Literal["databricks", "tracking_server"]
+
+
+@dataclass(frozen=True)
+class MlflowConfiguration(MlflowDestination):
+    """One experiment-scoped MLflow write configuration."""
+
+    experiment_id: str
 
 
 class MlflowConfigurationError(ValueError):
@@ -37,17 +43,29 @@ class MlflowConfigurationError(ValueError):
 def load_mlflow_configuration(
     environment: Mapping[str, str],
 ) -> MlflowConfiguration:
-    """Validate Databricks or HTTP(S) tracking-server configuration."""
-    tracking_uri = environment.get("MLFLOW_TRACKING_URI", "")
+    """Validate an experiment-scoped MLflow write configuration."""
+    destination = load_mlflow_destination(environment)
     experiment_id = environment.get("MLFLOW_EXPERIMENT_ID", "")
-    if not _tracking_uri_is_supported(tracking_uri):
-        raise MlflowConfigurationError("mlflow_tracking_uri_invalid")
     if (
         not experiment_id
         or experiment_id != experiment_id.strip()
         or _SAFE_EXPERIMENT_ID.fullmatch(experiment_id) is None
     ):
         raise MlflowConfigurationError("mlflow_configuration_missing")
+    return MlflowConfiguration(
+        tracking_uri=destination.tracking_uri,
+        backend=destination.backend,
+        experiment_id=experiment_id,
+    )
+
+
+def load_mlflow_destination(
+    environment: Mapping[str, str],
+) -> MlflowDestination:
+    """Validate the destination and credentials needed for MLflow reads."""
+    tracking_uri = environment.get("MLFLOW_TRACKING_URI", "")
+    if not _tracking_uri_is_supported(tracking_uri):
+        raise MlflowConfigurationError("mlflow_tracking_uri_invalid")
     if tracking_uri == "databricks":
         if any(
             not environment.get(key, "").strip()
@@ -57,9 +75,8 @@ def load_mlflow_configuration(
         backend: Literal["databricks", "tracking_server"] = "databricks"
     else:
         backend = "tracking_server"
-    return MlflowConfiguration(
+    return MlflowDestination(
         tracking_uri=tracking_uri,
-        experiment_id=experiment_id,
         backend=backend,
     )
 
@@ -75,7 +92,7 @@ def mlflow_configuration_failure(environment: Mapping[str, str]) -> str | None:
 
 def dataset_name_matches_backend(
     dataset_name: str,
-    configuration: MlflowConfiguration,
+    configuration: MlflowDestination,
 ) -> bool:
     """Require Unity Catalog identity only when Databricks is selected."""
     pattern = (

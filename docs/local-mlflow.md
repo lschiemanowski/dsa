@@ -9,18 +9,20 @@ the UI can therefore remain on one machine.
 Install the pinned optional backend and create persistent state once:
 
 ```bash
-cd /home/lothar/workspace/dsa
+cd "$(git rev-parse --show-toplevel)"
+export DSA_MLFLOW_ROOT="$(pwd)/.mlflow"
 UV_CACHE_DIR=/tmp/dsa-benchmark-uv-cache uv sync --extra mlflow --frozen
-mkdir -p /home/lothar/workspace/dsa/.mlflow/artifacts
+mkdir -p "${DSA_MLFLOW_ROOT}/artifacts"
 ```
 
 Keep this command running in its own terminal:
 
 ```bash
-cd /home/lothar/workspace/dsa
+cd "$(git rev-parse --show-toplevel)"
+export DSA_MLFLOW_ROOT="$(pwd)/.mlflow"
 UV_CACHE_DIR=/tmp/dsa-benchmark-uv-cache uv run mlflow server \
-  --backend-store-uri sqlite:////home/lothar/workspace/dsa/.mlflow/mlflow.db \
-  --artifacts-destination /home/lothar/workspace/dsa/.mlflow/artifacts \
+  --backend-store-uri "sqlite:///${DSA_MLFLOW_ROOT}/mlflow.db" \
+  --artifacts-destination "${DSA_MLFLOW_ROOT}/artifacts" \
   --host 127.0.0.1 \
   --port 5000 \
   --workers 1

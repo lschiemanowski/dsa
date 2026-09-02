@@ -47,7 +47,7 @@ from dsa.evaluation import (
     exact_json_equal,
     infrastructure_failure,
 )
-from dsa.mlflow_config import MlflowConfigurationError, load_mlflow_configuration
+from dsa.mlflow_config import MlflowConfigurationError, load_mlflow_destination
 from dsa.pack import LoadedEvaluationPack, load_huggingface_evaluation_pack
 from dsa.record import FailureStage, RunFailure, RunSuccess, TerminalRecord
 from dsa.reporting import MlflowReporting
@@ -1518,15 +1518,15 @@ def _default_evidence_reader(
     environment: Mapping[str, str],
 ) -> BenchmarkEvidenceReader:
     try:
-        configuration = load_mlflow_configuration(environment)
+        destination = load_mlflow_destination(environment)
     except MlflowConfigurationError:
         raise BenchmarkReportConfigurationError(
-            "benchmark report requires complete MLflow configuration"
+            "benchmark report requires a valid MLflow destination"
         ) from None
     try:
         tracking = import_module("mlflow.tracking")
         client_type = tracking.MlflowClient
-        client = client_type(tracking_uri=configuration.tracking_uri)
+        client = client_type(tracking_uri=destination.tracking_uri)
     except Exception:
         raise BenchmarkReportConfigurationError(
             "benchmark report MLflow client is unavailable"

@@ -8,6 +8,7 @@ from dsa.mlflow_config import (
     MlflowConfigurationError,
     dataset_name_matches_backend,
     load_mlflow_configuration,
+    load_mlflow_destination,
 )
 
 
@@ -88,3 +89,29 @@ def test_databricks_missing_credentials_is_classified_without_retaining_values()
 
     assert caught.value.code == "mlflow_configuration_missing"
     assert "workspace" not in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    "environment, expected_backend",
+    [
+        (
+            {"MLFLOW_TRACKING_URI": "http://127.0.0.1:5000"},
+            "tracking_server",
+        ),
+        (
+            {
+                "MLFLOW_TRACKING_URI": "databricks",
+                "DATABRICKS_HOST": "https://workspace.example",
+                "DATABRICKS_TOKEN": "token",
+            },
+            "databricks",
+        ),
+    ],
+)
+def test_read_destination_does_not_require_an_experiment(
+    environment: dict[str, str],
+    expected_backend: str,
+) -> None:
+    destination = load_mlflow_destination(environment)
+
+    assert destination.backend == expected_backend
