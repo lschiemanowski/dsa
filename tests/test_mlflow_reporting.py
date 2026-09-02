@@ -4,6 +4,7 @@ import asyncio
 import json
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from contextvars import ContextVar
+from hashlib import sha256
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, ClassVar, cast
@@ -12,7 +13,7 @@ import pytest
 from pydantic import ValidationError
 from pydantic_ai.models.test import TestModel
 
-from dsa import MlflowReporting, RunSuccess, run_analysis
+from dsa import MlflowReporting, RetainedDerivationNotebook, RunSuccess, run_analysis
 from dsa import reporting as reporting_module
 from dsa.record import ArtifactRecord
 
@@ -217,6 +218,39 @@ async def test_terminal_export_uses_exact_bytes_and_safe_failure_codes(
         "artifacts": [],
     }
     assert client.terminated == ["FINISHED"]
+
+    notebook_path = tmp_path / "derivation.ipynb"
+    notebook_text = '{"cells":[],"metadata":{},"nbformat":4,"nbformat_minor":5}\n'
+    notebook_path.write_text(notebook_text)
+    with_notebook = completion.model_copy(
+        update={
+            "retained_notebook": RetainedDerivationNotebook(
+                path=notebook_path,
+                sha256=sha256(notebook_text.encode()).hexdigest(),
+                byte_length=len(notebook_text.encode()),
+            )
+        }
+    )
+    notebook_client = Client()
+    selected_client = notebook_client
+    notebook_result = await backend._export_completion("123", "trace", with_notebook)
+    assert notebook_result.status == "reported"
+    assert [path for path, _text in notebook_client.text] == [
+        "dsa/terminal.json",
+        "dsa/derivation.ipynb",
+        "dsa/artifacts.json",
+    ]
+    assert notebook_client.text[1][1] == notebook_text
+
+    notebook_path.write_text("tampered\n")
+    notebook_integrity_client = Client()
+    selected_client = notebook_integrity_client
+    notebook_integrity_failure = await backend._export_completion(
+        "123", "trace", with_notebook
+    )
+    assert notebook_integrity_failure.failure_code == "mlflow_export_failed"
+    assert notebook_integrity_client.text == []
+    notebook_path.write_text(notebook_text)
 
     failed_client = Client(fail=True)
     selected_client = failed_client

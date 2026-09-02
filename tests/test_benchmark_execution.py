@@ -490,8 +490,7 @@ async def test_parent_cleanup_removes_only_containers_with_the_attempt_label(
     removed = await remove_benchmark_cell_containers(invocation, runner=runner)
 
     assert removed is True
-    assert invocation.case_workers * invocation.policy.max_tool_calls == 2
-    assert runner.output_limits == [2 * 65, 2 * 65]
+    assert runner.output_limits == [8 * 65, 2 * 65]
     assert runner.calls[0][-2:] == (
         "--filter",
         f"label=dsa.benchmark.cleanup={invocation.cleanup_token}",
@@ -522,7 +521,7 @@ async def test_parent_cleanup_removes_a_large_valid_cell_in_bounded_batches(
     removed = await remove_benchmark_cell_containers(invocation, runner=runner)
 
     assert removed is True
-    assert runner.output_limits == [130 * 65, 128 * 65, 2 * 65]
+    assert runner.output_limits == [136 * 65, 128 * 65, 2 * 65]
     assert runner.calls[1][:3] == ("docker", "rm", "--force")
     assert runner.calls[1][3:] == container_ids[:128]
     assert runner.calls[2][3:] == container_ids[128:]

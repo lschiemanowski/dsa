@@ -6,10 +6,12 @@ import asyncio
 import json
 import os
 import re
+import stat
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from hashlib import sha256
 from importlib import import_module
+from pathlib import Path
 from threading import Lock
 from typing import Any, Literal, Protocol, Self, cast
 
@@ -22,7 +24,12 @@ from dsa.mlflow_config import (
     load_mlflow_configuration,
     mlflow_configuration_failure,
 )
-from dsa.record import RetainedTerminalRecord, RunFailure, TerminalRecord
+from dsa.record import (
+    RetainedDerivationNotebook,
+    RetainedTerminalRecord,
+    RunFailure,
+    TerminalRecord,
+)
 
 
 class MlflowReporting(ContractModel):
@@ -65,6 +72,7 @@ class MlflowReporting(ContractModel):
 class _ReportableCompletion(Protocol):
     record: TerminalRecord
     retained_record: RetainedTerminalRecord
+    retained_notebook: RetainedDerivationNotebook | None
 
     def with_reporting(self, reporting: MlflowReporting) -> Self: ...
 
@@ -308,6 +316,11 @@ class _MlflowBackend:
     ) -> MlflowReporting:
         try:
             terminal_text = _verified_terminal_text(completion.retained_record)
+            notebook_text = (
+                _verified_notebook_text(completion.retained_notebook)
+                if completion.retained_notebook is not None
+                else None
+            )
             manifest_text = _artifact_manifest_text(completion.record)
             metrics, params, tags = self._run_metadata(completion.record)
         except Exception:
@@ -339,6 +352,12 @@ class _MlflowBackend:
                     raise ValueError("MLflow returned an unsafe tracking run identifier")
                 self.mlflow.flush_trace_async_logging()
                 client.log_text(tracking_run_id, terminal_text, "dsa/terminal.json")
+                if notebook_text is not None:
+                    client.log_text(
+                        tracking_run_id,
+                        notebook_text,
+                        "dsa/derivation.ipynb",
+                    )
                 client.log_text(tracking_run_id, manifest_text, "dsa/artifacts.json")
                 client.log_batch(
                     tracking_run_id,
@@ -450,9 +469,38 @@ def _configuration_failure() -> str | None:
 
 
 def _verified_terminal_text(retained: RetainedTerminalRecord) -> str:
-    content = retained.path.read_bytes()
-    if len(content) != retained.byte_length or sha256(content).hexdigest() != retained.sha256:
-        raise ValueError("terminal integrity check failed")
+    return _verified_text(
+        retained.path,
+        expected_length=retained.byte_length,
+        expected_sha256=retained.sha256,
+        label="terminal",
+    )
+
+
+def _verified_notebook_text(retained: RetainedDerivationNotebook) -> str:
+    return _verified_text(
+        retained.path,
+        expected_length=retained.byte_length,
+        expected_sha256=retained.sha256,
+        label="derivation notebook",
+    )
+
+
+def _verified_text(
+    path: Path,
+    *,
+    expected_length: int,
+    expected_sha256: str,
+    label: str,
+) -> str:
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    with os.fdopen(descriptor, "rb") as source:
+        metadata = os.fstat(source.fileno())
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size != expected_length:
+            raise ValueError(f"{label} integrity check failed")
+        content = source.read(expected_length + 1)
+    if len(content) != expected_length or sha256(content).hexdigest() != expected_sha256:
+        raise ValueError(f"{label} integrity check failed")
     return content.decode("utf-8")
 
 

@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 from copy import deepcopy
 from pathlib import Path
-from typing import Annotated, cast
+from typing import Annotated, Literal, cast
 
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import SchemaError
@@ -15,6 +15,8 @@ from referencing.jsonschema import DRAFT202012
 
 DRAFT_2020_12 = "https://json-schema.org/draft/2020-12/schema"
 PositiveInt = Annotated[int, Field(gt=0)]
+_MAX_DERIVATION_CELLS = 24
+_MAX_DERIVATION_SOURCE_BYTES = 64 * 1024
 _SAFE_MODEL_SETTING_KEYS = frozenset(
     {
         "frequency_penalty",
@@ -101,12 +103,86 @@ class RunPolicy(ContractModel):
         return self
 
 
+class DerivationRequest(ContractModel):
+    """Opt into one versioned replayable human-verification derivation."""
+
+    format: Literal["dsa-derivation/v1"] = "dsa-derivation/v1"
+
+
+class DerivationMarkdownCell(ContractModel):
+    """One concise explanatory cell in a replayable derivation."""
+
+    type: Literal["markdown"] = "markdown"
+    source: str = Field(min_length=1, max_length=16 * 1024)
+
+    @field_validator("source")
+    @classmethod
+    def source_is_not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("derivation cell source must not be blank")
+        return value
+
+
+class DerivationCodeCell(ContractModel):
+    """One plain-Python code cell in a replayable derivation."""
+
+    type: Literal["code"] = "code"
+    source: str = Field(min_length=1, max_length=32 * 1024)
+
+    @field_validator("source")
+    @classmethod
+    def source_is_not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("derivation cell source must not be blank")
+        return value
+
+
+DerivationCell = Annotated[
+    DerivationMarkdownCell | DerivationCodeCell,
+    Field(discriminator="type"),
+]
+
+
+class Derivation(ContractModel):
+    """Model-authored notebook cells without outputs or execution metadata."""
+
+    format: Literal["dsa-derivation/v1"] = "dsa-derivation/v1"
+    cells: tuple[DerivationCell, ...] = Field(
+        min_length=2,
+        max_length=_MAX_DERIVATION_CELLS,
+    )
+
+    @field_validator("cells", mode="before")
+    @classmethod
+    def snapshot_cells(cls, value: object) -> object:
+        if isinstance(value, list):
+            return tuple(cast(list[object], value))
+        return value
+
+    @model_validator(mode="after")
+    def validate_human_verification_shape(self) -> Derivation:
+        if not isinstance(self.cells[0], DerivationMarkdownCell):
+            raise ValueError("derivation must begin with an explanatory markdown cell")
+        if not isinstance(self.cells[-1], DerivationCodeCell):
+            raise ValueError("derivation must end with a code cell")
+        if not any(isinstance(cell, DerivationCodeCell) for cell in self.cells):
+            raise ValueError("derivation must contain a code cell")
+        total_bytes = sum(len(cell.source.encode("utf-8")) for cell in self.cells)
+        if total_bytes > _MAX_DERIVATION_SOURCE_BYTES:
+            raise ValueError("derivation source exceeds its byte limit")
+        return self
+
+
 class RunRequest(ContractModel):
     """Everything a caller may place in the model-visible analysis contract."""
 
     database_path: Path
     question: str
     answer_schema: dict[str, JsonValue]
+    derivation: DerivationRequest | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
     model: ModelConfiguration
     policy: RunPolicy
 

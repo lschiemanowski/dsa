@@ -17,7 +17,13 @@ from typing import Any, Protocol, cast
 from pydantic import Field, JsonValue, TypeAdapter, model_validator
 from pydantic_ai.models import Model
 
-from dsa.contract import ContractModel, ModelConfiguration, RunPolicy, RunRequest
+from dsa.contract import (
+    ContractModel,
+    DerivationRequest,
+    ModelConfiguration,
+    RunPolicy,
+    RunRequest,
+)
 from dsa.environment import PythonExecutor
 from dsa.mlflow_config import mlflow_configuration_failure
 from dsa.pack import (
@@ -40,6 +46,11 @@ class MlflowEvaluationPrediction(ContractModel):
     terminal_sha256: str = Field(pattern=r"[0-9a-f]{64}")
     accepted: bool
     answer: JsonValue = None
+    derivation_sha256: str | None = Field(
+        default=None,
+        pattern=r"[0-9a-f]{64}",
+        exclude_if=lambda value: value is None,
+    )
     failure_stage: FailureStage | None = None
     failure_code: str | None = None
     reporting: MlflowReporting
@@ -49,7 +60,12 @@ class MlflowEvaluationPrediction(ContractModel):
         if self.accepted:
             if self.failure_stage is not None or self.failure_code is not None:
                 raise ValueError("accepted predictions must not contain failure state")
-        elif self.failure_stage is None or not self.failure_code or self.answer is not None:
+        elif (
+            self.failure_stage is None
+            or not self.failure_code
+            or self.answer is not None
+            or self.derivation_sha256 is not None
+        ):
             raise ValueError("failed predictions require only classified failure state")
         return self
 
@@ -164,6 +180,7 @@ def run_mlflow_evaluation(
         database_sha256: str,
         question: str,
         answer_schema: dict[str, JsonValue],
+        derivation: dict[str, JsonValue] | None = None,
     ) -> dict[str, JsonValue]:
         case = indexed.get(case_id)
         if case is None:
@@ -174,6 +191,7 @@ def run_mlflow_evaluation(
             or database_sha256 != canonical_pack.manifest.database.sha256
             or question != case.question
             or answer_schema != case.answer_schema
+            or derivation != _derivation_input(case.derivation)
         ):
             raise ValueError("evaluation input does not match its verified pack case")
         with capture_lock:
@@ -184,6 +202,7 @@ def run_mlflow_evaluation(
             database_path=canonical_pack.database_path,
             question=case.question,
             answer_schema=case.answer_schema,
+            derivation=case.derivation,
             model=canonical_model,
             policy=canonical_policy,
         )
@@ -242,12 +261,16 @@ def evaluation_prediction(
 ) -> MlflowEvaluationPrediction:
     """Project canonical completion state into bounded evaluation output."""
     if isinstance(completion.outcome, RunSuccess):
+        verification = completion.outcome.derivation_verification
         return MlflowEvaluationPrediction(
             case_id=case_id,
             run_id=completion.record.run_id,
             terminal_sha256=completion.retained_record.sha256,
             accepted=True,
             answer=deepcopy(completion.outcome.answer),
+            derivation_sha256=(
+                verification.derivation_sha256 if verification is not None else None
+            ),
             reporting=completion.reporting,
         )
     return MlflowEvaluationPrediction(
@@ -259,6 +282,14 @@ def evaluation_prediction(
         failure_code=completion.outcome.failure.code,
         reporting=completion.reporting,
     )
+
+
+def _derivation_input(
+    value: DerivationRequest | None,
+) -> dict[str, JsonValue] | None:
+    if value is None:
+        return None
+    return cast(dict[str, JsonValue], value.model_dump(mode="json"))
 
 
 def end_to_end_exact_success(

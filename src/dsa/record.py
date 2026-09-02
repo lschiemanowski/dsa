@@ -16,12 +16,13 @@ from jsonschema import Draft202012Validator
 from jsonschema.exceptions import ValidationError as JsonSchemaValidationError
 from pydantic import Field, JsonValue, model_validator
 
-from dsa.contract import ContractModel, RunRequest
+from dsa.contract import ContractModel, Derivation, RunRequest
 
 FailureStage = Literal[
     "model",
     "analysis_environment",
     "answer_validation",
+    "derivation_validation",
     "orchestration",
     "cancelled",
 ]
@@ -40,11 +41,37 @@ class Failure(ContractModel):
     diagnostics: dict[str, JsonValue] = Field(default_factory=dict)
 
 
+class DerivationVerification(ContractModel):
+    """Integrity evidence from replaying a derivation in an injected executor."""
+
+    status: Literal["verified"] = "verified"
+    derivation_sha256: str = Field(pattern=r"[0-9a-f]{64}")
+    result_sha256: str = Field(pattern=r"[0-9a-f]{64}")
+    source_database_sha256: str = Field(pattern=r"[0-9a-f]{64}")
+    runtime_identity: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=512,
+        exclude_if=lambda value: value is None,
+    )
+    notebook_relative_path: Literal["derivation.ipynb"] = "derivation.ipynb"
+    notebook_sha256: str = Field(pattern=r"[0-9a-f]{64}")
+    notebook_byte_length: Annotated[int, Field(gt=0)]
+
+
 class RunSuccess(ContractModel):
     """A caller-schema-valid answer."""
 
     status: Literal["succeeded"] = "succeeded"
     answer: JsonValue
+    derivation: Derivation | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    derivation_verification: DerivationVerification | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
 
 
 class RunFailure(ContractModel):
@@ -93,7 +120,7 @@ class DatabaseRecord(ContractModel):
 class TerminalRecord(ContractModel):
     """The single canonical debugging and reproducibility record for a run."""
 
-    schema_version: Literal["1"] = "1"
+    schema_version: Literal["1", "2"] = "1"
     run_id: str
     started_at: datetime
     finished_at: datetime
@@ -112,6 +139,9 @@ class TerminalRecord(ContractModel):
             raise ValueError("terminal timestamps must be timezone-aware")
         if self.finished_at < self.started_at:
             raise ValueError("finished_at must not precede started_at")
+        expected_schema_version = "2" if self.request.derivation is not None else "1"
+        if self.schema_version != expected_schema_version:
+            raise ValueError("terminal schema version must match the derivation contract")
         if isinstance(self.outcome, RunSuccess):
             validator = cast(
                 _AnswerValidator,
@@ -120,6 +150,34 @@ class TerminalRecord(ContractModel):
             errors = list(validator.iter_errors(self.outcome.answer))
             if errors:
                 raise ValueError("successful terminal answer violates the caller schema")
+            derivation_requested = self.request.derivation is not None
+            derivation_present = self.outcome.derivation is not None
+            verification = self.outcome.derivation_verification
+            if derivation_requested != derivation_present or derivation_present != (
+                verification is not None
+            ):
+                raise ValueError(
+                    "successful terminal derivation must match the request contract"
+                )
+            if derivation_requested:
+                assert self.outcome.derivation is not None
+                assert verification is not None
+                derivation_bytes = _canonical_json_bytes(
+                    self.outcome.derivation.model_dump(mode="json")
+                )
+                result_bytes = _canonical_json_bytes(self.outcome.answer)
+                if verification.derivation_sha256 != sha256(derivation_bytes).hexdigest():
+                    raise ValueError("derivation digest contradicts terminal content")
+                if verification.result_sha256 != sha256(result_bytes).hexdigest():
+                    raise ValueError("derivation result digest contradicts terminal answer")
+                if (
+                    self.database is None
+                    or verification.source_database_sha256
+                    != self.database.source_sha256
+                ):
+                    raise ValueError(
+                        "derivation source digest contradicts terminal database"
+                    )
         expected_handles = [f"a{index}" for index in range(1, len(self.artifacts) + 1)]
         if [artifact.handle for artifact in self.artifacts] != expected_handles:
             raise ValueError("artifact handles must be unique and sequential")
@@ -131,6 +189,14 @@ class RetainedTerminalRecord(ContractModel):
 
     path: Path
     sha256: str
+    byte_length: Annotated[int, Field(gt=0)]
+
+
+class RetainedDerivationNotebook(ContractModel):
+    """Integrity reference to one deterministic notebook projection."""
+
+    path: Path
+    sha256: str = Field(pattern=r"[0-9a-f]{64}")
     byte_length: Annotated[int, Field(gt=0)]
 
 
@@ -178,6 +244,16 @@ def write_terminal_record(
         sha256=sha256(content).hexdigest(),
         byte_length=len(content),
     )
+
+
+def _canonical_json_bytes(value: object) -> bytes:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
 
 
 def _fsync_directory(directory: Path) -> None:

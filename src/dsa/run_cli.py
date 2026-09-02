@@ -137,6 +137,13 @@ def _result_projection(completion: RunCompletion) -> dict[str, Any]:
             "sha256": retained.sha256,
         },
     }
+    notebook = completion.retained_notebook
+    if notebook is not None:
+        result["derivation_notebook"] = {
+            "byte_length": notebook.byte_length,
+            "path": str(notebook.path),
+            "sha256": notebook.sha256,
+        }
     outcome = completion.outcome
     if isinstance(outcome, RunFailure):
         result["failure"] = {

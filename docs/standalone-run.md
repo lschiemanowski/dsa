@@ -56,12 +56,39 @@ dsa-run \
 Add `--report-to-mlflow` to project the ordinary run to the configured Databricks
 experiment. Reporting failure does not change the local analysis outcome.
 
+### Optional verified derivation
+
+Set `derivation=DerivationRequest()` on `RunRequest` when this task should require a
+concise human-verification derivation. Leaving the field unset preserves the answer-only
+contract. For example:
+
+```python
+from dsa import DerivationRequest
+
+request = request.model_copy(
+    update={"derivation": DerivationRequest(format="dsa-derivation/v1")}
+)
+```
+
+For an opted-in task, the model returns the caller-schema answer plus bounded Markdown
+and Python cells. DSA independently replays those cells from the pristine source
+database through the configured Docker executor. The final code cell must leave the
+same JSON value in `result`; canonical JSON must match the submitted answer exactly.
+Exploratory mutations made earlier in the run are not visible to this replay.
+
+On success the command also returns a `derivation_notebook` object containing the exact
+path, SHA-256 digest, and byte length of `derivation.ipynb`. With MLflow reporting
+enabled, the same bytes are uploaded as `dsa/derivation.ipynb`. See
+[`milestone-7.md`](milestone-7.md) for the versioned cell, replay, evidence, and notebook
+contracts.
+
 The command writes one canonical JSON object to standard output. A successful result
 contains the schema-valid answer when its canonical encoding is at most 1 MiB. Larger
 answers remain available in the retained terminal record and are reported with
 `answer_inline: false`. A failed analysis exposes only its stable stage and code, not raw
 provider text. Every started run reports the exact terminal-record path, SHA-256 digest,
-and byte length.
+and byte length. A derivation-enabled success additionally reports the verified notebook
+identity; failures and answer-only runs do not create a notebook.
 
 Exit status is `0` for analysis success, `1` for a terminal analysis failure or an
 unexpected execution failure, `2` for invalid CLI input or request configuration, and

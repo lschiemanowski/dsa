@@ -16,6 +16,7 @@ from dsa import (
     PythonExecutionRequest,
     PythonExecutionResult,
     PythonExecutor,
+    RetainedDerivationNotebook,
     RetainedTerminalRecord,
     RunCompletion,
     RunFailure,
@@ -66,6 +67,7 @@ def completion(
     *,
     outcome: RunSuccess | RunFailure,
     reporting: MlflowReporting | None = None,
+    retained_notebook: RetainedDerivationNotebook | None = None,
 ) -> RunCompletion:
     run_directory = runs_directory / "run-001"
     retained = RetainedTerminalRecord(
@@ -83,6 +85,7 @@ def completion(
     return RunCompletion(
         record=record,
         retained_record=retained,
+        retained_notebook=retained_notebook,
         reporting=reporting or MlflowReporting(),
     )
 
@@ -167,6 +170,48 @@ def test_success_runs_one_resolved_request_with_the_hardened_executor(
             "path": str(runs_directory / "run-001/terminal.json"),
             "sha256": "f" * 64,
         },
+    }
+
+
+def test_success_projects_the_verified_derivation_notebook_identity(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    request_path = write_request(tmp_path)
+    runs_directory = tmp_path / "runs"
+
+    async def run(request: RunRequest, **kwargs: object) -> RunCompletion:
+        del kwargs
+        return completion(
+            request,
+            runs_directory,
+            outcome=RunSuccess(answer={"count": 3}),
+            retained_notebook=RetainedDerivationNotebook(
+                path=runs_directory / "run-001/derivation.ipynb",
+                sha256="d" * 64,
+                byte_length=456,
+            ),
+        )
+
+    status = main(
+        [
+            "--request",
+            str(request_path),
+            "--runs-directory",
+            str(runs_directory),
+            "--docker-image",
+            IMAGE,
+        ],
+        runner=run,
+        executor_factory=lambda _image: StubExecutor(),
+    )
+
+    assert status == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["derivation_notebook"] == {
+        "byte_length": 456,
+        "path": str(runs_directory / "run-001/derivation.ipynb"),
+        "sha256": "d" * 64,
     }
 
 

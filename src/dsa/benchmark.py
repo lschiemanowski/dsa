@@ -64,6 +64,10 @@ ImmutableImage = Annotated[
 PositiveBounded = Annotated[int, Field(gt=0, le=64)]
 
 
+def _cell_container_bound(case_workers: int, policy: RunPolicy) -> int:
+    return case_workers * (policy.max_tool_calls + policy.max_validation_attempts)
+
+
 class BenchmarkPack(ContractModel):
     """One exact evaluation pack selected by a portable study."""
 
@@ -110,7 +114,7 @@ class BenchmarkStudy(ContractModel):
         if len(self.packs) * len(self.models) * self.repetitions > 10_000:
             raise ValueError("benchmark study contains too many cells")
         if (
-            self.execution.case_workers * self.policy.max_tool_calls
+            _cell_container_bound(self.execution.case_workers, self.policy)
             > _MAX_CELL_CONTAINERS
         ):
             raise ValueError("benchmark cell container concurrency is too large")
@@ -214,7 +218,7 @@ class BenchmarkCellInvocation(ContractModel):
 
     @model_validator(mode="after")
     def cleanup_container_count_is_bounded(self) -> BenchmarkCellInvocation:
-        if self.case_workers * self.policy.max_tool_calls > _MAX_CELL_CONTAINERS:
+        if _cell_container_bound(self.case_workers, self.policy) > _MAX_CELL_CONTAINERS:
             raise ValueError("benchmark cell container concurrency is too large")
         return self
 
@@ -903,7 +907,7 @@ async def remove_benchmark_cell_containers(
     """Force-remove the bounded set of containers labeled for one cell attempt."""
     configuration = default_docker_configuration(invocation.docker_image)
     selected_runner = runner or AsyncSubprocessDockerRunner()
-    container_bound = invocation.case_workers * invocation.policy.max_tool_calls
+    container_bound = _cell_container_bound(invocation.case_workers, invocation.policy)
     try:
         listed = await selected_runner.run(
             (

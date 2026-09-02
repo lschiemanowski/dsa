@@ -22,6 +22,7 @@ from dsa import RunFailure, RunRequest, RunSuccess, run_analysis
 from dsa.environment import PythonExecutionRequest, PythonExecutionResult
 
 from .test_contract import DRAFT_2020_12, request_value
+from .test_derivation import ResultExecutor, sample_derivation
 
 
 def valid_request(tmp_path: Path, **policy: int) -> RunRequest:
@@ -119,6 +120,66 @@ async def test_valid_structured_answer_succeeds_and_retains_native_messages(
     retained = json.loads(completion.retained_record.path.read_bytes())
     assert retained["outcome"] == {"status": "succeeded", "answer": {"count": 3}}
     assert retained["messages"] == list(completion.record.messages)
+
+
+async def test_opted_in_derivation_is_replayed_and_retained_with_a_notebook(
+    tmp_path: Path,
+) -> None:
+    request = valid_request(tmp_path)
+    request = RunRequest.model_validate(
+        {
+            **request.model_dump(mode="python", round_trip=True),
+            "derivation": {"format": "dsa-derivation/v1"},
+        }
+    )
+    derivation = sample_derivation()
+
+    completion = await run_analysis(
+        request,
+        runs_directory=tmp_path / "runs",
+        model=TestModel(
+            call_tools=[],
+            custom_output_args={
+                "answer": {"count": 3},
+                "derivation": derivation.model_dump(mode="json"),
+            },
+        ),
+        python_executor=ResultExecutor({"count": 3}),
+        identity_factory=lambda: "run-derived",
+        clock=clock(),
+    )
+
+    assert isinstance(completion.outcome, RunSuccess)
+    assert completion.outcome.answer == {"count": 3}
+    assert completion.outcome.derivation == derivation
+    assert completion.outcome.derivation_verification is not None
+    assert completion.record.schema_version == "2"
+    assert completion.retained_notebook is not None
+    assert completion.retained_notebook.path.is_file()
+    retained = json.loads(completion.retained_record.path.read_bytes())
+    assert retained["request"]["derivation"] == {"format": "dsa-derivation/v1"}
+    assert retained["outcome"]["derivation"]["cells"][0]["type"] == "markdown"
+    assert retained["outcome"]["derivation_verification"]["status"] == "verified"
+
+
+async def test_answer_only_run_keeps_legacy_terminal_and_creates_no_notebook(
+    tmp_path: Path,
+) -> None:
+    completion = await run_analysis(
+        valid_request(tmp_path),
+        runs_directory=tmp_path / "runs",
+        model=TestModel(call_tools=[], custom_output_args={"count": 3}),
+        identity_factory=lambda: "run-answer-only",
+        clock=clock(),
+    )
+
+    assert isinstance(completion.outcome, RunSuccess)
+    assert completion.record.schema_version == "1"
+    assert completion.outcome.derivation is None
+    assert completion.retained_notebook is None
+    retained = json.loads(completion.retained_record.path.read_bytes())
+    assert retained["outcome"] == {"status": "succeeded", "answer": {"count": 3}}
+    assert "derivation" not in retained["request"]
 
 
 async def test_python_tool_is_absent_without_an_injected_executor(tmp_path: Path) -> None:
@@ -503,6 +564,80 @@ class MutatingEpisodeExecutor:
         )
 
 
+class MutatingAndDerivingExecutor:
+    async def execute(self, request: PythonExecutionRequest) -> PythonExecutionResult:
+        connection = duckdb.connect(str(request.database_path))
+        try:
+            if not request.expected_outputs:
+                connection.execute("insert into events values (12, 'event-12')")
+            else:
+                row = cast(
+                    tuple[int],
+                    connection.execute("select count(*) from events").fetchone(),
+                )
+                count = row[0]
+                (request.output_directory / "result.json").write_text(
+                    json.dumps({"count": count}),
+                    encoding="utf-8",
+                )
+        finally:
+            connection.close()
+        return PythonExecutionResult(
+            runtime_identity="docker/test|sha256:" + "2" * 64,
+        )
+
+
+class SequenceDerivationExecutor:
+    def __init__(self, results: list[JsonValue]) -> None:
+        self.results = results
+        self.calls = 0
+
+    async def execute(self, request: PythonExecutionRequest) -> PythonExecutionResult:
+        result = self.results[self.calls]
+        self.calls += 1
+        (request.output_directory / "result.json").write_text(
+            json.dumps(result),
+            encoding="utf-8",
+        )
+        return PythonExecutionResult(runtime_identity="docker/test")
+
+
+class ArtifactAndDerivationExecutor:
+    async def execute(self, request: PythonExecutionRequest) -> PythonExecutionResult:
+        if request.expected_outputs == ("answer.json",):
+            table = parquet.read_table(  # pyright: ignore[reportUnknownMemberType]
+                request.inputs_directory / "a1.parquet"
+            )
+            result = {"count": table.num_rows}
+            name = "answer.json"
+        else:
+            assert request.expected_outputs == ("result.json",)
+            connection = duckdb.connect(str(request.database_path), read_only=True)
+            try:
+                row = cast(
+                    tuple[int],
+                    connection.execute("select count(*) from events").fetchone(),
+                )
+                count = row[0]
+            finally:
+                connection.close()
+            result = {"count": count}
+            name = "result.json"
+        (request.output_directory / name).write_text(json.dumps(result), encoding="utf-8")
+        return PythonExecutionResult(runtime_identity="docker/test")
+
+
+class BlockingDerivationExecutor:
+    def __init__(self) -> None:
+        self.entered = asyncio.Event()
+
+    async def execute(self, request: PythonExecutionRequest) -> PythonExecutionResult:
+        del request
+        self.entered.set()
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+
 async def test_run_uses_private_database_commits_mutation_and_cleans_workspace(
     tmp_path: Path,
 ) -> None:
@@ -567,6 +702,280 @@ async def test_run_uses_private_database_commits_mutation_and_cleans_workspace(
         and part.get("tool_name") == "query_database"
     ]
     assert any(result.get("rows") == [[13]] for result in tool_results)
+
+
+async def test_derivation_replays_from_pristine_source_not_exploratory_state(
+    tmp_path: Path,
+) -> None:
+    request = valid_database_request(tmp_path)
+    request = RunRequest.model_validate(
+        {
+            **request.model_dump(mode="python", round_trip=True),
+            "derivation": {"format": "dsa-derivation/v1"},
+        }
+    )
+    calls = 0
+
+    async def respond(_messages: list[Any], _info: AgentInfo) -> ModelResponse:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        "run_python",
+                        {"source": "# exploratory mutation", "inputs": [], "expected_outputs": []},
+                        "mutate",
+                    )
+                ]
+            )
+        return ModelResponse(
+            parts=[
+                ToolCallPart(
+                    "final_answer",
+                    {
+                        "answer": {"count": 12},
+                        "derivation": sample_derivation().model_dump(mode="json"),
+                    },
+                    "derived-answer",
+                )
+            ]
+        )
+
+    completion = await run_analysis(
+        request,
+        runs_directory=tmp_path / "runs",
+        model=FunctionModel(respond, model_name="test"),
+        python_executor=MutatingAndDerivingExecutor(),
+        identity_factory=lambda: "run-pristine-derivation",
+        clock=clock(),
+    )
+
+    assert isinstance(completion.outcome, RunSuccess)
+    assert completion.outcome.answer == {"count": 12}
+    assert completion.record.database is not None
+    assert completion.record.database.final_sha256 != completion.record.database.source_sha256
+
+
+async def test_derivation_mismatch_retries_then_accepts_reproduced_answer(
+    tmp_path: Path,
+) -> None:
+    request = valid_request(tmp_path, max_validation_attempts=2)
+    request = RunRequest.model_validate(
+        {
+            **request.model_dump(mode="python", round_trip=True),
+            "derivation": {"format": "dsa-derivation/v1"},
+        }
+    )
+    model_calls = 0
+
+    async def respond(_messages: list[Any], _info: AgentInfo) -> ModelResponse:
+        nonlocal model_calls
+        model_calls += 1
+        return ModelResponse(
+            parts=[
+                ToolCallPart(
+                    "final_answer",
+                    {
+                        "answer": {"count": 3},
+                        "derivation": sample_derivation().model_dump(mode="json"),
+                    },
+                    f"answer-{model_calls}",
+                )
+            ]
+        )
+
+    executor = SequenceDerivationExecutor([{"count": 4}, {"count": 3}])
+    completion = await run_analysis(
+        request,
+        runs_directory=tmp_path / "runs",
+        model=FunctionModel(respond, model_name="test"),
+        python_executor=executor,
+        identity_factory=lambda: "run-derivation-retry",
+        clock=clock(),
+    )
+
+    assert model_calls == 2
+    assert executor.calls == 2
+    assert isinstance(completion.outcome, RunSuccess)
+    assert "derivation_result_mismatch" in json.dumps(completion.record.messages)
+
+
+async def test_exhausted_derivation_mismatches_are_a_typed_agent_failure(
+    tmp_path: Path,
+) -> None:
+    request = valid_request(tmp_path, max_validation_attempts=2)
+    request = RunRequest.model_validate(
+        {
+            **request.model_dump(mode="python", round_trip=True),
+            "derivation": {"format": "dsa-derivation/v1"},
+        }
+    )
+
+    completion = await run_analysis(
+        request,
+        runs_directory=tmp_path / "runs",
+        model=TestModel(
+            call_tools=[],
+            custom_output_args={
+                "answer": {"count": 3},
+                "derivation": sample_derivation().model_dump(mode="json"),
+            },
+        ),
+        python_executor=SequenceDerivationExecutor([{"count": 4}, {"count": 4}]),
+        identity_factory=lambda: "run-derivation-exhausted",
+        clock=clock(),
+    )
+
+    assert isinstance(completion.outcome, RunFailure)
+    assert completion.outcome.failure.stage == "derivation_validation"
+    assert completion.outcome.failure.code == "attempts_exhausted"
+    assert completion.outcome.failure.diagnostics == {"attempts": 2}
+    assert completion.retained_notebook is None
+
+
+async def test_invalid_derivation_cell_sequence_uses_bounded_retries(
+    tmp_path: Path,
+) -> None:
+    request = valid_request(tmp_path, max_validation_attempts=2)
+    request = RunRequest.model_validate(
+        {
+            **request.model_dump(mode="python", round_trip=True),
+            "derivation": {"format": "dsa-derivation/v1"},
+        }
+    )
+    invalid = {
+        "format": "dsa-derivation/v1",
+        "cells": [
+            {"type": "code", "source": "value = 3"},
+            {"type": "code", "source": "result = {'count': value}"},
+        ],
+    }
+    completion = await run_analysis(
+        request,
+        runs_directory=tmp_path / "runs",
+        model=TestModel(
+            call_tools=[],
+            custom_output_args={"answer": {"count": 3}, "derivation": invalid},
+        ),
+        python_executor=ResultExecutor({"count": 3}),
+        identity_factory=lambda: "run-invalid-derivation-shape",
+        clock=clock(),
+    )
+
+    assert isinstance(completion.outcome, RunFailure)
+    assert completion.outcome.failure.stage == "derivation_validation"
+    assert completion.outcome.failure.code == "attempts_exhausted"
+    assert completion.outcome.failure.diagnostics == {"attempts": 2}
+
+
+async def test_derivation_can_accompany_a_retained_artifact_answer(
+    tmp_path: Path,
+) -> None:
+    request = valid_database_request(tmp_path)
+    request = RunRequest.model_validate(
+        {
+            **request.model_dump(mode="python", round_trip=True),
+            "derivation": {"format": "dsa-derivation/v1"},
+        }
+    )
+    calls = 0
+
+    async def respond(_messages: list[Any], _info: AgentInfo) -> ModelResponse:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        "query_database",
+                        {"sql": "select * from events order by event_id"},
+                        "query-for-derived-artifact",
+                    )
+                ]
+            )
+        if calls == 2:
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        "run_python",
+                        {
+                            "source": "# write answer.json from a1",
+                            "inputs": ["a1"],
+                            "expected_outputs": ["answer.json"],
+                        },
+                        "write-derived-artifact",
+                    )
+                ]
+            )
+        return ModelResponse(
+            parts=[
+                ToolCallPart(
+                    "answer_from_artifact",
+                    {
+                        "handle": "a2",
+                        "derivation": sample_derivation().model_dump(mode="json"),
+                    },
+                    "submit-derived-artifact",
+                )
+            ]
+        )
+
+    completion = await run_analysis(
+        request,
+        runs_directory=tmp_path / "runs",
+        model=FunctionModel(respond, model_name="test"),
+        python_executor=ArtifactAndDerivationExecutor(),
+        identity_factory=lambda: "run-derived-artifact",
+        clock=clock(),
+    )
+
+    assert calls == 3
+    assert isinstance(completion.outcome, RunSuccess)
+    assert completion.outcome.answer == {"count": 12}
+    assert completion.outcome.derivation_verification is not None
+    assert completion.retained_notebook is not None
+
+
+async def test_cancellation_during_derivation_replay_retains_terminal_only(
+    tmp_path: Path,
+) -> None:
+    request = valid_request(tmp_path)
+    request = RunRequest.model_validate(
+        {
+            **request.model_dump(mode="python", round_trip=True),
+            "derivation": {"format": "dsa-derivation/v1"},
+        }
+    )
+    executor = BlockingDerivationExecutor()
+    task = asyncio.create_task(
+        run_analysis(
+            request,
+            runs_directory=tmp_path / "runs",
+            model=TestModel(
+                call_tools=[],
+                custom_output_args={
+                    "answer": {"count": 3},
+                    "derivation": sample_derivation().model_dump(mode="json"),
+                },
+            ),
+            python_executor=executor,
+            identity_factory=lambda: "run-cancelled-derivation",
+            clock=clock(),
+        )
+    )
+    await executor.entered.wait()
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError) as captured:
+        await task
+
+    error = cast(Any, captured.value)
+    assert error.terminal_record.outcome.failure.stage == "cancelled"
+    assert error.retained_record.path.is_file()
+    run_directory = tmp_path / "runs" / "run-cancelled-derivation"
+    assert not (run_directory / "derivation.ipynb").exists()
+    assert not (run_directory / "work").exists()
 
 
 async def test_operator_can_retain_private_database_for_debugging(tmp_path: Path) -> None:

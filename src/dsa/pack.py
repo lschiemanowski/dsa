@@ -16,7 +16,12 @@ from jsonschema import Draft202012Validator
 from jsonschema.exceptions import ValidationError as JsonSchemaValidationError
 from pydantic import Field, JsonValue, field_validator, model_validator
 
-from dsa.contract import ContractModel, ensure_finite_json, snapshot_answer_schema
+from dsa.contract import (
+    ContractModel,
+    DerivationRequest,
+    ensure_finite_json,
+    snapshot_answer_schema,
+)
 
 Sha256 = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
 PositiveSize = Annotated[int, Field(gt=0)]
@@ -159,6 +164,10 @@ class EvaluationPackCase(ContractModel):
     case_version: SafeName
     question: str
     answer_schema: dict[str, JsonValue]
+    derivation: DerivationRequest | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
     expected_answer: JsonValue
     metadata: EvaluationCaseMetadata
 
@@ -196,15 +205,21 @@ class EvaluationPackCase(ContractModel):
         manifest: EvaluationPackManifest,
     ) -> dict[str, JsonValue]:
         """Project portable inputs, host-only expectations, and descriptive tags."""
+        inputs: dict[str, JsonValue] = {
+            "case_id": self.case_id,
+            "case_version": self.case_version,
+            "database_id": manifest.database.id,
+            "database_sha256": manifest.database.sha256,
+            "question": self.question,
+            "answer_schema": deepcopy(self.answer_schema),
+        }
+        if self.derivation is not None:
+            inputs["derivation"] = cast(
+                JsonValue,
+                self.derivation.model_dump(mode="json"),
+            )
         return {
-            "inputs": {
-                "case_id": self.case_id,
-                "case_version": self.case_version,
-                "database_id": manifest.database.id,
-                "database_sha256": manifest.database.sha256,
-                "question": self.question,
-                "answer_schema": deepcopy(self.answer_schema),
-            },
+            "inputs": inputs,
             "expectations": self.scoring_expectations(manifest),
             "tags": {
                 "family": self.metadata.family,
