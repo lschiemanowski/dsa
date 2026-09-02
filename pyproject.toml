@@ -7,6 +7,7 @@ requires-python = ">=3.12,<3.15"
 dependencies = [
     "duckdb==1.5.5",
     "jsonschema>=4.25,<5",
+    "nbformat>=5.10,<6",
     "pyarrow==25.0.1",
     "pydantic>=2.12,<3",
     "pydantic-ai-slim[openai]>=1.107,<2",

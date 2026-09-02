@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from copy import deepcopy
 from pathlib import Path
 from typing import cast
@@ -7,9 +8,21 @@ from typing import cast
 import pytest
 from pydantic import JsonValue, ValidationError
 
-from dsa import ModelConfiguration, RunPolicy, RunRequest
+from dsa import Derivation, ModelConfiguration, RunPolicy, RunRequest
 
 DRAFT_2020_12 = "https://json-schema.org/draft/2020-12/schema"
+
+
+def local_reference_answer_schema() -> dict[str, object]:
+    return {
+        "$schema": DRAFT_2020_12,
+        "$defs": {"count": {"type": "integer", "minimum": 0}},
+        "type": "object",
+        "properties": {"count": {"$ref": "#/$defs/count"}},
+        "required": ["count"],
+    }
+
+
 ANSWER_SCHEMA = {
     "$schema": DRAFT_2020_12,
     "type": "object",
@@ -58,6 +71,60 @@ def test_request_is_compact_strict_and_json_serializable(tmp_path: Path) -> None
 
     with pytest.raises(ValidationError, match="extra_forbidden"):
         RunRequest.model_validate({**raw, "expectations": {"count": 3}})
+
+
+def test_derivation_is_strictly_opt_in_without_changing_legacy_canonical_bytes(
+    tmp_path: Path,
+) -> None:
+    raw = request_value(tmp_path / "source.duckdb")
+    legacy = RunRequest.model_validate(raw)
+    enabled = RunRequest.model_validate(
+        {**raw, "derivation": {"format": "dsa-derivation/v1"}}
+    )
+
+    assert "derivation" not in legacy.model_dump(mode="json")
+    assert "derivation" not in json.loads(legacy.model_dump_json())
+    assert enabled.model_dump(mode="json")["derivation"] == {
+        "format": "dsa-derivation/v1"
+    }
+
+    with pytest.raises(ValidationError):
+        RunRequest.model_validate({**raw, "derivation": {"format": "unknown"}})
+
+
+def test_derivation_cells_are_bounded_and_notebook_shaped() -> None:
+    derivation = Derivation.model_validate(
+        {
+            "format": "dsa-derivation/v1",
+            "cells": [
+                {"type": "markdown", "source": "Count the relevant rows."},
+                {"type": "code", "source": "result = {'count': 3}"},
+            ],
+        }
+    )
+
+    assert [cell.type for cell in derivation.cells] == ["markdown", "code"]
+    with pytest.raises(ValidationError, match="begin with an explanatory markdown"):
+        Derivation.model_validate(
+            {
+                "format": "dsa-derivation/v1",
+                "cells": [
+                    {"type": "code", "source": "value = 3"},
+                    {"type": "code", "source": "result = {'count': value}"},
+                ],
+            }
+        )
+    with pytest.raises(ValidationError, match="end with a code cell"):
+        Derivation.model_validate(
+            {
+                "format": "dsa-derivation/v1",
+                "cells": [
+                    {"type": "markdown", "source": "Explain."},
+                    {"type": "code", "source": "result = {'count': 3}"},
+                    {"type": "markdown", "source": "Done."},
+                ],
+            }
+        )
 
 
 def test_request_snapshots_caller_owned_json(tmp_path: Path) -> None:
@@ -109,13 +176,7 @@ def test_answer_contract_must_be_valid_draft_2020_12(
 
 def test_answer_contract_allows_local_refs_but_rejects_external_refs(tmp_path: Path) -> None:
     local = request_value(tmp_path / "source.duckdb")
-    local["answer_schema"] = {
-        "$schema": DRAFT_2020_12,
-        "$defs": {"count": {"type": "integer", "minimum": 0}},
-        "type": "object",
-        "properties": {"count": {"$ref": "#/$defs/count"}},
-        "required": ["count"],
-    }
+    local["answer_schema"] = local_reference_answer_schema()
     external = deepcopy(local)
     external_schema = external["answer_schema"]
     assert isinstance(external_schema, dict)

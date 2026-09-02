@@ -5,17 +5,22 @@ from __future__ import annotations
 import asyncio
 import json
 from datetime import UTC, datetime
+from hashlib import sha256
 from pathlib import Path
 from typing import Any, cast
 
 import pytest
+from pydantic import ValidationError
 
 from dsa import (
+    DatabaseRecord,
+    DerivationVerification,
     Failure,
     MlflowReporting,
     PythonExecutionRequest,
     PythonExecutionResult,
     PythonExecutor,
+    RetainedDerivationNotebook,
     RetainedTerminalRecord,
     RunCompletion,
     RunFailure,
@@ -26,6 +31,7 @@ from dsa import (
 from dsa.run_cli import main
 
 from .test_contract import request_value
+from .test_derivation import sample_derivation
 
 IMAGE = f"sha256:{'a' * 64}"
 
@@ -41,10 +47,13 @@ def write_request(
     *,
     database_path: Path | None = None,
     answer_schema: dict[str, object] | None = None,
+    derivation: bool = False,
 ) -> Path:
     raw = request_value(database_path or Path("data/source.duckdb"))
     if answer_schema is not None:
         raw["answer_schema"] = answer_schema
+    if derivation:
+        raw["derivation"] = {"format": "dsa-derivation/v1"}
     request = RunRequest.model_validate(raw)
     path = tmp_path / "task.json"
     path.write_text(
@@ -66,6 +75,8 @@ def completion(
     *,
     outcome: RunSuccess | RunFailure,
     reporting: MlflowReporting | None = None,
+    retained_notebook: RetainedDerivationNotebook | None = None,
+    database: DatabaseRecord | None = None,
 ) -> RunCompletion:
     run_directory = runs_directory / "run-001"
     retained = RetainedTerminalRecord(
@@ -74,15 +85,18 @@ def completion(
         byte_length=123,
     )
     record = TerminalRecord(
+        schema_version="2" if request.derivation is not None else "1",
         run_id="run-001",
         started_at=datetime(2026, 8, 31, 8, 0, tzinfo=UTC),
         finished_at=datetime(2026, 8, 31, 8, 1, tzinfo=UTC),
         request=request,
+        database=database,
         outcome=outcome,
     )
     return RunCompletion(
         record=record,
         retained_record=retained,
+        retained_notebook=retained_notebook,
         reporting=reporting or MlflowReporting(),
     )
 
@@ -167,6 +181,147 @@ def test_success_runs_one_resolved_request_with_the_hardened_executor(
             "path": str(runs_directory / "run-001/terminal.json"),
             "sha256": "f" * 64,
         },
+    }
+
+
+def test_success_projects_the_verified_derivation_notebook_identity(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    request_path = write_request(tmp_path, derivation=True)
+    runs_directory = tmp_path / "runs"
+    derivation = sample_derivation()
+    derivation_bytes = json.dumps(
+        derivation.model_dump(mode="json"),
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    answer_bytes = b'{"count":3}'
+    source_sha256 = "a" * 64
+    notebook_sha256 = "d" * 64
+    verification = DerivationVerification(
+        derivation_sha256=sha256(derivation_bytes).hexdigest(),
+        result_sha256=sha256(answer_bytes).hexdigest(),
+        source_database_sha256=source_sha256,
+        runtime_identity="docker/test",
+        notebook_sha256=notebook_sha256,
+        notebook_byte_length=456,
+    )
+    produced: list[RunCompletion] = []
+
+    async def run(request: RunRequest, **kwargs: object) -> RunCompletion:
+        del kwargs
+        selected = completion(
+            request,
+            runs_directory,
+            outcome=RunSuccess(
+                answer={"count": 3},
+                derivation=derivation,
+                derivation_verification=verification,
+            ),
+            retained_notebook=RetainedDerivationNotebook(
+                path=runs_directory / "run-001/derivation.ipynb",
+                sha256=notebook_sha256,
+                byte_length=456,
+            ),
+            database=DatabaseRecord(
+                source_sha256=source_sha256,
+                final_sha256=source_sha256,
+            ),
+        )
+        produced.append(selected)
+        return selected
+
+    status = main(
+        [
+            "--request",
+            str(request_path),
+            "--runs-directory",
+            str(runs_directory),
+            "--docker-image",
+            IMAGE,
+        ],
+        runner=run,
+        executor_factory=lambda _image: StubExecutor(),
+    )
+
+    assert status == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["derivation_notebook"] == {
+        "byte_length": 456,
+        "path": str(runs_directory / "run-001/derivation.ipynb"),
+        "sha256": "d" * 64,
+    }
+    raw = produced[0].model_dump(mode="python")
+    with pytest.raises(ValidationError, match="requires its retained notebook"):
+        RunCompletion.model_validate({**raw, "retained_notebook": None})
+    retained_notebook = cast(dict[str, object], raw["retained_notebook"])
+    with pytest.raises(ValidationError, match="does not match"):
+        RunCompletion.model_validate(
+            {
+                **raw,
+                "retained_notebook": {
+                    **retained_notebook,
+                    "sha256": "e" * 64,
+                },
+            }
+        )
+
+
+def test_answer_only_completion_rejects_an_unbound_notebook(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    request = RunRequest.model_validate(request_value(tmp_path / "source.duckdb"))
+    with pytest.raises(ValidationError, match="must not retain a notebook"):
+        completion(
+            request,
+            tmp_path / "runs",
+            outcome=RunSuccess(answer={"count": 3}),
+            retained_notebook=RetainedDerivationNotebook(
+                path=tmp_path / "runs/run-001/derivation.ipynb",
+                sha256="d" * 64,
+                byte_length=456,
+            ),
+        )
+
+    request_path = write_request(tmp_path)
+
+    async def run(request: RunRequest, **kwargs: object) -> RunCompletion:
+        del kwargs
+        valid = completion(
+            request,
+            tmp_path / "runs",
+            outcome=RunSuccess(answer={"count": 3}),
+        )
+        return valid.model_copy(
+            update={
+                "retained_notebook": RetainedDerivationNotebook(
+                    path=tmp_path / "runs/run-001/derivation.ipynb",
+                    sha256="d" * 64,
+                    byte_length=456,
+                )
+            }
+        )
+
+    status = main(
+        [
+            "--request",
+            str(request_path),
+            "--runs-directory",
+            str(tmp_path / "runs"),
+            "--docker-image",
+            IMAGE,
+        ],
+        runner=run,
+        executor_factory=lambda _image: StubExecutor(),
+    )
+    assert status == 1
+    assert json.loads(capsys.readouterr().out) == {
+        "code": "run_execution_failed",
+        "status": "failed",
     }
 
 

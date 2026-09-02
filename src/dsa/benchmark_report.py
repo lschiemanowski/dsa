@@ -49,7 +49,13 @@ from dsa.evaluation import (
 )
 from dsa.mlflow_config import MlflowConfigurationError, load_mlflow_destination
 from dsa.pack import LoadedEvaluationPack, load_huggingface_evaluation_pack
-from dsa.record import FailureStage, RunFailure, RunSuccess, TerminalRecord
+from dsa.record import (
+    DerivationVerification,
+    FailureStage,
+    RunFailure,
+    RunSuccess,
+    TerminalRecord,
+)
 from dsa.reporting import MlflowReporting
 
 Sha256 = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
@@ -90,6 +96,7 @@ _REPORT_MARKDOWN_BYTES = 64 * 1024 * 1024
 _MAX_REPORT_CASE_EXECUTIONS = 100_000
 _RECEIPT_BYTES = 64 * 1024 * 1024
 _TERMINAL_BYTES = 64 * 1024 * 1024
+_DERIVATION_NOTEBOOK_BYTES = 2 * 1024 * 1024
 _MAX_CELL_ATTEMPTS = 10_000
 
 
@@ -1402,6 +1409,16 @@ def _verify_terminal_record_at(
                 prediction.answer,
             ):
                 raise ValueError("benchmark report terminal outcome does not match its receipt")
+            verification = terminal.outcome.derivation_verification
+            terminal_derivation_sha256 = (
+                verification.derivation_sha256 if verification is not None else None
+            )
+            if terminal_derivation_sha256 != prediction.derivation_sha256:
+                raise ValueError(
+                    "benchmark report derivation identity does not match its receipt"
+                )
+            if verification is not None:
+                _verify_derivation_notebook_at(run_descriptor, verification)
         elif not isinstance(terminal.outcome, RunFailure) or (
             terminal.outcome.failure.stage != prediction.failure_stage
             or terminal.outcome.failure.code != prediction.failure_code
@@ -1420,6 +1437,37 @@ def _verify_terminal_record_at(
             os.close(terminal_descriptor)
         if run_descriptor is not None:
             os.close(run_descriptor)
+
+
+def _verify_derivation_notebook_at(
+    run_descriptor: int,
+    verification: DerivationVerification,
+) -> None:
+    notebook_descriptor: int | None = None
+    try:
+        notebook_descriptor = os.open(
+            verification.notebook_relative_path,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=run_descriptor,
+        )
+        metadata = os.fstat(notebook_descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_size != verification.notebook_byte_length
+            or metadata.st_size <= 0
+            or metadata.st_size > _DERIVATION_NOTEBOOK_BYTES
+        ):
+            raise ValueError("benchmark report requires the exact derivation notebook")
+        with os.fdopen(notebook_descriptor, "rb") as source:
+            notebook_descriptor = None
+            digest = sha256()
+            while chunk := source.read(1024 * 1024):
+                digest.update(chunk)
+        if digest.hexdigest() != verification.notebook_sha256:
+            raise ValueError("benchmark report derivation notebook digest does not match")
+    finally:
+        if notebook_descriptor is not None:
+            os.close(notebook_descriptor)
 
 
 def _dataset_evidence(

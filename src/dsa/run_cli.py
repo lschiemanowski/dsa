@@ -11,7 +11,7 @@ from dsa.cli import HelpRequested, Parser, canonical_json, emit, read_contract
 from dsa.contract import RunRequest
 from dsa.docker import DockerPythonExecutor, default_docker_configuration
 from dsa.environment import PythonExecutor
-from dsa.record import RunFailure, RunSuccess
+from dsa.record import RunFailure, RunSuccess, validate_retained_derivation_notebook
 from dsa.runner import RunCompletion, run_analysis
 
 Runner = Callable[..., Coroutine[Any, Any, RunCompletion]]
@@ -68,7 +68,12 @@ def main(
         emit({"code": "run_execution_failed", "status": "failed"})
         return 1
 
-    emit(_result_projection(completion))
+    try:
+        result = _result_projection(completion)
+    except Exception:
+        emit({"code": "run_execution_failed", "status": "failed"})
+        return 1
+    emit(result)
     return 0 if isinstance(completion.outcome, RunSuccess) else 1
 
 
@@ -126,6 +131,11 @@ def _docker_executor(image: str) -> DockerPythonExecutor:
 
 
 def _result_projection(completion: RunCompletion) -> dict[str, Any]:
+    validate_retained_derivation_notebook(
+        completion.record,
+        completion.retained_record,
+        completion.retained_notebook,
+    )
     retained = completion.retained_record
     result: dict[str, Any] = {
         "reporting": completion.reporting.model_dump(mode="json", exclude_none=True),
@@ -137,6 +147,13 @@ def _result_projection(completion: RunCompletion) -> dict[str, Any]:
             "sha256": retained.sha256,
         },
     }
+    notebook = completion.retained_notebook
+    if notebook is not None:
+        result["derivation_notebook"] = {
+            "byte_length": notebook.byte_length,
+            "path": str(notebook.path),
+            "sha256": notebook.sha256,
+        }
     outcome = completion.outcome
     if isinstance(outcome, RunFailure):
         result["failure"] = {

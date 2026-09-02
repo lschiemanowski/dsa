@@ -9,8 +9,9 @@ import re
 import shutil
 import stat
 from collections.abc import Callable, Iterable, Sequence
+from contextlib import suppress
 from copy import deepcopy
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
@@ -20,7 +21,8 @@ from uuid import uuid4
 import duckdb
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import ValidationError as JsonSchemaValidationError
-from pydantic import JsonValue
+from pydantic import Field, JsonValue, model_validator
+from pydantic import ValidationError as PydanticValidationError
 from pydantic_ai import (
     Agent,
     ModelAPIError,
@@ -34,13 +36,18 @@ from pydantic_ai import (
     UnexpectedModelBehavior,
     UsageLimitExceeded,
 )
+from pydantic_ai.capabilities import PrepareOutputTools
 from pydantic_ai.messages import ModelMessagesTypeAdapter
 from pydantic_ai.models import Model
 from pydantic_ai.settings import ModelSettings
+from pydantic_ai.tools import ToolDefinition
 from pydantic_ai.usage import RunUsage, UsageLimits
 from pydantic_graph import End
+from referencing import Resource
+from referencing.jsonschema import DRAFT202012
 
-from dsa.contract import ContractModel, RunRequest
+from dsa.contract import ContractModel, Derivation, RunRequest
+from dsa.derivation import DerivationError, VerifiedDerivation, verify_derivation
 from dsa.environment import (
     AnalysisEnvironment,
     ArtifactError,
@@ -51,11 +58,13 @@ from dsa.record import (
     ArtifactRecord,
     DatabaseRecord,
     Failure,
+    RetainedDerivationNotebook,
     RetainedTerminalRecord,
     RunFailure,
     RunOutcome,
     RunSuccess,
     TerminalRecord,
+    validate_retained_derivation_notebook,
     write_terminal_record,
 )
 from dsa.reporting import MlflowReporting, run_with_mlflow_reporting
@@ -67,13 +76,30 @@ Artifact previews are incomplete orientation only. Use their managed paths from 
 Return only the requested answer through a provided structured output boundary.
 The answer must satisfy the caller's JSON Schema exactly.
 """
+_DERIVATION_INSTRUCTIONS = """\
+Alongside the answer, submit a concise dsa-derivation/v1 for a human verifier.
+This is a curated reproducibility document, not a transcript of your work.
+Omit exploration, false starts, and computations that are unnecessary to verify the answer.
+Begin with a brief Markdown explanation. Use plain Python code cells with brief explanations.
+Code cells share one namespace and receive database_path bound to the pristine source database.
+Do not depend on retained artifacts or prior database mutations.
+The final code cell must assign the exact JSON answer to result.
+The derivation is replayed independently and must reproduce the submitted answer exactly.
+"""
 
 
 class _AnswerValidator(Protocol):
     def iter_errors(self, instance: JsonValue) -> Iterable[JsonSchemaValidationError]: ...
 
 
+type _SchemaNode = dict[str, JsonValue] | bool
+
+
 class _ValidationAttemptsExceeded(Exception):
+    pass
+
+
+class _DerivationAttemptsExceeded(Exception):
     pass
 
 
@@ -89,7 +115,20 @@ class RunCompletion(ContractModel):
 
     record: TerminalRecord
     retained_record: RetainedTerminalRecord
+    retained_notebook: RetainedDerivationNotebook | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
     reporting: MlflowReporting = MlflowReporting()
+
+    @model_validator(mode="after")
+    def retained_notebook_matches_terminal(self) -> RunCompletion:
+        validate_retained_derivation_notebook(
+            self.record,
+            self.retained_record,
+            self.retained_notebook,
+        )
+        return self
 
     @property
     def outcome(self) -> RunOutcome:
@@ -166,9 +205,12 @@ async def _run_canonical_analysis(
     run_directory.mkdir(mode=0o700)
 
     try:
-        working_database, source_database_sha256 = _prepare_working_database(
-            canonical_request.database_path,
-            run_directory,
+        working_database, source_database_sha256, pristine_database = (
+            _prepare_working_database(
+                canonical_request.database_path,
+                run_directory,
+                preserve_pristine=canonical_request.derivation is not None,
+            )
         )
     except _SourceDatabaseError as error:
         outcome = RunFailure(
@@ -271,16 +313,32 @@ async def _run_canonical_analysis(
     messages: tuple[dict[str, JsonValue], ...] = ()
     usage: dict[str, JsonValue] = {}
     validation_failures = 0
+    derivation_failures = 0
+    verified_derivation: VerifiedDerivation | None = None
     running: Any | None = None
 
     caller_schema = canonical_request.answer_schema
-    wrapped = caller_schema.get("type") != "object"
-    framework_schema = _framework_schema(caller_schema, wrapped)
+    derivation_requested = canonical_request.derivation is not None
+    wrapped = not derivation_requested and caller_schema.get("type") != "object"
+    framework_schema = _framework_schema(
+        caller_schema,
+        wrapped,
+        derivation_requested=derivation_requested,
+    )
+    provider_framework_schema = (
+        _provider_derivation_schema(caller_schema) if derivation_requested else None
+    )
     validator = cast(_AnswerValidator, Draft202012Validator(caller_schema))
 
     async def validate_answer(proposal: Any) -> Any:
-        nonlocal validation_failures
-        answer = proposal.get("value") if wrapped else proposal
+        nonlocal derivation_failures, validation_failures, verified_derivation
+        answer = (
+            proposal.get("answer")
+            if derivation_requested
+            else proposal.get("value")
+            if wrapped
+            else proposal
+        )
         errors = sorted(
             validator.iter_errors(cast(JsonValue, answer)),
             key=_validation_error_key,
@@ -318,6 +376,46 @@ async def _run_canonical_analysis(
                     canonical_request.policy.max_tool_result_bytes,
                 )
             ) from error
+        if derivation_requested:
+            try:
+                try:
+                    derivation = Derivation.model_validate(proposal.get("derivation"))
+                except PydanticValidationError as error:
+                    raise DerivationError(
+                        "derivation_invalid",
+                        "The derivation does not satisfy its cell contract",
+                    ) from error
+                if pristine_database is None:
+                    raise DerivationError(
+                        "derivation_source_unavailable",
+                        "The private source database is unavailable for derivation replay",
+                        infrastructure=True,
+                    )
+                verified_derivation = await verify_derivation(
+                    derivation,
+                    cast(JsonValue, answer),
+                    question=canonical_request.question,
+                    source_database=pristine_database,
+                    source_database_sha256=source_database_sha256,
+                    run_directory=run_directory,
+                    policy=canonical_request.policy,
+                    python_executor=python_executor,
+                )
+            except DerivationError as error:
+                if error.infrastructure:
+                    raise
+                derivation_failures += 1
+                if derivation_failures >= canonical_request.policy.max_validation_attempts:
+                    raise _DerivationAttemptsExceeded from error
+                raise ModelRetry(
+                    _bounded_retry_feedback(
+                        [
+                            {"error": error.code, "message": error.message},
+                            {"error": error.code},
+                        ],
+                        canonical_request.policy.max_tool_result_bytes,
+                    )
+                ) from error
         return proposal
 
     async def answer_from_artifact(handle: str) -> JsonValue:
@@ -339,6 +437,17 @@ async def _run_canonical_analysis(
                 )
             ) from error
         return {"value": answer} if wrapped else answer
+
+    async def answer_and_derivation_from_artifact(
+        handle: str,
+        derivation: Derivation,
+    ) -> dict[str, JsonValue]:
+        """Submit one retained answer with its concise replayable derivation."""
+        answer = await answer_from_artifact(handle)
+        return {
+            "answer": answer,
+            "derivation": cast(JsonValue, derivation.model_dump(mode="json")),
+        }
 
     async def inspect_database(
         context: RunContext[None],
@@ -413,6 +522,39 @@ async def _run_canonical_analysis(
                     sequential=True,
                 )
             )
+        artifact_output = (
+            ToolOutput(
+                answer_and_derivation_from_artifact,
+                name="answer_from_artifact",
+                description=(
+                    "Submit a same-run retained JSON answer with its concise replayable "
+                    "human-verification derivation."
+                ),
+            )
+            if derivation_requested
+            else ToolOutput(
+                answer_from_artifact,
+                name="answer_from_artifact",
+                description="Submit a same-run retained JSON artifact as the final answer.",
+            )
+        )
+
+        def prepare_output_tools(
+            _context: RunContext[None],
+            definitions: list[ToolDefinition],
+        ) -> list[ToolDefinition]:
+            if provider_framework_schema is None:
+                return definitions
+            return [
+                replace(
+                    definition,
+                    parameters_json_schema=deepcopy(provider_framework_schema),
+                )
+                if definition.name == "final_answer"
+                else definition
+                for definition in definitions
+            ]
+
         agent = Agent(
             selected_model,
             output_type=[
@@ -425,17 +567,22 @@ async def _run_canonical_analysis(
                     name="final_answer",
                     description="Submit the exact caller-requested answer directly.",
                 ),
-                ToolOutput(
-                    answer_from_artifact,
-                    name="answer_from_artifact",
-                    description="Submit a same-run retained JSON artifact as the final answer.",
-                ),
+                artifact_output,
             ],
-            instructions=_INSTRUCTIONS,
+            instructions=(
+                _INSTRUCTIONS + _DERIVATION_INSTRUCTIONS
+                if derivation_requested
+                else _INSTRUCTIONS
+            ),
             name="dsa",
             retries={"output": canonical_request.policy.max_validation_attempts - 1},
             end_strategy="early",
             tools=tools,
+            capabilities=(
+                [PrepareOutputTools(prepare_output_tools)]
+                if derivation_requested
+                else None
+            ),
         )
         agent.output_validator(validate_answer)
         limits = UsageLimits(
@@ -471,8 +618,23 @@ async def _run_canonical_analysis(
                 if running.result is None:
                     raise RuntimeError("Pydantic AI completed without a result")
                 proposal = running.result.output
-                answer = proposal["value"] if wrapped else proposal
-                outcome: RunOutcome = RunSuccess(answer=cast(JsonValue, answer))
+                answer = (
+                    proposal["answer"]
+                    if derivation_requested
+                    else proposal["value"]
+                    if wrapped
+                    else proposal
+                )
+                if derivation_requested:
+                    if verified_derivation is None:
+                        raise RuntimeError("verified derivation state is unavailable")
+                    outcome = RunSuccess(
+                        answer=cast(JsonValue, answer),
+                        derivation=verified_derivation.derivation,
+                        derivation_verification=verified_derivation.verification,
+                    )
+                else:
+                    outcome = RunSuccess(answer=cast(JsonValue, answer))
     except asyncio.CancelledError as error:
         if running is not None:
             snapshot_messages, usage = _snapshot_run(running)
@@ -498,6 +660,11 @@ async def _run_canonical_analysis(
             source_database_sha256=source_database_sha256,
             working_database=working_database,
             keep_workdir=keep_workdir,
+            retained_notebook=(
+                verified_derivation.notebook
+                if verified_derivation is not None
+                else None
+            ),
         )
         retained_error = cast(Any, error)
         retained_error.terminal_record = completion.record
@@ -508,7 +675,11 @@ async def _run_canonical_analysis(
             snapshot_messages, usage = _snapshot_run(running)
             if len(snapshot_messages) > len(messages):
                 messages = snapshot_messages
-        outcome = _failure_outcome(error, validation_failures)
+        outcome = _failure_outcome(
+            error,
+            validation_failures,
+            derivation_failures,
+        )
 
     return _retain_completion(
         canonical_request,
@@ -523,19 +694,121 @@ async def _run_canonical_analysis(
         source_database_sha256=source_database_sha256,
         working_database=working_database,
         keep_workdir=keep_workdir,
+        retained_notebook=(
+            verified_derivation.notebook if verified_derivation is not None else None
+        ),
     )
 
 
 def _framework_schema(
     caller_schema: dict[str, JsonValue],
     wrapped: bool,
+    *,
+    derivation_requested: bool,
 ) -> dict[str, Any]:
+    if derivation_requested:
+        return _derivation_envelope({})
     if not wrapped:
         return deepcopy(caller_schema)
     return {
         "type": "object",
         "properties": {"value": deepcopy(caller_schema)},
         "required": ["value"],
+        "additionalProperties": False,
+    }
+
+
+def _provider_derivation_schema(
+    caller_schema: dict[str, JsonValue],
+) -> dict[str, JsonValue]:
+    """Compose the exact caller schema into the model-facing derivation envelope.
+
+    Pydantic validates the output through a reference-free envelope, while an
+    output-tool preparation hook supplies this exact schema to the provider.
+    Local JSON Pointer references are rebased to the caller schema's new location;
+    anchors and references inside nested resources retain their original scope.
+    """
+    answer_schema = deepcopy(caller_schema)
+    _rebase_local_references(answer_schema, rebase=True)
+    return _derivation_envelope(answer_schema)
+
+
+def _derivation_envelope(answer_schema: _SchemaNode) -> dict[str, JsonValue]:
+    return {
+        "type": "object",
+        "properties": {
+            "answer": answer_schema,
+            "derivation": cast(JsonValue, _derivation_schema()),
+        },
+        "required": ["answer", "derivation"],
+        "additionalProperties": False,
+    }
+
+
+def _rebase_local_references(
+    schema: _SchemaNode,
+    *,
+    rebase: bool,
+) -> None:
+    if isinstance(schema, bool):
+        return
+    resource = cast(Resource[_SchemaNode], DRAFT202012.create_resource(schema))
+    # Resource.id() returns the resolved resource identifier without its fragment.
+    # Empty and fragment-only IDs therefore keep the enclosing resource scope.
+    if resource.id():
+        rebase = False
+    if rebase:
+        for keyword in ("$ref", "$dynamicRef"):
+            reference = schema.get(keyword)
+            if reference == "#":
+                schema[keyword] = "#/properties/answer"
+            elif isinstance(reference, str) and reference.startswith("#/"):
+                schema[keyword] = f"#/properties/answer{reference[1:]}"
+
+    # The dialect supplies the schema-bearing children, avoiding traversal into
+    # literal JSON held by keywords such as const, enum, and examples.
+    for subresource in resource.subresources():
+        _rebase_local_references(
+            subresource.contents,
+            rebase=rebase,
+        )
+
+
+def _derivation_schema() -> dict[str, Any]:
+    source = {"type": "string", "minLength": 1, "maxLength": 32 * 1024}
+    return {
+        "type": "object",
+        "properties": {
+            "format": {"const": "dsa-derivation/v1"},
+            "cells": {
+                "type": "array",
+                "minItems": 2,
+                "maxItems": 24,
+                "items": {
+                    "oneOf": [
+                        {
+                            "type": "object",
+                            "properties": {
+                                "type": {"const": "markdown"},
+                                "source": deepcopy(source),
+                            },
+                            "required": ["type", "source"],
+                            "additionalProperties": False,
+                        },
+                        {
+                            "type": "object",
+                            "properties": {
+                                "type": {"const": "code"},
+                                "source": deepcopy(source),
+                            },
+                            "required": ["type", "source"],
+                            "additionalProperties": False,
+                        },
+                    ]
+                },
+            },
+        },
+        "required": ["format", "cells"],
         "additionalProperties": False,
     }
 
@@ -559,7 +832,11 @@ def _snapshot_run(running: Any) -> tuple[tuple[dict[str, JsonValue], ...], dict[
     return messages, cast(dict[str, JsonValue], raw_usage)
 
 
-def _failure_outcome(error: Exception, validation_failures: int) -> RunFailure:
+def _failure_outcome(
+    error: Exception,
+    validation_failures: int,
+    derivation_failures: int,
+) -> RunFailure:
     if isinstance(error, _ValidationAttemptsExceeded):
         return RunFailure(
             failure=Failure(
@@ -567,6 +844,25 @@ def _failure_outcome(error: Exception, validation_failures: int) -> RunFailure:
                 code="attempts_exhausted",
                 message="The model did not produce an answer satisfying the caller schema",
                 diagnostics={"attempts": validation_failures},
+            )
+        )
+    if isinstance(error, _DerivationAttemptsExceeded):
+        return RunFailure(
+            failure=Failure(
+                stage="derivation_validation",
+                code="attempts_exhausted",
+                message=(
+                    "The model did not produce a derivation that reproduced its answer"
+                ),
+                diagnostics={"attempts": derivation_failures},
+            )
+        )
+    if isinstance(error, DerivationError):
+        return RunFailure(
+            failure=Failure(
+                stage=("analysis_environment" if error.infrastructure else "derivation_validation"),
+                code=error.code,
+                message=error.message,
             )
         )
     if isinstance(error, ToolResultLimitExceeded):
@@ -603,6 +899,17 @@ def _failure_outcome(error: Exception, validation_failures: int) -> RunFailure:
             )
         )
     if isinstance(error, UnexpectedModelBehavior):
+        if derivation_failures:
+            return RunFailure(
+                failure=Failure(
+                    stage="derivation_validation",
+                    code="attempts_exhausted",
+                    message=(
+                        "The model did not produce a derivation that reproduced its answer"
+                    ),
+                    diagnostics={"attempts": derivation_failures},
+                )
+            )
         if validation_failures:
             return RunFailure(
                 failure=Failure(
@@ -664,6 +971,7 @@ def _retain_completion(
     source_database_sha256: str | None = None,
     working_database: Path | None = None,
     keep_workdir: bool = False,
+    retained_notebook: RetainedDerivationNotebook | None = None,
 ) -> RunCompletion:
     database: DatabaseRecord | None = None
     if source_database_sha256 is not None and working_database is not None:
@@ -691,7 +999,12 @@ def _retain_completion(
                     message="The private database workspace could not be removed",
                 )
             )
+    if not isinstance(outcome, RunSuccess) and retained_notebook is not None:
+        with suppress(OSError):
+            retained_notebook.path.unlink(missing_ok=True)
+        retained_notebook = None
     record = TerminalRecord(
+        schema_version=("2" if request.derivation is not None else "1"),
         run_id=run_id,
         started_at=started_at,
         finished_at=finished_at,
@@ -703,10 +1016,19 @@ def _retain_completion(
         outcome=outcome,
     )
     retained = write_terminal_record(record, run_directory)
-    return RunCompletion(record=record, retained_record=retained)
+    return RunCompletion(
+        record=record,
+        retained_record=retained,
+        retained_notebook=retained_notebook,
+    )
 
 
-def _prepare_working_database(source: Path, run_directory: Path) -> tuple[Path, str]:
+def _prepare_working_database(
+    source: Path,
+    run_directory: Path,
+    *,
+    preserve_pristine: bool,
+) -> tuple[Path, str, Path | None]:
     wal = Path(f"{source}.wal")
     if os.path.lexists(wal):
         raise _SourceDatabaseError(
@@ -769,8 +1091,12 @@ def _prepare_working_database(source: Path, run_directory: Path) -> tuple[Path, 
                 "The source database changed while its private copy was created",
             )
         os.replace(temporary, destination)
+        pristine: Path | None = None
+        if preserve_pristine:
+            pristine = work_directory / "source.duckdb"
+            os.link(destination, pristine)
         _fsync_directory(work_directory)
-        return destination, digest.hexdigest()
+        return destination, digest.hexdigest(), pristine
     except _SourceDatabaseError:
         shutil.rmtree(work_directory, ignore_errors=True)
         raise

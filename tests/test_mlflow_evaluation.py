@@ -14,7 +14,7 @@ import pytest
 from pydantic import JsonValue, ValidationError
 from pydantic_ai.models.test import TestModel
 
-from dsa import MlflowEvaluationError, MlflowReporting
+from dsa import DerivationRequest, MlflowEvaluationError, MlflowReporting
 from dsa.evaluation import (
     MlflowEvaluationPrediction,
     agent_failure,
@@ -175,6 +175,35 @@ def test_case_snapshots_expectation_and_keeps_it_out_of_inputs(tmp_path: Path) -
         "pack_version": "1.0.0",
         "source_level": "small",
     }
+
+
+def test_case_includes_derivation_request_only_when_opted_in(tmp_path: Path) -> None:
+    request = valid_request(tmp_path)
+    answer_only = EvaluationPackCase(
+        case_id="answer-only",
+        case_version="1",
+        question=request.question,
+        answer_schema=request.answer_schema,
+        expected_answer={"count": 3},
+        metadata=case_metadata(),
+    )
+    derived = EvaluationPackCase(
+        case_id="derived",
+        case_version="1",
+        question=request.question,
+        answer_schema=request.answer_schema,
+        derivation=DerivationRequest(),
+        expected_answer={"count": 3},
+        metadata=case_metadata(),
+    )
+    pack = evaluation_pack(tmp_path, answer_only, derived)
+
+    answer_inputs = answer_only.dataset_record(pack.manifest)["inputs"]
+    derived_inputs = derived.dataset_record(pack.manifest)["inputs"]
+    assert isinstance(answer_inputs, dict)
+    assert isinstance(derived_inputs, dict)
+    assert "derivation" not in answer_inputs
+    assert derived_inputs["derivation"] == {"format": "dsa-derivation/v1"}
 
 
 def test_case_rejects_expectation_outside_answer_schema(tmp_path: Path) -> None:

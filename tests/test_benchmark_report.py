@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from datetime import UTC, datetime, timedelta
+from hashlib import sha256
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -27,14 +28,23 @@ from dsa.benchmark_report import (
     create_benchmark_report,
     publish_benchmark_report,
 )
-from dsa.contract import RunRequest
+from dsa.contract import DerivationRequest, RunRequest
 from dsa.cost import unavailable_provider_cost
 from dsa.evaluation import MlflowEvaluationPrediction
-from dsa.pack import EvaluationCaseMetadata, EvaluationPackCase
-from dsa.record import Failure, RunFailure, RunSuccess, TerminalRecord, write_terminal_record
+from dsa.pack import EvaluationCaseMetadata, EvaluationPackCase, LoadedEvaluationPack
+from dsa.record import (
+    DatabaseRecord,
+    DerivationVerification,
+    Failure,
+    RunFailure,
+    RunSuccess,
+    TerminalRecord,
+    write_terminal_record,
+)
 from dsa.reporting import MlflowReporting
 
 from .test_benchmark_execution import prepared_benchmark, receipt
+from .test_derivation import sample_derivation
 from .test_episode import valid_request
 from .test_mlflow_evaluation import evaluation_pack
 
@@ -104,8 +114,46 @@ def retain_receipt_with_terminals(
         case = cases[prediction.case_id]
         run_directory = invocation.attempt_directory / "runs" / prediction.run_id
         run_directory.mkdir(parents=True)
+        verification: DerivationVerification | None = None
         if prediction.accepted:
-            outcome = RunSuccess(answer=prediction.answer)
+            if case.derivation is None:
+                outcome = RunSuccess(answer=prediction.answer)
+            else:
+                derivation = sample_derivation()
+                derivation_bytes = json.dumps(
+                    derivation.model_dump(mode="json"),
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode()
+                answer_bytes = json.dumps(
+                    prediction.answer,
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode()
+                notebook_bytes = b'{"cells":[],"nbformat":4,"nbformat_minor":5}\n'
+                (run_directory / "derivation.ipynb").write_bytes(notebook_bytes)
+                source_sha256 = next(
+                    pack.manifest.database.sha256
+                    for pack_id, pack in prepared.packs
+                    if pack_id == selected.pack_id
+                )
+                verification = DerivationVerification(
+                    derivation_sha256=sha256(derivation_bytes).hexdigest(),
+                    result_sha256=sha256(answer_bytes).hexdigest(),
+                    source_database_sha256=source_sha256,
+                    runtime_identity="docker/test",
+                    notebook_sha256=sha256(notebook_bytes).hexdigest(),
+                    notebook_byte_length=len(notebook_bytes),
+                )
+                outcome = RunSuccess(
+                    answer=prediction.answer,
+                    derivation=derivation,
+                    derivation_verification=verification,
+                )
         else:
             if prediction.failure_stage is None or prediction.failure_code is None:
                 raise AssertionError("failed test prediction must be classified")
@@ -122,7 +170,13 @@ def retain_receipt_with_terminals(
         )
         if len(response_ids) != len(provider_costs):
             raise AssertionError("test provider response evidence is misaligned")
+        source_sha256 = next(
+            pack.manifest.database.sha256
+            for pack_id, pack in prepared.packs
+            if pack_id == selected.pack_id
+        )
         terminal = TerminalRecord(
+            schema_version="2" if case.derivation is not None else "1",
             run_id=terminal_run_id or prediction.run_id,
             started_at=started_at,
             finished_at=started_at + timedelta(seconds=1),
@@ -134,6 +188,7 @@ def retain_receipt_with_terminals(
                 ),
                 question=case.question,
                 answer_schema=case.answer_schema,
+                derivation=case.derivation,
                 model=invocation.model_configuration,
                 policy=invocation.policy,
             ),
@@ -152,12 +207,27 @@ def retain_receipt_with_terminals(
                     strict=True,
                 )
             ),
+            database=(
+                DatabaseRecord(
+                    source_sha256=source_sha256,
+                    final_sha256=source_sha256,
+                )
+                if case.derivation is not None
+                else None
+            ),
             outcome=outcome,
         )
         retained = write_terminal_record(terminal, run_directory)
         predictions.append(
             prediction.model_copy(
-                update={"terminal_sha256": terminal_sha256 or retained.sha256}
+                update={
+                    "terminal_sha256": terminal_sha256 or retained.sha256,
+                    "derivation_sha256": (
+                        verification.derivation_sha256
+                        if verification is not None
+                        else None
+                    ),
+                }
             )
         )
     selected = selected.model_copy(update={"predictions": tuple(predictions)})
@@ -170,8 +240,9 @@ def complete_report_evidence(
     *,
     accepted_answer: object = None,
     provider_costs: tuple[float | None, ...] = (0.001, 0.002),
+    pack: LoadedEvaluationPack | None = None,
 ) -> tuple[PreparedBenchmark, EvidenceReader]:
-    prepared = prepared_benchmark(tmp_path)
+    prepared = prepared_benchmark(tmp_path, pack=pack)
     invocation = BenchmarkCellInvocation.from_prepared(prepared, prepared.cells[0], 1)
     selected_receipt = receipt(invocation)
     if accepted_answer is not None:
@@ -271,6 +342,42 @@ def test_report_recomputes_exact_counts_and_observed_usage(tmp_path: Path) -> No
     assert report.cells[0].cases[0].end_to_end_policy_success is True
     assert not hasattr(report.cells[0].cases[0], "answer")
     assert report.canonical_json.endswith("\n")
+
+
+def test_report_hashes_exact_local_derivation_notebook(tmp_path: Path) -> None:
+    request = valid_request(tmp_path)
+    case = EvaluationPackCase(
+        case_id="tiny-count",
+        case_version="1",
+        question=request.question,
+        answer_schema=request.answer_schema,
+        derivation=DerivationRequest(),
+        expected_answer={"count": 3},
+        metadata=EvaluationCaseMetadata(family="counting", source_level="small"),
+    )
+    pack = evaluation_pack(tmp_path, case)
+    prepared, reader = complete_report_evidence(tmp_path, pack=pack)
+
+    report = build_benchmark_report(
+        prepared.study,
+        prepared.runtime,
+        reporter_revision=REPORTER_REVISION,
+        pack_loader=lambda _reference: pack,
+        evidence_reader=reader,
+    )
+
+    assert report.overall.metrics.end_to_end_exact_success.numerator == 1
+    invocation = BenchmarkCellInvocation.from_prepared(prepared, prepared.cells[0], 1)
+    notebook = invocation.attempt_directory / "runs" / "run-id" / "derivation.ipynb"
+    notebook.write_bytes(b"tampered\n")
+    with pytest.raises(ValueError, match="derivation notebook"):
+        build_benchmark_report(
+            prepared.study,
+            prepared.runtime,
+            reporter_revision=REPORTER_REVISION,
+            pack_loader=lambda _reference: pack,
+            evidence_reader=reader,
+        )
 
 
 def test_report_uses_task_counts_instead_of_averaging_cell_rates(

@@ -13,6 +13,8 @@ from pydantic import ValidationError
 
 from dsa import (
     ArtifactRecord,
+    DatabaseRecord,
+    DerivationVerification,
     Failure,
     RetainedTerminalRecord,
     RunFailure,
@@ -23,6 +25,7 @@ from dsa import (
 )
 
 from .test_contract import request_value
+from .test_derivation import sample_derivation
 
 
 def request(tmp_path: Path) -> RunRequest:
@@ -103,6 +106,89 @@ def test_terminal_record_independently_rejects_invalid_success_answer(tmp_path: 
     raw["outcome"] = {"status": "succeeded", "answer": {"count": -1}}
 
     with pytest.raises(ValidationError, match="violates the caller schema"):
+        TerminalRecord.model_validate(raw)
+
+
+def test_terminal_record_requires_derivation_exactly_when_requested(
+    tmp_path: Path,
+) -> None:
+    derivation = sample_derivation()
+    request_raw = request_value(tmp_path / "source.duckdb")
+    request_raw["derivation"] = {"format": "dsa-derivation/v1"}
+    selected_request = RunRequest.model_validate(request_raw)
+    derivation_bytes = json.dumps(
+        derivation.model_dump(mode="json"),
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    answer_bytes = b'{"count":3}'
+    source_digest = "a" * 64
+    verification = DerivationVerification(
+        derivation_sha256=sha256(derivation_bytes).hexdigest(),
+        result_sha256=sha256(answer_bytes).hexdigest(),
+        source_database_sha256=source_digest,
+        runtime_identity="docker/test",
+        notebook_sha256="b" * 64,
+        notebook_byte_length=100,
+    )
+    derived = TerminalRecord(
+        schema_version="2",
+        run_id="run-derived",
+        started_at=datetime(2026, 8, 26, 8, 0, tzinfo=UTC),
+        finished_at=datetime(2026, 8, 26, 8, 1, tzinfo=UTC),
+        request=selected_request,
+        database=DatabaseRecord(
+            source_sha256=source_digest,
+            final_sha256=source_digest,
+        ),
+        outcome=RunSuccess(
+            answer={"count": 3},
+            derivation=derivation,
+            derivation_verification=verification,
+        ),
+    )
+
+    assert derived.schema_version == "2"
+    with pytest.raises(ValidationError, match="schema version"):
+        TerminalRecord.model_validate(
+            {**derived.model_dump(mode="python"), "schema_version": "1"}
+        )
+    with pytest.raises(ValidationError, match="must match the request contract"):
+        TerminalRecord.model_validate(
+            {
+                **derived.model_dump(mode="python"),
+                "outcome": {"status": "succeeded", "answer": {"count": 3}},
+            }
+        )
+    with pytest.raises(ValidationError, match="digest contradicts"):
+        TerminalRecord.model_validate(
+            {
+                **derived.model_dump(mode="python"),
+                "outcome": {
+                    **derived.outcome.model_dump(mode="python"),
+                    "derivation_verification": {
+                        **verification.model_dump(mode="python"),
+                        "derivation_sha256": "0" * 64,
+                    },
+                },
+            }
+        )
+
+
+def test_answer_only_terminal_rejects_unrequested_derivation(tmp_path: Path) -> None:
+    raw = terminal_record(tmp_path).model_dump(mode="python")
+    raw["outcome"] = {
+        "status": "succeeded",
+        "answer": {"count": 3},
+        "derivation": sample_derivation().model_dump(mode="python"),
+    }
+
+    with pytest.raises(ValidationError, match="must match the request contract"):
+        TerminalRecord.model_validate(raw)
+
+    raw = terminal_record(tmp_path).model_dump(mode="python")
+    raw["schema_version"] = "2"
+    with pytest.raises(ValidationError, match="schema version"):
         TerminalRecord.model_validate(raw)
 
 

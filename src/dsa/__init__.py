@@ -23,7 +23,15 @@ from dsa.benchmark_report import (
     build_benchmark_report,
     publish_benchmark_report,
 )
-from dsa.contract import ModelConfiguration, RunPolicy, RunRequest
+from dsa.contract import (
+    Derivation,
+    DerivationCodeCell,
+    DerivationMarkdownCell,
+    DerivationRequest,
+    ModelConfiguration,
+    RunPolicy,
+    RunRequest,
+)
 from dsa.docker import (
     DockerExecutorConfiguration,
     DockerPythonExecutor,
@@ -52,7 +60,9 @@ from dsa.pack import (
 from dsa.record import (
     ArtifactRecord,
     DatabaseRecord,
+    DerivationVerification,
     Failure,
+    RetainedDerivationNotebook,
     RetainedTerminalRecord,
     RunFailure,
     RunSuccess,
@@ -75,6 +85,11 @@ __all__ = [
     "BenchmarkRuntime",
     "BenchmarkStudy",
     "DatabaseRecord",
+    "Derivation",
+    "DerivationCodeCell",
+    "DerivationMarkdownCell",
+    "DerivationRequest",
+    "DerivationVerification",
     "DockerExecutorConfiguration",
     "DockerPythonExecutor",
     "EvaluationPackCase",
@@ -94,6 +109,7 @@ __all__ = [
     "PythonExecutionResult",
     "PythonExecutor",
     "RetainedBenchmarkReport",
+    "RetainedDerivationNotebook",
     "RetainedTerminalRecord",
     "RunCompletion",
     "RunFailure",
