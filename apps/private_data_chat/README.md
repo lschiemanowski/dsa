@@ -69,24 +69,24 @@ optional dependency and is not vendored. From the repository root, one command r
 optional UI environment and starts the application:
 
 ```bash
+source .private-data-chat.env
 uv run --python 3.12 --extra chat --frozen \
-  chainlit run apps/private_data_chat/chainlit_app.py
+  chainlit run apps/private_data_chat/chainlit_app.py \
+  --headless --host 127.0.0.1 --port 8001
 ```
 
-Before starting it, configure the host-owned boundary:
+For a portable starting point, copy and edit the Online Retail II template:
 
 ```bash
-export DSA_CHAT_DATA_SOURCE_ID=retail
-export DSA_CHAT_MOCK_CONTEXT_PATH="$PWD/apps/private_data_chat/mock-database.example.json"
-export DSA_CHAT_CLARIFIER_MODEL_NAME=openai:your-capable-untrusted-model
-export DSA_CHAT_CLARIFIER_MODEL_SETTINGS_JSON='{}'
-export DSA_CHAT_DATABASE_PATH=/absolute/path/to/real.duckdb
-export DSA_CHAT_RUNS_DIRECTORY=/absolute/path/to/dsa-runs
-export DSA_CHAT_TRUSTED_MODEL_NAME=openai:your-trusted-model
-export DSA_CHAT_TRUSTED_MODEL_SETTINGS_JSON='{}'
-export DSA_CHAT_DOCKER_IMAGE='repository/image@sha256:...'
-export DSA_CHAT_REPORT_TO_MLFLOW=false
+cp apps/private_data_chat/online-retail-ii.env.example .private-data-chat.env
 ```
+
+The database setting must name a regular verified database file. Hugging Face snapshot entries are
+normally symlinks and are intentionally rejected by the DSA run boundary; use the verified blob
+path returned by `load_huggingface_evaluation_pack`, or copy those verified bytes to a private
+regular file. The template assumes a local OpenAI-compatible model server on port 8000 and a
+remote OpenRouter clarifier. Export `OPENROUTER_API_KEY` separately rather than saving it in the
+template.
 
 Provider credentials continue to come from the process environment. Neither model-settings
 variable may contain credentials or a provider endpoint; the same safe `ModelConfiguration`
