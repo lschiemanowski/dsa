@@ -63,10 +63,29 @@ invocation.
 
 ## Open WebUI setup
 
-This application is intentionally not part of the `dsa` wheel. The Open WebUI backend must have
-the repository root on `PYTHONPATH`, the DSA environment available, and access to the Docker CLI
-and daemon used for derivation replay. If Open WebUI itself runs in Docker, mount the repository,
-the real database, and the runs directory at the same absolute paths seen by the Docker daemon.
+The application remains in the separate `apps.private_data_chat` namespace, but the project wheel
+includes it so a cloned checkout does not need a custom `PYTHONPATH`. Open WebUI is a pinned
+dependency of a small app-local uv project rather than vendored source. From the repository root,
+install DSA, the application, and Open WebUI with one command:
+
+```bash
+uv sync --project apps/private_data_chat/runtime --python 3.12 --frozen
+```
+
+Start the installed server with:
+
+```bash
+uv run --project apps/private_data_chat/runtime --python 3.12 --frozen open-webui serve
+```
+
+The app-local environment is separate because Open WebUI currently pins PyArrow 20 while DSA's
+normal environment pins PyArrow 25. It supports the default `REPORT_TO_MLFLOW=false` demo flow;
+Open WebUI's Pandas 3 pin is incompatible with DSA's pinned MLflow extra. These are upstream
+dependency constraints, not trust-boundary requirements.
+
+The Open WebUI backend needs access to the Docker CLI and daemon used for derivation replay. If
+Open WebUI itself runs in Docker instead, mount the repository, the real database, and the runs
+directory at the same absolute paths seen by the Docker daemon.
 
 In Open WebUI:
 
