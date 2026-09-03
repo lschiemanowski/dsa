@@ -14,7 +14,7 @@ approving user.
 
 ### Untrusted side
 
-- Open WebUI chat content and conversation history;
+- Chainlit chat content and bounded conversation history;
 - the clarification model and everything it emits;
 - the synthetic mock database context;
 - proposal text and answer schema until server validation; and
@@ -22,9 +22,9 @@ approving user.
 
 The untrusted side receives no real rows, private schema metadata beyond what an operator chose to
 mock, filesystem path, provider secret, broker credential with broad scope, or DSA execution tool.
-The configured clarifier must be a plain model connection, not another Pipe or a model profile
-with server-side tools. The application controls what is sent to the model, not what an arbitrary
-operator-installed backend extension can read from its own host.
+The configured clarifier must be a plain model connection without provider-side tools. The
+application controls what is sent to the model, not what arbitrary software installed on the same
+host can read.
 
 ### Trusted application side
 
@@ -70,9 +70,9 @@ honestly rather than fabricating or presenting an unverified notebook.
 ## Artifact invariant
 
 External responses contain an opaque artifact ID, SHA-256 digest, byte length, and media type—not
-a local path. The Pipe keeps the retained notebook reference only for its current invocation,
+a local path. The application keeps the retained notebook reference only for its current session,
 reopens it without following symlinks, and verifies the exact length and digest before emitting a
-fixed-name download embed. There is no general artifact endpoint or possession-based download API
+fixed-name Chainlit file element. There is no general artifact endpoint or possession-based API
 in this demo.
 
 ## Failure policy
@@ -93,6 +93,6 @@ retained terminal evidence and must not automatically repeat an ambiguous paid e
 - protection from an operator putting sensitive values into the mock context; and
 - semantic quality or privacy review of the final answer and notebook.
 
-The configured Pipe exposes one data source to everyone allowed to select that Pipe. Open WebUI
+The configured application exposes one data source to everyone allowed to access it. Chainlit
 deployment and access control must therefore restrict it to the intended users. A future
 multi-source application would need real per-user data-source authorization.

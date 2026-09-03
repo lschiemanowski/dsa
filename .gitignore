@@ -212,6 +212,10 @@ tempCodeRunnerFile.py
 # Local MLflow state when following docs/local-mlflow.md inside the checkout
 /.mlflow/
 
+# Chainlit creates local configuration, translations, and uploaded-file state on first import
+/.chainlit/
+/.files/
+
 # Marimo
 marimo/_static/
 marimo/_lsp/

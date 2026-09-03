@@ -7,6 +7,8 @@ from apps.private_data_chat.broker import (
     PrivateDataBroker,
     ProposalStore,
 )
+from apps.private_data_chat.chat import ChatResponse, NotebookDownload, PrivateDataChatSession
+from apps.private_data_chat.clarifier import ConversationMessage, PydanticClarifier
 from apps.private_data_chat.contracts import (
     AnalysisRequest,
     AnalysisResult,
@@ -27,15 +29,20 @@ __all__ = [
     "AnalysisResult",
     "ArtifactIdentity",
     "BrokerError",
+    "ChatResponse",
     "ClarifierTurn",
+    "ConversationMessage",
     "InMemoryProposalStore",
     "MockDatabaseContext",
     "MockRelation",
+    "NotebookDownload",
     "PrivateDataBroker",
+    "PrivateDataChatSession",
     "ProposalBinding",
     "ProposalPayload",
     "ProposalRecord",
     "ProposalStatus",
     "ProposalStore",
+    "PydanticClarifier",
     "QuantitativeInterpretation",
 ]

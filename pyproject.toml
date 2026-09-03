@@ -19,6 +19,9 @@ dsa-benchmark = "dsa.benchmark_cli:main"
 dsa-run = "dsa.run_cli:main"
 
 [project.optional-dependencies]
+chat = [
+    "chainlit==2.12.0; python_version < '3.14'",
+]
 huggingface = [
     "huggingface-hub>=1,<2",
 ]
@@ -41,7 +44,6 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/dsa", "apps"]
-exclude = ["apps/private_data_chat/runtime"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
