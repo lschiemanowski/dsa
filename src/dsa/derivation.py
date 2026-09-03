@@ -67,6 +67,70 @@ async def verify_derivation(
     python_executor: PythonExecutor | None,
 ) -> VerifiedDerivation:
     """Replay cells from a pristine database and retain their notebook projection."""
+    replayed_answer, runtime_identity = await _execute_derivation(
+        derivation,
+        source_database=source_database,
+        source_database_sha256=source_database_sha256,
+        run_directory=run_directory,
+        policy=policy,
+        python_executor=python_executor,
+    )
+    answer_bytes = _canonical_json_bytes(answer)
+    if _canonical_json_bytes(replayed_answer) != answer_bytes:
+        raise DerivationError(
+            "derivation_result_mismatch",
+            "The derivation result does not exactly match the submitted answer",
+        )
+    return _retain_verified_derivation(
+        derivation,
+        answer_bytes=answer_bytes,
+        question=question,
+        source_database_sha256=source_database_sha256,
+        run_directory=run_directory,
+        runtime_identity=runtime_identity,
+    )
+
+
+async def replay_derivation(
+    derivation: Derivation,
+    *,
+    question: str,
+    source_database: Path,
+    source_database_sha256: str,
+    run_directory: Path,
+    policy: RunPolicy,
+    python_executor: PythonExecutor | None,
+) -> tuple[JsonValue, VerifiedDerivation]:
+    """Replay and retain a derivation, returning the exact JSON result it produced."""
+    replayed_answer, runtime_identity = await _execute_derivation(
+        derivation,
+        source_database=source_database,
+        source_database_sha256=source_database_sha256,
+        run_directory=run_directory,
+        policy=policy,
+        python_executor=python_executor,
+    )
+    verified = _retain_verified_derivation(
+        derivation,
+        answer_bytes=_canonical_json_bytes(replayed_answer),
+        question=question,
+        source_database_sha256=source_database_sha256,
+        run_directory=run_directory,
+        runtime_identity=runtime_identity,
+    )
+    return replayed_answer, verified
+
+
+async def _execute_derivation(
+    derivation: Derivation,
+    *,
+    source_database: Path,
+    source_database_sha256: str,
+    run_directory: Path,
+    policy: RunPolicy,
+    python_executor: PythonExecutor | None,
+) -> tuple[JsonValue, str | None]:
+    """Replay cells from a pristine database without publishing a notebook."""
     if python_executor is None:
         raise DerivationError(
             "derivation_executor_unavailable",
@@ -125,12 +189,6 @@ async def verify_derivation(
             replayed_answer = environment.load_json_artifact(handle)
         except ArtifactError as error:
             raise DerivationError(error.code, error.message) from error
-        answer_bytes = _canonical_json_bytes(answer)
-        if _canonical_json_bytes(replayed_answer) != answer_bytes:
-            raise DerivationError(
-                "derivation_result_mismatch",
-                "The derivation result does not exactly match the submitted answer",
-            )
     finally:
         active_exception = sys.exc_info()[0]
         try:
@@ -147,6 +205,18 @@ async def verify_derivation(
                     infrastructure=True,
                 ) from error
 
+    return replayed_answer, runtime_identity
+
+
+def _retain_verified_derivation(
+    derivation: Derivation,
+    *,
+    answer_bytes: bytes,
+    question: str,
+    source_database_sha256: str,
+    run_directory: Path,
+    runtime_identity: str | None,
+) -> VerifiedDerivation:
     derivation_bytes = _canonical_json_bytes(derivation.model_dump(mode="json"))
     try:
         derivation_sha256 = sha256(derivation_bytes).hexdigest()

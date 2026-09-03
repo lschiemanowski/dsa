@@ -2,11 +2,11 @@
 
 ## Objective
 
-Allow an individual task to request a concise, human-readable derivation alongside its
-answer. A requested derivation is accepted only after DSA replays it from the pristine
-source database and obtains exactly the same JSON value as the submitted answer. The
-same verified content is retained as a deterministic Jupyter notebook for a human
-reviewer.
+Allow an individual task to ask for a concise, human-readable derivation alongside its
+answer. The model may validate a proposed derivation before finalizing. A validated
+derivation is accepted only after DSA replays it from the pristine source database; the
+same verified content is retained as a deterministic Jupyter notebook for a human reviewer.
+If validation does not succeed, the model may still submit its answer without a derivation.
 
 Derivations are opt-in. Omitting the derivation request preserves the existing model
 prompt, answer output shape, terminal-record schema version, evaluation input, and
@@ -17,26 +17,19 @@ cases without changing answer-only tasks.
 
 `RunRequest.derivation` is either absent or the versioned request
 `{"format":"dsa-derivation/v1"}`. When absent, the model returns only the caller's answer
-as before. When present, DSA asks the model for this envelope:
+as before. When present, DSA exposes `validate_derivation(derivation)`. A successful call
+returns an opaque receipt bound to the replayed JSON result. The final output is:
 
 ```json
 {
   "answer": {"value": 3},
-  "derivation": {
-    "format": "dsa-derivation/v1",
-    "cells": [
-      {
-        "type": "markdown",
-        "source": "Compute the requested value directly from the source table."
-      },
-      {
-        "type": "code",
-        "source": "import duckdb\ncon = duckdb.connect(str(database_path), read_only=True)\nresult = {\"value\": con.execute(\"select count(*) from events\").fetchone()[0]}"
-      }
-    ]
-  }
+  "derivation_receipt": "dvr_<sha256>"
 }
 ```
+
+`derivation_receipt` is optional (and nullable in the provider-facing strict schema). The
+model should try the validation tool and may revise and retry within the ordinary run and
+tool limits. It may omit the receipt when it cannot obtain one.
 
 The derivation is a bounded sequence of Markdown and plain-Python cells. It begins with
 an explanation, ends with code, and contains at most 24 cells and 64 KiB of source. Code
@@ -60,26 +53,26 @@ the initial working database. This avoids a second initial database copy while e
 that later atomic database promotion cannot change the replay source. The caller's
 database is never modified.
 
-After the answer satisfies its JSON Schema, DSA runs the submitted code cells in order
+When the model calls `validate_derivation`, DSA runs the submitted code cells in order
 through the already-injected isolated Python executor. Replay receives a disposable
 working database linked from that pristine private source, not the database state left
 by exploratory tools. The wrapper serializes `result` to a managed JSON output; DSA
-loads it through the normal artifact boundary and compares its canonical JSON bytes to
-the submitted answer.
+loads it through the normal artifact boundary and binds its canonical JSON bytes to the
+returned receipt. `final_answer` accepts that receipt only with the exact replayed answer.
 
 The comparison is literal canonical JSON identity. In particular, `3` and `3.0` are not
-the same result. A mismatch, missing result, invalid JSON result, or model-authored
-execution failure consumes one bounded derivation-validation attempt and returns safe
-retry feedback. Exhaustion becomes a typed `derivation_validation` agent failure.
+the same result. A missing result, invalid JSON result, or model-authored execution failure
+returns safe tool feedback and the model may try again. Such failures do not prevent an
+answer-only final submission.
 Executor unavailability, executor protocol failure, or private-workspace failure is an
 infrastructure failure and is not presented to the model as repairable content.
 Cancellation propagates after retaining the ordinary cancellation terminal record.
 
 ## Retained evidence and notebook
 
-A derivation-enabled run uses terminal schema version 2, including when it fails or is
-cancelled. Its successful outcome contains the validated derivation and a verification
-record binding these SHA-256 identities:
+A derivation-enabled run uses terminal schema version 2, including when it succeeds
+without a receipt, fails, or is cancelled. When its successful outcome includes a validated
+derivation, it also contains a verification record binding these SHA-256 identities:
 
 - canonical derivation content;
 - canonical answer/result content;
@@ -103,8 +96,8 @@ derivation as a distinct evaluation input without weakening deterministic answer
 scoring.
 
 Answer-only successes continue to use terminal schema version 1 and create no notebook.
-Failed or cancelled runs retain no notebook, even if an earlier candidate derivation
-was successfully replayed.
+Answer-only, failed, and cancelled outcomes retain no notebook. A successfully replayed
+candidate is retained only when its receipt accompanies the final answer.
 
 ## Acceptance
 
