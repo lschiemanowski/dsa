@@ -95,7 +95,7 @@ def test_mock_context_loader_rejects_relative_symlink_and_oversized_files(
 ) -> None:
     valid = tmp_path / "mock.json"
     valid.write_text(json.dumps(mock_context().model_dump(mode="json")))
-    assert load_mock_context(valid).data_source_id == "retail"
+    assert load_mock_context(valid).data_source_id == "online_retail_ii"
 
     with pytest.raises(ValueError, match="absolute"):
         load_mock_context(Path("mock.json"))

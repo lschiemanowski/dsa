@@ -130,6 +130,7 @@ def test_checked_in_mock_context_is_valid_and_explicitly_synthetic() -> None:
     path = Path(__file__).parents[2] / "apps/private_data_chat/mock-database.example.json"
     context = MockDatabaseContext.model_validate_json(path.read_bytes())
     assert context.synthetic is True
+    assert context.data_source_id == "online_retail_ii"
     assert tuple(relation.name for relation in context.relations) == (
         "analysis.transaction_lines_nonoverlapping",
     )
