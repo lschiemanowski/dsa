@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import inspect
 import json
@@ -51,6 +52,7 @@ class Clarifier(Protocol):
 
 
 ExecutorFactory = Callable[[DsaRuntimeConfiguration], DsaAnalysisExecutor]
+ConversationKey = tuple[str, str]
 
 
 class Pipe:
@@ -84,7 +86,9 @@ class Pipe:
         self.valves = self.Valves()
         self._clarifier = clarifier or _openwebui_clarifier
         self._executor_factory = executor_factory or DsaAnalysisExecutor
-        self._terminal_conversations: set[str] = set()
+        self._conversation_lock = asyncio.Lock()
+        self._active_conversations: set[ConversationKey] = set()
+        self._terminal_conversations: set[ConversationKey] = set()
 
     async def pipe(
         self,
@@ -96,81 +100,117 @@ class Pipe:
         __metadata__: dict[str, object] | None = None,
     ) -> str:
         """Run one safe turn; a DSA result permanently closes this conversation."""
-        conversation_id = _conversation_id(body, __metadata__)
-        if conversation_id in self._terminal_conversations or _has_terminal_result(body):
-            self._terminal_conversations.add(conversation_id)
-            return _closed_message()
-
         try:
             user_id = _bounded_identity(__user__.get("id"), "user identity")
-            context = _load_mock_context(Path(self.valves.MOCK_CONTEXT_PATH))
-            if context.data_source_id != self.valves.DATA_SOURCE_ID:
-                raise ValueError("mock context does not match the configured data source")
-            clarification_body = _clarification_body(
-                body,
-                context,
-                self.valves.CLARIFIER_MODEL_ID,
-            )
-            raw_turn = await self._clarifier(clarification_body, __user__, __request__)
-            turn = _parse_clarifier_turn(raw_turn)
+            conversation_id = _conversation_id(body, __metadata__)
         except Exception:
-            await _emit_status(
-                __event_emitter__,
-                "Clarification is unavailable. Check the Pipe configuration.",
-                done=True,
-            )
-            return (
-                "The clarification step is unavailable. Please ask the operator to check "
-                "the Pipe configuration."
-            )
+            return "The conversation identity is unavailable. Please start a new conversation."
+        key = (user_id, conversation_id)
+        reservation = await self._reserve_conversation(key, _has_terminal_result(body))
+        if reservation == "terminal":
+            return _closed_message()
+        if reservation == "active":
+            return "Another turn is already in progress in this conversation."
 
-        if turn.kind == "clarification":
-            return _remove_terminal_marker(turn.message)
-
-        assert turn.proposal is not None
         try:
-            runtime = _runtime_configuration(self.valves)
-            executor = self._executor_factory(runtime)
-            broker = PrivateDataBroker(store=InMemoryProposalStore(), executor=executor)
-            proposal = await broker.propose(
-                user_id=user_id,
-                conversation_id=conversation_id,
-                data_source_id=context.data_source_id,
-                payload=turn.proposal,
-            )
-        except Exception:
-            return (
-                "The proposed analysis could not be prepared safely. Please refine the "
-                "question and try again."
-            )
+            try:
+                context = _load_mock_context(Path(self.valves.MOCK_CONTEXT_PATH))
+                if context.data_source_id != self.valves.DATA_SOURCE_ID:
+                    raise ValueError("mock context does not match the configured data source")
+                clarification_body = _clarification_body(
+                    body,
+                    context,
+                    self.valves.CLARIFIER_MODEL_ID,
+                )
+                raw_turn = await self._clarifier(clarification_body, __user__, __request__)
+                turn = _parse_clarifier_turn(raw_turn)
+            except Exception:
+                await _emit_status(
+                    __event_emitter__,
+                    "Clarification is unavailable. Check the Pipe configuration.",
+                    done=True,
+                )
+                return (
+                    "The clarification step is unavailable. Please ask the operator to check "
+                    "the Pipe configuration."
+                )
 
-        confirmed = await _confirm(__event_call__, proposal.payload, proposal.proposal_sha256)
-        if not confirmed:
-            return (
-                "The analysis was not run. You can continue refining the question in this "
-                "conversation."
-            )
+            if turn.kind == "clarification":
+                return _remove_terminal_marker(turn.message)
 
-        await _emit_status(__event_emitter__, "Running the approved analysis…", done=False)
-        try:
-            await broker.approve(
-                proposal_id=proposal.proposal_id,
-                proposal_sha256=proposal.proposal_sha256,
-                user_id=user_id,
-                conversation_id=conversation_id,
+            assert turn.proposal is not None
+            try:
+                runtime = _runtime_configuration(self.valves)
+                executor = self._executor_factory(runtime)
+                broker = PrivateDataBroker(store=InMemoryProposalStore(), executor=executor)
+                proposal = await broker.propose(
+                    user_id=user_id,
+                    conversation_id=conversation_id,
+                    data_source_id=context.data_source_id,
+                    payload=turn.proposal,
+                )
+            except Exception:
+                return (
+                    "The proposed analysis could not be prepared safely. Please refine the "
+                    "question and try again."
+                )
+
+            confirmed = await _confirm(
+                __event_call__,
+                proposal.payload,
+                proposal.proposal_sha256,
             )
-            result = await broker.execute(
-                proposal_id=proposal.proposal_id,
-                user_id=user_id,
-                conversation_id=conversation_id,
-            )
-            response = await _terminal_response(result, executor, __event_emitter__)
-        except Exception:
-            response = _terminal_failure("analysis_orchestration_failed")
+            if not confirmed:
+                return (
+                    "The analysis was not run. You can continue refining the question in this "
+                    "conversation."
+                )
+
+            await self._mark_terminal(key)
+            await _emit_status(__event_emitter__, "Running the approved analysis…", done=False)
+            try:
+                await broker.approve(
+                    proposal_id=proposal.proposal_id,
+                    proposal_sha256=proposal.proposal_sha256,
+                    user_id=user_id,
+                    conversation_id=conversation_id,
+                )
+                result = await broker.execute(
+                    proposal_id=proposal.proposal_id,
+                    user_id=user_id,
+                    conversation_id=conversation_id,
+                )
+                response = await _terminal_response(result, executor, __event_emitter__)
+            except Exception:
+                response = _terminal_failure("analysis_orchestration_failed")
+            finally:
+                await _emit_status(__event_emitter__, "Analysis complete.", done=True)
+            return response
         finally:
-            self._terminal_conversations.add(conversation_id)
-            await _emit_status(__event_emitter__, "Analysis complete.", done=True)
-        return response
+            await self._release_conversation(key)
+
+    async def _reserve_conversation(
+        self,
+        key: ConversationKey,
+        terminal_in_history: bool,
+    ) -> str:
+        async with self._conversation_lock:
+            if terminal_in_history:
+                self._terminal_conversations.add(key)
+            if key in self._terminal_conversations:
+                return "terminal"
+            if key in self._active_conversations:
+                return "active"
+            self._active_conversations.add(key)
+            return "reserved"
+
+    async def _mark_terminal(self, key: ConversationKey) -> None:
+        async with self._conversation_lock:
+            self._terminal_conversations.add(key)
+
+    async def _release_conversation(self, key: ConversationKey) -> None:
+        async with self._conversation_lock:
+            self._active_conversations.discard(key)
 
 
 async def _openwebui_clarifier(

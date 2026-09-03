@@ -39,7 +39,10 @@ The contracts supporting that flow are intentionally modest:
   public boundary.
 
 The in-memory store is sufficient because proposal, confirmation, and execution happen in one
-Pipe invocation. This is a portfolio demo, not durable workflow infrastructure.
+Pipe invocation. The Pipe atomically rejects overlapping turns for the same user and conversation;
+it releases that reservation after clarification or declined confirmation and makes it permanently
+terminal immediately after confirmation. This is a portfolio demo, not durable workflow
+infrastructure.
 
 ## State machine
 

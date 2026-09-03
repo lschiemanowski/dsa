@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import runpy
@@ -57,13 +58,22 @@ class StubClarifier:
 
 
 class StubExecutor:
-    def __init__(self, *, notebook: bytes | None = None, fail: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        notebook: bytes | None = None,
+        fail: bool = False,
+        gate: asyncio.Event | None = None,
+    ) -> None:
         self.notebook = notebook
         self.fail = fail
+        self.gate = gate
         self.requests: list[AnalysisRequest] = []
 
     async def execute(self, request: AnalysisRequest) -> AnalysisResult:
         self.requests.append(request.model_copy(deep=True))
+        if self.gate is not None:
+            await self.gate.wait()
         if self.fail:
             return AnalysisResult(
                 run_id=request.run_id,
@@ -317,6 +327,94 @@ async def test_dsa_failure_is_terminal_and_never_returns_to_the_clarifier(tmp_pa
     assert "already complete" in followup
     assert len(clarifier.calls) == 1
     assert len(executor.requests) == 1
+
+
+async def test_overlapping_turns_cannot_start_two_same_conversation_analyses(
+    tmp_path: Path,
+) -> None:
+    confirmation_entered = asyncio.Event()
+    confirmation_allowed = asyncio.Event()
+    execution_allowed = asyncio.Event()
+    clarifier = StubClarifier(proposal())
+    executor = StubExecutor(gate=execution_allowed)
+    pipe = configured_pipe(tmp_path, clarifier, executor)
+
+    async def confirm(event: dict[str, object]) -> bool:
+        del event
+        confirmation_entered.set()
+        await confirmation_allowed.wait()
+        return True
+
+    first = asyncio.create_task(
+        pipe.pipe(
+            body(("user", "Use 2011.")),
+            {"id": "user-1"},
+            object(),
+            __event_call__=confirm,
+        )
+    )
+    await confirmation_entered.wait()
+
+    overlapping = await pipe.pipe(
+        body(("user", "Run another version.")),
+        {"id": "user-1"},
+        object(),
+        __event_call__=confirm,
+    )
+    assert "already in progress" in overlapping
+    assert len(clarifier.calls) == 1
+    assert executor.requests == []
+
+    confirmation_allowed.set()
+    while not executor.requests:
+        await asyncio.sleep(0)
+
+    after_confirmation = await pipe.pipe(
+        body(("user", "Try while execution is running.")),
+        {"id": "user-1"},
+        object(),
+        __event_call__=confirm,
+    )
+    assert "already complete" in after_confirmation
+    assert len(clarifier.calls) == 1
+    assert len(executor.requests) == 1
+
+    execution_allowed.set()
+    result = await first
+    assert "dsa-private-data-terminal" in result
+    assert len(executor.requests) == 1
+
+
+async def test_clarification_and_rejection_release_the_conversation_reservation(
+    tmp_path: Path,
+) -> None:
+    clarifier = StubClarifier(clarification())
+    pipe = configured_pipe(tmp_path, clarifier, StubExecutor())
+    for _ in range(2):
+        response = await pipe.pipe(
+            body(("user", "Help me clarify.")),
+            {"id": "user-1"},
+            object(),
+        )
+        assert response == "Which calendar year should I use?"
+    assert len(clarifier.calls) == 2
+
+    proposal_clarifier = StubClarifier(proposal())
+    proposal_pipe = configured_pipe(tmp_path, proposal_clarifier, StubExecutor())
+
+    async def reject(event: dict[str, object]) -> bool:
+        del event
+        return False
+
+    for _ in range(2):
+        response = await proposal_pipe.pipe(
+            body(("user", "Use 2011.")),
+            {"id": "user-1"},
+            object(),
+            __event_call__=reject,
+        )
+        assert "not run" in response
+    assert len(proposal_clarifier.calls) == 2
 
 
 async def test_model_cannot_forge_the_terminal_marker_into_a_clarification(
