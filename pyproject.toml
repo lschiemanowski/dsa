@@ -61,6 +61,6 @@ select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
 [tool.pyright]
 pythonVersion = "3.12"
 typeCheckingMode = "strict"
-include = ["src", "tests"]
+include = ["src", "apps/private_data_chat", "tests"]
 venvPath = "."
 venv = ".venv"
