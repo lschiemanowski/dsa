@@ -22,7 +22,6 @@ import duckdb
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import ValidationError as JsonSchemaValidationError
 from pydantic import Field, JsonValue, model_validator
-from pydantic import ValidationError as PydanticValidationError
 from pydantic_ai import (
     Agent,
     ModelAPIError,
@@ -47,7 +46,12 @@ from referencing import Resource
 from referencing.jsonschema import DRAFT202012
 
 from dsa.contract import ContractModel, Derivation, RunRequest
-from dsa.derivation import DerivationError, VerifiedDerivation, verify_derivation
+from dsa.derivation import (
+    DerivationError,
+    VerifiedDerivation,
+    replay_derivation,
+    retain_replayed_derivation,
+)
 from dsa.environment import (
     AnalysisEnvironment,
     ArtifactError,
@@ -77,14 +81,18 @@ Return only the requested answer through a provided structured output boundary.
 The answer must satisfy the caller's JSON Schema exactly.
 """
 _DERIVATION_INSTRUCTIONS = """\
-Alongside the answer, submit a concise dsa-derivation/v1 for a human verifier.
+Before submitting the answer, try to validate a concise dsa-derivation/v1 for a human
+verifier by calling validate_derivation.
 This is a curated reproducibility document, not a transcript of your work.
 Omit exploration, false starts, and computations that are unnecessary to verify the answer.
 Begin with a brief Markdown explanation. Use plain Python code cells with brief explanations.
 Code cells share one namespace and receive database_path bound to the pristine source database.
 Do not depend on retained artifacts or prior database mutations.
 The final code cell must assign the exact JSON answer to result.
-The derivation is replayed independently and must reproduce the submitted answer exactly.
+The derivation is replayed independently. If validation succeeds, pass its receipt to
+final_answer. You may retry validation as often as needed within the run limits. If you
+cannot obtain a receipt, submit the answer without one; do not submit the derivation itself
+to final_answer.
 """
 
 
@@ -96,10 +104,6 @@ type _SchemaNode = dict[str, JsonValue] | bool
 
 
 class _ValidationAttemptsExceeded(Exception):
-    pass
-
-
-class _DerivationAttemptsExceeded(Exception):
     pass
 
 
@@ -313,8 +317,8 @@ async def _run_canonical_analysis(
     messages: tuple[dict[str, JsonValue], ...] = ()
     usage: dict[str, JsonValue] = {}
     validation_failures = 0
-    derivation_failures = 0
     verified_derivation: VerifiedDerivation | None = None
+    validated_derivation: tuple[str, JsonValue, VerifiedDerivation] | None = None
     running: Any | None = None
 
     caller_schema = canonical_request.answer_schema
@@ -331,7 +335,7 @@ async def _run_canonical_analysis(
     validator = cast(_AnswerValidator, Draft202012Validator(caller_schema))
 
     async def validate_answer(proposal: Any) -> Any:
-        nonlocal derivation_failures, validation_failures, verified_derivation
+        nonlocal validation_failures, verified_derivation
         answer = (
             proposal.get("answer")
             if derivation_requested
@@ -377,45 +381,32 @@ async def _run_canonical_analysis(
                 )
             ) from error
         if derivation_requested:
-            try:
-                try:
-                    derivation = Derivation.model_validate(proposal.get("derivation"))
-                except PydanticValidationError as error:
-                    raise DerivationError(
-                        "derivation_invalid",
-                        "The derivation does not satisfy its cell contract",
-                    ) from error
-                if pristine_database is None:
-                    raise DerivationError(
-                        "derivation_source_unavailable",
-                        "The private source database is unavailable for derivation replay",
-                        infrastructure=True,
-                    )
-                verified_derivation = await verify_derivation(
-                    derivation,
-                    cast(JsonValue, answer),
-                    question=canonical_request.question,
-                    source_database=pristine_database,
-                    source_database_sha256=source_database_sha256,
-                    run_directory=run_directory,
-                    policy=canonical_request.policy,
-                    python_executor=python_executor,
-                )
-            except DerivationError as error:
-                if error.infrastructure:
-                    raise
-                derivation_failures += 1
-                if derivation_failures >= canonical_request.policy.max_validation_attempts:
-                    raise _DerivationAttemptsExceeded from error
+            receipt = proposal.get("derivation_receipt")
+            if receipt is None:
+                verified_derivation = None
+            elif (
+                validated_derivation is None
+                or receipt != validated_derivation[0]
+                or _canonical_json_bytes(cast(JsonValue, answer))
+                != _canonical_json_bytes(validated_derivation[1])
+            ):
                 raise ModelRetry(
                     _bounded_retry_feedback(
                         [
-                            {"error": error.code, "message": error.message},
-                            {"error": error.code},
+                            {
+                                "error": "derivation_receipt_invalid",
+                                "message": (
+                                    "Use the receipt returned by validate_derivation for "
+                                    "this exact answer, or omit derivation_receipt"
+                                ),
+                            },
+                            {"error": "derivation_receipt_invalid"},
                         ],
                         canonical_request.policy.max_tool_result_bytes,
                     )
-                ) from error
+                )
+            else:
+                verified_derivation = validated_derivation[2]
         return proposal
 
     async def answer_from_artifact(handle: str) -> JsonValue:
@@ -438,16 +429,120 @@ async def _run_canonical_analysis(
             ) from error
         return {"value": answer} if wrapped else answer
 
-    async def answer_and_derivation_from_artifact(
+    async def answer_with_derivation_receipt_from_artifact(
         handle: str,
-        derivation: Derivation,
+        derivation_receipt: str | None = None,
     ) -> dict[str, JsonValue]:
-        """Submit one retained answer with its concise replayable derivation."""
+        """Submit one retained answer, optionally with a validated derivation receipt."""
         answer = await answer_from_artifact(handle)
-        return {
-            "answer": answer,
-            "derivation": cast(JsonValue, derivation.model_dump(mode="json")),
-        }
+        return {"answer": answer, "derivation_receipt": derivation_receipt}
+
+    async def validate_derivation(derivation: Derivation) -> str:
+        """Replay a proposed derivation and return a receipt when it produces valid JSON."""
+        nonlocal validated_derivation
+        if validated_derivation is not None:
+            if derivation == validated_derivation[2].derivation:
+                return _bounded_retry_feedback(
+                    [
+                        {
+                            "status": "verified",
+                            "derivation_receipt": validated_derivation[0],
+                        }
+                    ],
+                    canonical_request.policy.max_tool_result_bytes,
+                )
+            return _bounded_retry_feedback(
+                [
+                    {
+                        "error": "derivation_already_validated",
+                        "message": "Use the receipt from the successful validation",
+                        "derivation_receipt": validated_derivation[0],
+                    },
+                    {"error": "derivation_already_validated"},
+                ],
+                canonical_request.policy.max_tool_result_bytes,
+            )
+        if pristine_database is None:
+            raise DerivationError(
+                "derivation_source_unavailable",
+                "The private source database is unavailable for derivation replay",
+                infrastructure=True,
+            )
+        try:
+            replayed = await replay_derivation(
+                derivation,
+                source_database=pristine_database,
+                source_database_sha256=source_database_sha256,
+                run_directory=run_directory,
+                policy=canonical_request.policy,
+                python_executor=python_executor,
+            )
+        except DerivationError as error:
+            if error.infrastructure:
+                raise
+            return _bounded_retry_feedback(
+                [
+                    {"error": error.code, "message": error.message},
+                    {"error": error.code},
+                ],
+                canonical_request.policy.max_tool_result_bytes,
+            )
+        replayed_answer = replayed.answer
+        errors = sorted(
+            validator.iter_errors(replayed_answer),
+            key=_validation_error_key,
+        )
+        if errors:
+            return _validation_feedback(
+                errors,
+                canonical_request.policy.max_tool_result_bytes,
+            )
+        try:
+            json.dumps(replayed_answer, allow_nan=False)
+        except (TypeError, ValueError):
+            return _bounded_retry_feedback(
+                [
+                    {
+                        "error": "answer_schema_validation_failed",
+                        "issues": [
+                            {
+                                "keyword": "json",
+                                "message": "derivation result must be finite JSON",
+                            }
+                        ],
+                    },
+                    {"error": "answer_schema_validation_failed"},
+                ],
+                canonical_request.policy.max_tool_result_bytes,
+            )
+        try:
+            verified = retain_replayed_derivation(
+                replayed,
+                question=canonical_request.question,
+                source_database_sha256=source_database_sha256,
+                run_directory=run_directory,
+            )
+        except DerivationError as error:
+            if error.infrastructure:
+                raise
+            return _bounded_retry_feedback(
+                [
+                    {"error": error.code, "message": error.message},
+                    {"error": error.code},
+                ],
+                canonical_request.policy.max_tool_result_bytes,
+            )
+        receipt_payload = (
+            verified.verification.derivation_sha256
+            + verified.verification.result_sha256
+            + verified.verification.source_database_sha256
+        ).encode("ascii")
+        receipt = f"dvr_{sha256(receipt_payload).hexdigest()}"
+        validated_derivation = (receipt, replayed_answer, verified)
+        return _bounded_retry_feedback(
+            [{"status": "verified", "derivation_receipt": receipt}],
+            canonical_request.policy.max_tool_result_bytes,
+        )
 
     async def inspect_database(
         context: RunContext[None],
@@ -522,13 +617,27 @@ async def _run_canonical_analysis(
                     sequential=True,
                 )
             )
+        if derivation_requested:
+            tools.append(
+                Tool(
+                    validate_derivation,
+                    name="validate_derivation",
+                    description=(
+                        "Replay a proposed dsa-derivation/v1 against the pristine source "
+                        "database. On success, use the returned receipt with final_answer. "
+                        "On failure, revise and retry; if no attempt succeeds, final_answer "
+                        "may omit the receipt. The last code cell must assign JSON to result."
+                    ),
+                    sequential=True,
+                )
+            )
         artifact_output = (
             ToolOutput(
-                answer_and_derivation_from_artifact,
+                answer_with_derivation_receipt_from_artifact,
                 name="answer_from_artifact",
                 description=(
-                    "Submit a same-run retained JSON answer with its concise replayable "
-                    "human-verification derivation."
+                    "Submit a same-run retained JSON answer, optionally with the receipt "
+                    "returned by validate_derivation."
                 ),
             )
             if derivation_requested
@@ -562,10 +671,16 @@ async def _run_canonical_analysis(
                     StructuredDict(
                         framework_schema,
                         name="final_answer",
-                        description="Submit the exact caller-requested answer.",
+                        description=(
+                            "Submit the exact caller-requested answer and optionally the "
+                            "receipt returned by validate_derivation."
+                        ),
                     ),
                     name="final_answer",
-                    description="Submit the exact caller-requested answer directly.",
+                    description=(
+                        "Submit the exact caller-requested answer. Include the receipt from "
+                        "validate_derivation when available; otherwise omit it or use null."
+                    ),
                 ),
                 artifact_output,
             ],
@@ -627,12 +742,13 @@ async def _run_canonical_analysis(
                 )
                 if derivation_requested:
                     if verified_derivation is None:
-                        raise RuntimeError("verified derivation state is unavailable")
-                    outcome = RunSuccess(
-                        answer=cast(JsonValue, answer),
-                        derivation=verified_derivation.derivation,
-                        derivation_verification=verified_derivation.verification,
-                    )
+                        outcome = RunSuccess(answer=cast(JsonValue, answer))
+                    else:
+                        outcome = RunSuccess(
+                            answer=cast(JsonValue, answer),
+                            derivation=verified_derivation.derivation,
+                            derivation_verification=verified_derivation.verification,
+                        )
                 else:
                     outcome = RunSuccess(answer=cast(JsonValue, answer))
     except asyncio.CancelledError as error:
@@ -678,7 +794,6 @@ async def _run_canonical_analysis(
         outcome = _failure_outcome(
             error,
             validation_failures,
-            derivation_failures,
         )
 
     return _retain_completion(
@@ -730,17 +845,29 @@ def _provider_derivation_schema(
     """
     answer_schema = deepcopy(caller_schema)
     _rebase_local_references(answer_schema, rebase=True)
-    return _derivation_envelope(answer_schema)
+    return _derivation_envelope(answer_schema, require_receipt=True)
 
 
-def _derivation_envelope(answer_schema: _SchemaNode) -> dict[str, JsonValue]:
+def _derivation_envelope(
+    answer_schema: _SchemaNode,
+    *,
+    require_receipt: bool = False,
+) -> dict[str, JsonValue]:
     return {
         "type": "object",
         "properties": {
             "answer": answer_schema,
-            "derivation": cast(JsonValue, _derivation_schema()),
+            "derivation_receipt": {
+                "anyOf": [
+                    {"type": "string", "pattern": r"^dvr_[0-9a-f]{64}$"},
+                    {"type": "null"},
+                ]
+            },
         },
-        "required": ["answer", "derivation"],
+        # OpenAI strict schemas require every property to be named here. The provider
+        # receives a required nullable receipt, while local validation also accepts
+        # omission so the semantic contract remains optional.
+        "required": ["answer", "derivation_receipt"] if require_receipt else ["answer"],
         "additionalProperties": False,
     }
 
@@ -774,45 +901,6 @@ def _rebase_local_references(
         )
 
 
-def _derivation_schema() -> dict[str, Any]:
-    source = {"type": "string", "minLength": 1, "maxLength": 32 * 1024}
-    return {
-        "type": "object",
-        "properties": {
-            "format": {"const": "dsa-derivation/v1"},
-            "cells": {
-                "type": "array",
-                "minItems": 2,
-                "maxItems": 24,
-                "items": {
-                    "oneOf": [
-                        {
-                            "type": "object",
-                            "properties": {
-                                "type": {"const": "markdown"},
-                                "source": deepcopy(source),
-                            },
-                            "required": ["type", "source"],
-                            "additionalProperties": False,
-                        },
-                        {
-                            "type": "object",
-                            "properties": {
-                                "type": {"const": "code"},
-                                "source": deepcopy(source),
-                            },
-                            "required": ["type", "source"],
-                            "additionalProperties": False,
-                        },
-                    ]
-                },
-            },
-        },
-        "required": ["format", "cells"],
-        "additionalProperties": False,
-    }
-
-
 def _bounded_model_settings(request: RunRequest) -> ModelSettings:
     settings: dict[str, Any] = dict(request.model.settings)
     configured = settings.get("max_tokens")
@@ -821,6 +909,16 @@ def _bounded_model_settings(request: RunRequest) -> ModelSettings:
     else:
         settings["max_tokens"] = request.policy.max_model_output_tokens
     return cast(ModelSettings, settings)
+
+
+def _canonical_json_bytes(value: JsonValue) -> bytes:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
 
 
 def _snapshot_run(running: Any) -> tuple[tuple[dict[str, JsonValue], ...], dict[str, JsonValue]]:
@@ -835,7 +933,6 @@ def _snapshot_run(running: Any) -> tuple[tuple[dict[str, JsonValue], ...], dict[
 def _failure_outcome(
     error: Exception,
     validation_failures: int,
-    derivation_failures: int,
 ) -> RunFailure:
     if isinstance(error, _ValidationAttemptsExceeded):
         return RunFailure(
@@ -844,17 +941,6 @@ def _failure_outcome(
                 code="attempts_exhausted",
                 message="The model did not produce an answer satisfying the caller schema",
                 diagnostics={"attempts": validation_failures},
-            )
-        )
-    if isinstance(error, _DerivationAttemptsExceeded):
-        return RunFailure(
-            failure=Failure(
-                stage="derivation_validation",
-                code="attempts_exhausted",
-                message=(
-                    "The model did not produce a derivation that reproduced its answer"
-                ),
-                diagnostics={"attempts": derivation_failures},
             )
         )
     if isinstance(error, DerivationError):
@@ -899,17 +985,6 @@ def _failure_outcome(
             )
         )
     if isinstance(error, UnexpectedModelBehavior):
-        if derivation_failures:
-            return RunFailure(
-                failure=Failure(
-                    stage="derivation_validation",
-                    code="attempts_exhausted",
-                    message=(
-                        "The model did not produce a derivation that reproduced its answer"
-                    ),
-                    diagnostics={"attempts": derivation_failures},
-                )
-            )
         if validation_failures:
             return RunFailure(
                 failure=Failure(
@@ -1003,6 +1078,9 @@ def _retain_completion(
         with suppress(OSError):
             retained_notebook.path.unlink(missing_ok=True)
         retained_notebook = None
+    if retained_notebook is None:
+        with suppress(OSError):
+            (run_directory / "derivation.ipynb").unlink(missing_ok=True)
     record = TerminalRecord(
         schema_version=("2" if request.derivation is not None else "1"),
         run_id=run_id,

@@ -11,6 +11,8 @@ from typing import Any, ClassVar, cast
 
 import pytest
 from pydantic import ValidationError
+from pydantic_ai.messages import ModelResponse, ToolCallPart
+from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.models.test import TestModel
 
 from dsa import MlflowReporting, RetainedDerivationNotebook, RunSuccess, run_analysis
@@ -18,7 +20,7 @@ from dsa import reporting as reporting_module
 from dsa.record import ArtifactRecord
 
 from .test_derivation import ResultExecutor, sample_derivation
-from .test_episode import clock, valid_request
+from .test_episode import clock, expected_derivation_receipt, valid_request
 
 
 def test_reporting_result_states_are_closed_and_safe() -> None:
@@ -227,16 +229,44 @@ async def test_terminal_export_uses_exact_bytes_and_safe_failure_codes(
             "derivation": {"format": "dsa-derivation/v1"},
         }
     )
+    derivation_json = sample_derivation().model_dump(mode="json")
+    receipt = expected_derivation_receipt(
+        derived_request,
+        derivation_json,
+        {"count": 3},
+    )
+    derived_calls = 0
+
+    async def respond_derived(
+        _messages: list[Any],
+        _info: AgentInfo,
+    ) -> ModelResponse:
+        nonlocal derived_calls
+        derived_calls += 1
+        if derived_calls == 1:
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        "validate_derivation",
+                        derivation_json,
+                        "validate-derivation",
+                    )
+                ]
+            )
+        return ModelResponse(
+            parts=[
+                ToolCallPart(
+                    "final_answer",
+                    {"answer": {"count": 3}, "derivation_receipt": receipt},
+                    "answer",
+                )
+            ]
+        )
+
     derived_completion = await run_analysis(
         derived_request,
         runs_directory=tmp_path / "derived-runs",
-        model=TestModel(
-            call_tools=[],
-            custom_output_args={
-                "answer": {"count": 3},
-                "derivation": sample_derivation().model_dump(mode="json"),
-            },
-        ),
+        model=FunctionModel(respond_derived, model_name="test"),
         python_executor=ResultExecutor({"count": 3}),
         identity_factory=lambda: "run-reporting-derived",
         clock=clock(),

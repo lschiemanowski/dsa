@@ -55,6 +55,15 @@ class VerifiedDerivation:
     notebook: RetainedDerivationNotebook
 
 
+@dataclass(frozen=True)
+class ReplayedDerivation:
+    """Model content and JSON result replayed before notebook publication."""
+
+    derivation: Derivation
+    answer: JsonValue
+    runtime_identity: str | None
+
+
 async def verify_derivation(
     derivation: Derivation,
     answer: JsonValue,
@@ -67,6 +76,81 @@ async def verify_derivation(
     python_executor: PythonExecutor | None,
 ) -> VerifiedDerivation:
     """Replay cells from a pristine database and retain their notebook projection."""
+    replayed = await replay_derivation(
+        derivation,
+        source_database=source_database,
+        source_database_sha256=source_database_sha256,
+        run_directory=run_directory,
+        policy=policy,
+        python_executor=python_executor,
+    )
+    answer_bytes = _canonical_json_bytes(answer)
+    if _canonical_json_bytes(replayed.answer) != answer_bytes:
+        raise DerivationError(
+            "derivation_result_mismatch",
+            "The derivation result does not exactly match the submitted answer",
+        )
+    return retain_replayed_derivation(
+        replayed,
+        question=question,
+        source_database_sha256=source_database_sha256,
+        run_directory=run_directory,
+    )
+
+
+async def replay_derivation(
+    derivation: Derivation,
+    *,
+    source_database: Path,
+    source_database_sha256: str,
+    run_directory: Path,
+    policy: RunPolicy,
+    python_executor: PythonExecutor | None,
+) -> ReplayedDerivation:
+    """Replay a derivation without publishing its notebook."""
+    replayed_answer, runtime_identity = await _execute_derivation(
+        derivation,
+        source_database=source_database,
+        source_database_sha256=source_database_sha256,
+        run_directory=run_directory,
+        policy=policy,
+        python_executor=python_executor,
+    )
+    return ReplayedDerivation(
+        derivation=derivation,
+        answer=replayed_answer,
+        runtime_identity=runtime_identity,
+    )
+
+
+def retain_replayed_derivation(
+    replayed: ReplayedDerivation,
+    *,
+    question: str,
+    source_database_sha256: str,
+    run_directory: Path,
+) -> VerifiedDerivation:
+    """Publish a notebook only after the caller accepts the replayed answer."""
+    return _retain_verified_derivation(
+        replayed.derivation,
+        answer_bytes=_canonical_json_bytes(replayed.answer),
+        question=question,
+        source_database_sha256=source_database_sha256,
+        run_directory=run_directory,
+        runtime_identity=replayed.runtime_identity,
+    )
+
+
+async def _execute_derivation(
+    derivation: Derivation,
+    *,
+    source_database: Path,
+    source_database_sha256: str,
+    run_directory: Path,
+    policy: RunPolicy,
+    python_executor: PythonExecutor | None,
+) -> tuple[JsonValue, str | None]:
+    """Replay cells from a pristine database without publishing a notebook."""
     if python_executor is None:
         raise DerivationError(
             "derivation_executor_unavailable",
@@ -125,12 +209,6 @@ async def verify_derivation(
             replayed_answer = environment.load_json_artifact(handle)
         except ArtifactError as error:
             raise DerivationError(error.code, error.message) from error
-        answer_bytes = _canonical_json_bytes(answer)
-        if _canonical_json_bytes(replayed_answer) != answer_bytes:
-            raise DerivationError(
-                "derivation_result_mismatch",
-                "The derivation result does not exactly match the submitted answer",
-            )
     finally:
         active_exception = sys.exc_info()[0]
         try:
@@ -147,6 +225,18 @@ async def verify_derivation(
                     infrastructure=True,
                 ) from error
 
+    return replayed_answer, runtime_identity
+
+
+def _retain_verified_derivation(
+    derivation: Derivation,
+    *,
+    answer_bytes: bytes,
+    question: str,
+    source_database_sha256: str,
+    run_directory: Path,
+    runtime_identity: str | None,
+) -> VerifiedDerivation:
     derivation_bytes = _canonical_json_bytes(derivation.model_dump(mode="json"))
     try:
         derivation_sha256 = sha256(derivation_bytes).hexdigest()

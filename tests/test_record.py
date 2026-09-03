@@ -109,7 +109,7 @@ def test_terminal_record_independently_rejects_invalid_success_answer(tmp_path: 
         TerminalRecord.model_validate(raw)
 
 
-def test_terminal_record_requires_derivation_exactly_when_requested(
+def test_terminal_record_allows_requested_derivation_to_be_omitted(
     tmp_path: Path,
 ) -> None:
     derivation = sample_derivation()
@@ -153,13 +153,14 @@ def test_terminal_record_requires_derivation_exactly_when_requested(
         TerminalRecord.model_validate(
             {**derived.model_dump(mode="python"), "schema_version": "1"}
         )
-    with pytest.raises(ValidationError, match="must match the request contract"):
-        TerminalRecord.model_validate(
-            {
-                **derived.model_dump(mode="python"),
-                "outcome": {"status": "succeeded", "answer": {"count": 3}},
-            }
-        )
+    without_derivation = TerminalRecord.model_validate(
+        {
+            **derived.model_dump(mode="python"),
+            "outcome": {"status": "succeeded", "answer": {"count": 3}},
+        }
+    )
+    assert isinstance(without_derivation.outcome, RunSuccess)
+    assert without_derivation.outcome.derivation is None
     with pytest.raises(ValidationError, match="digest contradicts"):
         TerminalRecord.model_validate(
             {
@@ -183,7 +184,7 @@ def test_answer_only_terminal_rejects_unrequested_derivation(tmp_path: Path) -> 
         "derivation": sample_derivation().model_dump(mode="python"),
     }
 
-    with pytest.raises(ValidationError, match="must match the request contract"):
+    with pytest.raises(ValidationError, match="must be requested and verified"):
         TerminalRecord.model_validate(raw)
 
     raw = terminal_record(tmp_path).model_dump(mode="python")

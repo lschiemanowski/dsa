@@ -58,7 +58,7 @@ experiment. Reporting failure does not change the local analysis outcome.
 
 ### Optional verified derivation
 
-Set `derivation=DerivationRequest()` on `RunRequest` when this task should require a
+Set `derivation=DerivationRequest()` on `RunRequest` when this task should ask for a
 concise human-verification derivation. Leaving the field unset preserves the answer-only
 contract. For example:
 
@@ -70,11 +70,13 @@ request = request.model_copy(
 )
 ```
 
-For an opted-in task, the model returns the caller-schema answer plus bounded Markdown
-and Python cells. DSA independently replays those cells from the pristine source
-database through the configured Docker executor. The final code cell must leave the
-same JSON value in `result`; canonical JSON must match the submitted answer exactly.
-Exploratory mutations made earlier in the run are not visible to this replay.
+For an opted-in task, the model can call `validate_derivation` with bounded Markdown and
+Python cells. DSA independently replays those cells from the pristine source database
+through the configured Docker executor. The final code cell must leave a JSON value in
+`result`. Successful validation returns a receipt that the model can include with the
+exact matching answer. The model may retry within the normal run limits, or submit the
+answer without a receipt if it cannot produce a valid derivation. Exploratory mutations
+made earlier in the run are not visible to replay.
 
 On success the command also returns a `derivation_notebook` object containing the exact
 path, SHA-256 digest, and byte length of `derivation.ipynb`. With MLflow reporting

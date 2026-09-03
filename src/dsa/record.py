@@ -153,13 +153,13 @@ class TerminalRecord(ContractModel):
             derivation_requested = self.request.derivation is not None
             derivation_present = self.outcome.derivation is not None
             verification = self.outcome.derivation_verification
-            if derivation_requested != derivation_present or derivation_present != (
+            if (not derivation_requested and derivation_present) or derivation_present != (
                 verification is not None
             ):
                 raise ValueError(
-                    "successful terminal derivation must match the request contract"
+                    "successful terminal derivation must be requested and verified"
                 )
-            if derivation_requested:
+            if derivation_present:
                 assert self.outcome.derivation is not None
                 assert verification is not None
                 derivation_bytes = _canonical_json_bytes(

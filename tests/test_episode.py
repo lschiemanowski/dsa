@@ -21,7 +21,7 @@ from pydantic_ai.models.test import TestModel
 from pydantic_ai.profiles.openai import OpenAIJsonSchemaTransformer
 
 from dsa import RunFailure, RunRequest, RunSuccess, run_analysis
-from dsa.environment import PythonExecutionRequest, PythonExecutionResult
+from dsa.environment import PythonExecutionError, PythonExecutionRequest, PythonExecutionResult
 
 from .test_contract import DRAFT_2020_12, local_reference_answer_schema, request_value
 from .test_derivation import ClassifiedFailureExecutor, ResultExecutor, sample_derivation
@@ -49,6 +49,34 @@ def clock() -> Callable[[], datetime]:
         return result
 
     return now
+
+
+def expected_derivation_receipt(
+    request: RunRequest,
+    derivation: object,
+    answer: JsonValue,
+) -> str:
+    derivation_bytes = json.dumps(
+        derivation,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    answer_bytes = json.dumps(
+        answer,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    source_bytes = request.database_path.read_bytes()
+    payload = (
+        sha256(derivation_bytes).hexdigest()
+        + sha256(answer_bytes).hexdigest()
+        + sha256(source_bytes).hexdigest()
+    ).encode("ascii")
+    return f"dvr_{sha256(payload).hexdigest()}"
 
 
 async def test_invalid_request_has_no_identity_model_call_or_filesystem_effect(
@@ -135,17 +163,37 @@ async def test_opted_in_derivation_is_replayed_and_retained_with_a_notebook(
         }
     )
     derivation = sample_derivation()
+    derivation_json = derivation.model_dump(mode="json")
+    receipt = expected_derivation_receipt(request, derivation_json, {"count": 3})
+    calls = 0
+
+    async def respond(_messages: list[Any], _info: AgentInfo) -> ModelResponse:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        "validate_derivation",
+                        derivation_json,
+                        "validate-derivation",
+                    )
+                ]
+            )
+        return ModelResponse(
+            parts=[
+                ToolCallPart(
+                    "final_answer",
+                    {"answer": {"count": 3}, "derivation_receipt": receipt},
+                    "answer",
+                )
+            ]
+        )
 
     completion = await run_analysis(
         request,
         runs_directory=tmp_path / "runs",
-        model=TestModel(
-            call_tools=[],
-            custom_output_args={
-                "answer": {"count": 3},
-                "derivation": derivation.model_dump(mode="json"),
-            },
-        ),
+        model=FunctionModel(respond, model_name="test"),
         python_executor=ResultExecutor({"count": 3}),
         identity_factory=lambda: "run-derived",
         clock=clock(),
@@ -182,10 +230,7 @@ async def test_derivation_envelope_preserves_local_answer_schema_references(
         runs_directory=tmp_path / "runs",
         model=TestModel(
             call_tools=[],
-            custom_output_args={
-                "answer": {"count": 3},
-                "derivation": sample_derivation().model_dump(mode="json"),
-            },
+            custom_output_args={"answer": {"count": 3}, "derivation_receipt": None},
         ),
         python_executor=ResultExecutor({"count": 3}),
         identity_factory=lambda: "run-derived-local-reference",
@@ -294,7 +339,7 @@ async def test_derivation_envelope_preserves_other_local_reference_forms(
     async def respond(_messages: list[Any], info: AgentInfo) -> ModelResponse:
         output = {
             "answer": answer,
-            "derivation": sample_derivation().model_dump(mode="json"),
+            "derivation_receipt": None,
         }
         validator = cast(
             Any,
@@ -352,7 +397,7 @@ async def test_false_boolean_reference_terminalizes_validation_failure(
                     "final_answer",
                     {
                         "answer": {"count": 3},
-                        "derivation": sample_derivation().model_dump(mode="json"),
+                        "derivation_receipt": None,
                     },
                     "answer",
                 )
@@ -386,20 +431,29 @@ async def test_false_boolean_reference_terminalizes_validation_failure(
 
 
 async def test_derivation_output_schema_prepares_for_openai(tmp_path: Path) -> None:
+    observed: dict[str, Any] = {}
+
     async def respond(_messages: list[Any], info: AgentInfo) -> ModelResponse:
+        validation_tool = next(
+            tool for tool in info.function_tools if tool.name == "validate_derivation"
+        )
+        prepared_validation = OpenAIJsonSchemaTransformer(
+            validation_tool.parameters_json_schema,
+            strict=True,
+        ).walk()
+        observed["validation"] = prepared_validation
         schema = info.output_tools[0].parameters_json_schema
         prepared = OpenAIJsonSchemaTransformer(schema, strict=True).walk()
-        derivation = prepared["properties"]["derivation"]
-        assert isinstance(derivation, dict)
-        assert derivation["required"] == ["format", "cells"]
-        assert derivation["additionalProperties"] is False
+        receipt = prepared["properties"]["derivation_receipt"]
+        assert isinstance(receipt, dict)
+        assert prepared["required"] == ["answer", "derivation_receipt"]
         return ModelResponse(
             parts=[
                 ToolCallPart(
                     "final_answer",
                     {
                         "answer": {"count": 3},
-                        "derivation": sample_derivation().model_dump(mode="json"),
+                        "derivation_receipt": None,
                     },
                     "answer",
                 )
@@ -423,6 +477,7 @@ async def test_derivation_output_schema_prepares_for_openai(tmp_path: Path) -> N
     )
 
     assert isinstance(completion.outcome, RunSuccess)
+    assert observed["validation"]["required"] == ["format", "cells"]
 
 
 async def test_answer_only_run_keeps_legacy_terminal_and_creates_no_notebook(
@@ -865,6 +920,22 @@ class SequenceDerivationExecutor:
         return PythonExecutionResult(runtime_identity="docker/test")
 
 
+class FailThenDeriveExecutor:
+    def __init__(self, result: JsonValue) -> None:
+        self.result = result
+        self.calls = 0
+
+    async def execute(self, request: PythonExecutionRequest) -> PythonExecutionResult:
+        self.calls += 1
+        if self.calls == 1:
+            raise PythonExecutionError("python_exit_nonzero", "candidate failed")
+        (request.output_directory / "result.json").write_text(
+            json.dumps(self.result),
+            encoding="utf-8",
+        )
+        return PythonExecutionResult(runtime_identity="docker/test")
+
+
 class ArtifactAndDerivationExecutor:
     async def execute(self, request: PythonExecutionRequest) -> PythonExecutionResult:
         if request.expected_outputs == ("answer.json",):
@@ -977,6 +1048,8 @@ async def test_derivation_replays_from_pristine_source_not_exploratory_state(
             "derivation": {"format": "dsa-derivation/v1"},
         }
     )
+    derivation_json = sample_derivation().model_dump(mode="json")
+    receipt = expected_derivation_receipt(request, derivation_json, {"count": 12})
     calls = 0
 
     async def respond(_messages: list[Any], _info: AgentInfo) -> ModelResponse:
@@ -992,14 +1065,21 @@ async def test_derivation_replays_from_pristine_source_not_exploratory_state(
                     )
                 ]
             )
+        if calls == 2:
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        "validate_derivation",
+                        derivation_json,
+                        "validate-derivation",
+                    )
+                ]
+            )
         return ModelResponse(
             parts=[
                 ToolCallPart(
                     "final_answer",
-                    {
-                        "answer": {"count": 12},
-                        "derivation": sample_derivation().model_dump(mode="json"),
-                    },
+                    {"answer": {"count": 12}, "derivation_receipt": receipt},
                     "derived-answer",
                 )
             ]
@@ -1020,7 +1100,7 @@ async def test_derivation_replays_from_pristine_source_not_exploratory_state(
     assert completion.record.database.final_sha256 != completion.record.database.source_sha256
 
 
-async def test_derivation_mismatch_retries_then_accepts_reproduced_answer(
+async def test_receipt_for_a_different_answer_retries_then_allows_answer_only(
     tmp_path: Path,
 ) -> None:
     request = valid_request(tmp_path, max_validation_attempts=2)
@@ -1030,25 +1110,37 @@ async def test_derivation_mismatch_retries_then_accepts_reproduced_answer(
             "derivation": {"format": "dsa-derivation/v1"},
         }
     )
+    derivation_json = sample_derivation().model_dump(mode="json")
+    receipt = expected_derivation_receipt(request, derivation_json, {"count": 4})
     model_calls = 0
 
     async def respond(_messages: list[Any], _info: AgentInfo) -> ModelResponse:
         nonlocal model_calls
         model_calls += 1
+        if model_calls == 1:
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        "validate_derivation",
+                        derivation_json,
+                        "validate-derivation",
+                    )
+                ]
+            )
         return ModelResponse(
             parts=[
                 ToolCallPart(
                     "final_answer",
                     {
                         "answer": {"count": 3},
-                        "derivation": sample_derivation().model_dump(mode="json"),
+                        "derivation_receipt": receipt if model_calls == 2 else None,
                     },
                     f"answer-{model_calls}",
                 )
             ]
         )
 
-    executor = SequenceDerivationExecutor([{"count": 4}, {"count": 3}])
+    executor = SequenceDerivationExecutor([{"count": 4}])
     completion = await run_analysis(
         request,
         runs_directory=tmp_path / "runs",
@@ -1058,13 +1150,15 @@ async def test_derivation_mismatch_retries_then_accepts_reproduced_answer(
         clock=clock(),
     )
 
-    assert model_calls == 2
-    assert executor.calls == 2
+    assert model_calls == 3
+    assert executor.calls == 1
     assert isinstance(completion.outcome, RunSuccess)
-    assert "derivation_result_mismatch" in json.dumps(completion.record.messages)
+    assert completion.outcome.derivation is None
+    assert completion.retained_notebook is None
+    assert "derivation_receipt_invalid" in json.dumps(completion.record.messages)
 
 
-async def test_exhausted_derivation_mismatches_are_a_typed_agent_failure(
+async def test_failed_derivation_validation_does_not_prevent_answer_submission(
     tmp_path: Path,
 ) -> None:
     request = valid_request(tmp_path, max_validation_attempts=2)
@@ -1075,29 +1169,159 @@ async def test_exhausted_derivation_mismatches_are_a_typed_agent_failure(
         }
     )
 
+    calls = 0
+
+    async def respond(_messages: list[Any], _info: AgentInfo) -> ModelResponse:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        "validate_derivation",
+                        sample_derivation().model_dump(mode="json"),
+                        "invalid-derivation",
+                    )
+                ]
+            )
+        return ModelResponse(
+            parts=[
+                ToolCallPart(
+                    "final_answer",
+                    {"answer": {"count": 3}, "derivation_receipt": None},
+                    "answer-only",
+                )
+            ]
+        )
+
     completion = await run_analysis(
         request,
         runs_directory=tmp_path / "runs",
-        model=TestModel(
-            call_tools=[],
-            custom_output_args={
-                "answer": {"count": 3},
-                "derivation": sample_derivation().model_dump(mode="json"),
-            },
-        ),
-        python_executor=SequenceDerivationExecutor([{"count": 4}, {"count": 4}]),
+        model=FunctionModel(respond, model_name="test"),
+        python_executor=ClassifiedFailureExecutor("python_exit_nonzero"),
         identity_factory=lambda: "run-derivation-exhausted",
         clock=clock(),
     )
 
-    assert isinstance(completion.outcome, RunFailure)
-    assert completion.outcome.failure.stage == "derivation_validation"
-    assert completion.outcome.failure.code == "attempts_exhausted"
-    assert completion.outcome.failure.diagnostics == {"attempts": 2}
+    assert calls == 2
+    assert isinstance(completion.outcome, RunSuccess)
+    assert completion.outcome.answer == {"count": 3}
+    assert completion.outcome.derivation is None
+    assert "python_exit_nonzero" in json.dumps(completion.record.messages)
     assert completion.retained_notebook is None
 
 
-async def test_invalid_derivation_cell_sequence_uses_bounded_retries(
+async def test_derivation_tool_can_retry_until_validation_succeeds(tmp_path: Path) -> None:
+    request = valid_request(tmp_path)
+    request = RunRequest.model_validate(
+        {
+            **request.model_dump(mode="python", round_trip=True),
+            "derivation": {"format": "dsa-derivation/v1"},
+        }
+    )
+    derivation_json = sample_derivation().model_dump(mode="json")
+    receipt = expected_derivation_receipt(request, derivation_json, {"count": 3})
+    calls = 0
+
+    async def respond(_messages: list[Any], _info: AgentInfo) -> ModelResponse:
+        nonlocal calls
+        calls += 1
+        if calls <= 2:
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        "validate_derivation",
+                        derivation_json,
+                        f"validate-derivation-{calls}",
+                    )
+                ]
+            )
+        return ModelResponse(
+            parts=[
+                ToolCallPart(
+                    "final_answer",
+                    {"answer": {"count": 3}, "derivation_receipt": receipt},
+                    "answer",
+                )
+            ]
+        )
+
+    executor = FailThenDeriveExecutor({"count": 3})
+    completion = await run_analysis(
+        request,
+        runs_directory=tmp_path / "runs",
+        model=FunctionModel(respond, model_name="test"),
+        python_executor=executor,
+        identity_factory=lambda: "run-derivation-tool-retry",
+        clock=clock(),
+    )
+
+    assert calls == 3
+    assert executor.calls == 2
+    assert isinstance(completion.outcome, RunSuccess)
+    assert completion.outcome.derivation_verification is not None
+    assert completion.retained_notebook is not None
+    assert "python_exit_nonzero" in json.dumps(completion.record.messages)
+
+
+async def test_schema_invalid_replay_does_not_consume_the_derivation_receipt_slot(
+    tmp_path: Path,
+) -> None:
+    request = valid_request(tmp_path)
+    request = RunRequest.model_validate(
+        {
+            **request.model_dump(mode="python", round_trip=True),
+            "derivation": {"format": "dsa-derivation/v1"},
+        }
+    )
+    derivation_json = sample_derivation().model_dump(mode="json")
+    receipt = expected_derivation_receipt(request, derivation_json, {"count": 3})
+    calls = 0
+
+    async def respond(_messages: list[Any], _info: AgentInfo) -> ModelResponse:
+        nonlocal calls
+        calls += 1
+        if calls <= 2:
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        "validate_derivation",
+                        derivation_json,
+                        f"validate-derivation-{calls}",
+                    )
+                ]
+            )
+        return ModelResponse(
+            parts=[
+                ToolCallPart(
+                    "final_answer",
+                    {"answer": {"count": 3}, "derivation_receipt": receipt},
+                    "answer",
+                )
+            ]
+        )
+
+    executor = SequenceDerivationExecutor(["wrong shape", {"count": 3}])
+    completion = await run_analysis(
+        request,
+        runs_directory=tmp_path / "runs",
+        model=FunctionModel(respond, model_name="test"),
+        python_executor=executor,
+        identity_factory=lambda: "run-schema-invalid-derivation-retry",
+        clock=clock(),
+    )
+
+    assert calls == 3
+    assert executor.calls == 2
+    assert isinstance(completion.outcome, RunSuccess)
+    assert completion.outcome.derivation_verification is not None
+    assert completion.retained_notebook is not None
+    retained_messages = json.dumps(completion.record.messages)
+    assert "answer_schema_validation_failed" in retained_messages
+    assert "derivation_already_validated" not in retained_messages
+
+
+async def test_derivation_can_be_skipped_without_calling_validation_tool(
     tmp_path: Path,
 ) -> None:
     request = valid_request(tmp_path, max_validation_attempts=2)
@@ -1107,29 +1331,22 @@ async def test_invalid_derivation_cell_sequence_uses_bounded_retries(
             "derivation": {"format": "dsa-derivation/v1"},
         }
     )
-    invalid = {
-        "format": "dsa-derivation/v1",
-        "cells": [
-            {"type": "code", "source": "value = 3"},
-            {"type": "code", "source": "result = {'count': value}"},
-        ],
-    }
     completion = await run_analysis(
         request,
         runs_directory=tmp_path / "runs",
         model=TestModel(
             call_tools=[],
-            custom_output_args={"answer": {"count": 3}, "derivation": invalid},
+            custom_output_args={"answer": {"count": 3}},
         ),
         python_executor=ResultExecutor({"count": 3}),
         identity_factory=lambda: "run-invalid-derivation-shape",
         clock=clock(),
     )
 
-    assert isinstance(completion.outcome, RunFailure)
-    assert completion.outcome.failure.stage == "derivation_validation"
-    assert completion.outcome.failure.code == "attempts_exhausted"
-    assert completion.outcome.failure.diagnostics == {"attempts": 2}
+    assert isinstance(completion.outcome, RunSuccess)
+    assert completion.outcome.answer == {"count": 3}
+    assert completion.outcome.derivation is None
+    assert completion.retained_notebook is None
 
 
 async def test_derivation_container_cleanup_failure_is_not_retried(
@@ -1143,16 +1360,25 @@ async def test_derivation_container_cleanup_failure_is_not_retried(
         }
     )
     executor = ClassifiedFailureExecutor("python_container_cleanup")
+    calls = 0
+
+    async def respond(_messages: list[Any], _info: AgentInfo) -> ModelResponse:
+        nonlocal calls
+        calls += 1
+        return ModelResponse(
+            parts=[
+                ToolCallPart(
+                    "validate_derivation",
+                    sample_derivation().model_dump(mode="json"),
+                    "validate-derivation",
+                )
+            ]
+        )
+
     completion = await run_analysis(
         request,
         runs_directory=tmp_path / "runs",
-        model=TestModel(
-            call_tools=[],
-            custom_output_args={
-                "answer": {"count": 3},
-                "derivation": sample_derivation().model_dump(mode="json"),
-            },
-        ),
+        model=FunctionModel(respond, model_name="test"),
         python_executor=executor,
         identity_factory=lambda: "run-derivation-cleanup-failure",
         clock=clock(),
@@ -1175,6 +1401,8 @@ async def test_derivation_can_accompany_a_retained_artifact_answer(
             "derivation": {"format": "dsa-derivation/v1"},
         }
     )
+    derivation_json = sample_derivation().model_dump(mode="json")
+    receipt = expected_derivation_receipt(request, derivation_json, {"count": 12})
     calls = 0
 
     async def respond(_messages: list[Any], _info: AgentInfo) -> ModelResponse:
@@ -1204,13 +1432,23 @@ async def test_derivation_can_accompany_a_retained_artifact_answer(
                     )
                 ]
             )
+        if calls == 3:
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        "validate_derivation",
+                        derivation_json,
+                        "validate-derivation",
+                    )
+                ]
+            )
         return ModelResponse(
             parts=[
                 ToolCallPart(
                     "answer_from_artifact",
                     {
                         "handle": "a2",
-                        "derivation": sample_derivation().model_dump(mode="json"),
+                        "derivation_receipt": receipt,
                     },
                     "submit-derived-artifact",
                 )
@@ -1226,7 +1464,7 @@ async def test_derivation_can_accompany_a_retained_artifact_answer(
         clock=clock(),
     )
 
-    assert calls == 3
+    assert calls == 4
     assert isinstance(completion.outcome, RunSuccess)
     assert completion.outcome.answer == {"count": 12}
     assert completion.outcome.derivation_verification is not None
@@ -1244,17 +1482,26 @@ async def test_cancellation_during_derivation_replay_retains_terminal_only(
         }
     )
     executor = BlockingDerivationExecutor()
+    calls = 0
+
+    async def respond(_messages: list[Any], _info: AgentInfo) -> ModelResponse:
+        nonlocal calls
+        calls += 1
+        return ModelResponse(
+            parts=[
+                ToolCallPart(
+                    "validate_derivation",
+                    sample_derivation().model_dump(mode="json"),
+                    "validate-derivation",
+                )
+            ]
+        )
+
     task = asyncio.create_task(
         run_analysis(
             request,
             runs_directory=tmp_path / "runs",
-            model=TestModel(
-                call_tools=[],
-                custom_output_args={
-                    "answer": {"count": 3},
-                    "derivation": sample_derivation().model_dump(mode="json"),
-                },
-            ),
+            model=FunctionModel(respond, model_name="test"),
             python_executor=executor,
             identity_factory=lambda: "run-cancelled-derivation",
             clock=clock(),
