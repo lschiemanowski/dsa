@@ -22,6 +22,9 @@ approving user.
 
 The untrusted side receives no real rows, private schema metadata beyond what an operator chose to
 mock, filesystem path, provider secret, broker credential with broad scope, or DSA execution tool.
+The configured clarifier must be a plain model connection, not another Pipe or a model profile
+with server-side tools. The application controls what is sent to the model, not what an arbitrary
+operator-installed backend extension can read from its own host.
 
 ### Trusted application side
 
@@ -67,9 +70,10 @@ honestly rather than fabricating or presenting an unverified notebook.
 ## Artifact invariant
 
 External responses contain an opaque artifact ID, SHA-256 digest, byte length, and media type—not
-a local path. A later artifact endpoint must reauthorize the current user against the proposal and
-stream the exact retained bytes with a fixed content disposition. Artifact IDs must not grant
-ambient access by possession alone.
+a local path. The Pipe keeps the retained notebook reference only for its current invocation,
+reopens it without following symlinks, and verifies the exact length and digest before emitting a
+fixed-name download embed. There is no general artifact endpoint or possession-based download API
+in this demo.
 
 ## Failure policy
 
@@ -81,14 +85,14 @@ Cancellation is recorded as `analysis_cancelled` before it is re-raised. If the 
 that transition, the record remains `running`; production recovery must reconcile it against DSA's
 retained terminal evidence and must not automatically repeat an ambiguous paid execution.
 
-## Out of scope for this milestone
+## Deliberate demo limits
 
 - HTTP authentication, CSRF protection, rate limits, and deployment hardening;
 - durable multi-process transactions and crash recovery;
-- real DSA/database and artifact-serving adapters;
-- Open WebUI Pipe, Action, and file-download integration;
+- a separate HTTP service or durable artifact-serving registry;
 - protection from an operator putting sensitive values into the mock context; and
 - semantic quality or privacy review of the final answer and notebook.
 
-The eventual HTTP adapter must also authorize the requested `data_source_id` for the current user;
-syntactic validation of a logical ID is not data-source authorization.
+The configured Pipe exposes one data source to everyone allowed to select that Pipe. Open WebUI
+deployment and access control must therefore restrict it to the intended users. A future
+multi-source application would need real per-user data-source authorization.

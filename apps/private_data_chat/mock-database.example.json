@@ -1,0 +1,46 @@
+{
+  "data_source_id": "retail",
+  "display_name": "Synthetic online retail data",
+  "format": "dsa-mock-database/v1",
+  "relations": [
+    {
+      "columns": [
+        "line_id",
+        "invoice_id",
+        "stock_code",
+        "description",
+        "quantity",
+        "invoice_ts",
+        "unit_price_gbp",
+        "customer_id",
+        "country"
+      ],
+      "name": "analysis.transaction_lines",
+      "sample_rows": [
+        {
+          "country": "Exampleland",
+          "customer_id": "FAKE-CUSTOMER-1",
+          "description": "Synthetic ceramic cup",
+          "invoice_id": "FAKE-1001",
+          "invoice_ts": "2011-01-03T10:15:00",
+          "line_id": 1,
+          "quantity": 2,
+          "stock_code": "FAKE-SKU-1",
+          "unit_price_gbp": 3.5
+        },
+        {
+          "country": "Sample Republic",
+          "customer_id": "FAKE-CUSTOMER-2",
+          "description": "Synthetic paper notebook",
+          "invoice_id": "FAKE-1002",
+          "invoice_ts": "2011-02-14T14:30:00",
+          "line_id": 2,
+          "quantity": 5,
+          "stock_code": "FAKE-SKU-2",
+          "unit_price_gbp": 1.25
+        }
+      ]
+    }
+  ],
+  "synthetic": true
+}

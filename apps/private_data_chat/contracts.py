@@ -114,6 +114,28 @@ class ProposalPayload(AppContract):
         return schema
 
 
+class ClarifierTurn(AppContract):
+    """One strictly parsed response from the untrusted clarification model."""
+
+    format: Literal["dsa-clarifier-turn/v1"] = "dsa-clarifier-turn/v1"
+    kind: Literal["clarification", "proposal"]
+    message: str = Field(min_length=1, max_length=8_000)
+    proposal: ProposalPayload | None = None
+
+    @field_validator("message")
+    @classmethod
+    def reject_blank_message(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("clarifier message must not be blank")
+        return value
+
+    @model_validator(mode="after")
+    def validate_turn_shape(self) -> ClarifierTurn:
+        if (self.kind == "proposal") != (self.proposal is not None):
+            raise ValueError("only proposal turns may contain a proposal")
+        return self
+
+
 class ProposalBinding(AppContract):
     """Host-controlled identity and private-data binding excluded from model control."""
 
