@@ -46,7 +46,12 @@ from referencing import Resource
 from referencing.jsonschema import DRAFT202012
 
 from dsa.contract import ContractModel, Derivation, RunRequest
-from dsa.derivation import DerivationError, VerifiedDerivation, replay_derivation
+from dsa.derivation import (
+    DerivationError,
+    VerifiedDerivation,
+    replay_derivation,
+    retain_replayed_derivation,
+)
 from dsa.environment import (
     AnalysisEnvironment,
     ArtifactError,
@@ -464,14 +469,58 @@ async def _run_canonical_analysis(
                 infrastructure=True,
             )
         try:
-            replayed_answer, verified = await replay_derivation(
+            replayed = await replay_derivation(
                 derivation,
-                question=canonical_request.question,
                 source_database=pristine_database,
                 source_database_sha256=source_database_sha256,
                 run_directory=run_directory,
                 policy=canonical_request.policy,
                 python_executor=python_executor,
+            )
+        except DerivationError as error:
+            if error.infrastructure:
+                raise
+            return _bounded_retry_feedback(
+                [
+                    {"error": error.code, "message": error.message},
+                    {"error": error.code},
+                ],
+                canonical_request.policy.max_tool_result_bytes,
+            )
+        replayed_answer = replayed.answer
+        errors = sorted(
+            validator.iter_errors(replayed_answer),
+            key=_validation_error_key,
+        )
+        if errors:
+            return _validation_feedback(
+                errors,
+                canonical_request.policy.max_tool_result_bytes,
+            )
+        try:
+            json.dumps(replayed_answer, allow_nan=False)
+        except (TypeError, ValueError):
+            return _bounded_retry_feedback(
+                [
+                    {
+                        "error": "answer_schema_validation_failed",
+                        "issues": [
+                            {
+                                "keyword": "json",
+                                "message": "derivation result must be finite JSON",
+                            }
+                        ],
+                    },
+                    {"error": "answer_schema_validation_failed"},
+                ],
+                canonical_request.policy.max_tool_result_bytes,
+            )
+        try:
+            verified = retain_replayed_derivation(
+                replayed,
+                question=canonical_request.question,
+                source_database_sha256=source_database_sha256,
+                run_directory=run_directory,
             )
         except DerivationError as error:
             if error.infrastructure:

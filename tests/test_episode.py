@@ -1264,6 +1264,63 @@ async def test_derivation_tool_can_retry_until_validation_succeeds(tmp_path: Pat
     assert "python_exit_nonzero" in json.dumps(completion.record.messages)
 
 
+async def test_schema_invalid_replay_does_not_consume_the_derivation_receipt_slot(
+    tmp_path: Path,
+) -> None:
+    request = valid_request(tmp_path)
+    request = RunRequest.model_validate(
+        {
+            **request.model_dump(mode="python", round_trip=True),
+            "derivation": {"format": "dsa-derivation/v1"},
+        }
+    )
+    derivation_json = sample_derivation().model_dump(mode="json")
+    receipt = expected_derivation_receipt(request, derivation_json, {"count": 3})
+    calls = 0
+
+    async def respond(_messages: list[Any], _info: AgentInfo) -> ModelResponse:
+        nonlocal calls
+        calls += 1
+        if calls <= 2:
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        "validate_derivation",
+                        derivation_json,
+                        f"validate-derivation-{calls}",
+                    )
+                ]
+            )
+        return ModelResponse(
+            parts=[
+                ToolCallPart(
+                    "final_answer",
+                    {"answer": {"count": 3}, "derivation_receipt": receipt},
+                    "answer",
+                )
+            ]
+        )
+
+    executor = SequenceDerivationExecutor(["wrong shape", {"count": 3}])
+    completion = await run_analysis(
+        request,
+        runs_directory=tmp_path / "runs",
+        model=FunctionModel(respond, model_name="test"),
+        python_executor=executor,
+        identity_factory=lambda: "run-schema-invalid-derivation-retry",
+        clock=clock(),
+    )
+
+    assert calls == 3
+    assert executor.calls == 2
+    assert isinstance(completion.outcome, RunSuccess)
+    assert completion.outcome.derivation_verification is not None
+    assert completion.retained_notebook is not None
+    retained_messages = json.dumps(completion.record.messages)
+    assert "answer_schema_validation_failed" in retained_messages
+    assert "derivation_already_validated" not in retained_messages
+
+
 async def test_derivation_can_be_skipped_without_calling_validation_tool(
     tmp_path: Path,
 ) -> None:
