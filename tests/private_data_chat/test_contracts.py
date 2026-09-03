@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from pathlib import Path
 from typing import cast
 
 import pytest
@@ -9,6 +10,7 @@ from pydantic import JsonValue, ValidationError
 from apps.private_data_chat.contracts import (
     AnalysisResult,
     ArtifactIdentity,
+    ClarifierTurn,
     MockDatabaseContext,
     MockRelation,
     ProposalPayload,
@@ -121,6 +123,33 @@ def test_mock_context_is_explicitly_synthetic_and_row_shaped() -> None:
             name="invoice_lines",
             columns=("invoice_id", "quantity"),
             sample_rows=({"invoice_id": "FAKE-1"},),
+        )
+
+
+def test_checked_in_mock_context_is_valid_and_explicitly_synthetic() -> None:
+    path = Path(__file__).parents[2] / "apps/private_data_chat/mock-database.example.json"
+    context = MockDatabaseContext.model_validate_json(path.read_bytes())
+    assert context.synthetic is True
+    assert all(
+        "FAKE" in str(value)
+        for relation in context.relations
+        for row in relation.sample_rows
+        for key, value in row.items()
+        if key in {"invoice_id", "stock_code", "customer_id"}
+    )
+
+
+def test_clarifier_turn_requires_proposal_only_for_proposal_kind() -> None:
+    clarification = ClarifierTurn(
+        kind="clarification",
+        message="Which calendar year should I use?",
+    )
+    assert clarification.proposal is None
+
+    with pytest.raises(ValidationError, match="only proposal turns"):
+        ClarifierTurn(
+            kind="proposal",
+            message="Ready.",
         )
 
 
