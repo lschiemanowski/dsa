@@ -13,14 +13,14 @@ message is refused before either model is called.
 
 ## Implemented demo flow
 
-`openwebui_pipe.py` implements one deliberately small Open WebUI Pipe:
+`chainlit_app.py` implements one deliberately small Chainlit application:
 
 1. it rebuilds the untrusted model request from bounded user/assistant text and the operator's
    synthetic `MockDatabaseContext` only;
 2. the clarifier asks questions until it emits a validated quantitative proposal;
-3. Open WebUI displays the canonical proposal in a native confirmation dialog;
+3. Chainlit displays the canonical proposal with native confirmation actions;
 4. exact confirmation invokes the host-owned `DsaAnalysisExecutor` against the real database;
-5. the Pipe returns the structured answer and emits an embedded notebook download when DSA
+5. the application returns the structured answer and attaches a notebook download when DSA
    retained a verified derivation; and
 6. that assistant result marks the conversation terminal. Later messages tell the user to open a
    new conversation without calling the clarifier or DSA.
@@ -39,7 +39,7 @@ The contracts supporting that flow are intentionally modest:
   public boundary.
 
 The in-memory store is sufficient because proposal, confirmation, and execution happen in one
-Pipe invocation. The Pipe atomically rejects overlapping turns for the same user and conversation;
+application session. The session atomically rejects overlapping turns for the same conversation;
 it releases that reservation after clarification or declined confirmation and makes it permanently
 terminal immediately after confirmation. This is a portfolio demo, not durable workflow
 infrastructure.
@@ -61,38 +61,52 @@ it never starts a second analysis. A concurrent call while execution is in progr
 The single-process lock makes those statements true for `InMemoryProposalStore` during the one
 invocation.
 
-## Open WebUI setup
+## Chainlit setup
 
-This application is intentionally not part of the `dsa` wheel. The Open WebUI backend must have
-the repository root on `PYTHONPATH`, the DSA environment available, and access to the Docker CLI
-and daemon used for derivation replay. If Open WebUI itself runs in Docker, mount the repository,
-the real database, and the runs directory at the same absolute paths seen by the Docker daemon.
+The application remains in the separate `apps.private_data_chat` namespace, but the project wheel
+includes it so a cloned checkout does not need a custom `PYTHONPATH`. Chainlit is an exact-pinned
+optional dependency and is not vendored. From the repository root, one command resolves the
+optional UI environment and starts the application:
 
-In Open WebUI:
+```bash
+uv run --python 3.12 --extra chat --frozen \
+  chainlit run apps/private_data_chat/chainlit_app.py
+```
 
-1. create a Function using the contents of `openwebui-function.py`;
-2. configure its Valves:
-   - `CLARIFIER_MODEL_ID`: the capable untrusted model available in Open WebUI. Use a plain model
-     connection with no server-side tools, Pipe, filesystem access, or privileged system prompt;
-   - `MOCK_CONTEXT_PATH`: an absolute path to a synthetic context based on
-     `mock-database.example.json`;
-   - `DATA_SOURCE_ID`: the same logical ID used in that context;
-   - `DATABASE_PATH` and `RUNS_DIRECTORY`: trusted absolute host paths;
-   - `TRUSTED_MODEL_NAME` and `TRUSTED_MODEL_SETTINGS_JSON`: the Pydantic AI model selection and
-     safe settings used by DSA;
-   - `DOCKER_IMAGE`: the immutable replay image in `name@sha256:<digest>` form; and
-   - `REPORT_TO_MLFLOW`: optional observability through the already configured MLflow backend.
-3. enable the Function and select **Private Data Chat** as the chat model.
+Before starting it, configure the host-owned boundary:
 
-The backend/provider credentials continue to come from its environment; no Valve accepts an API
-key or provider endpoint. The clarifier receives neither the real database configuration nor the
-original request's files, tools, system messages, or metadata.
+```bash
+export DSA_CHAT_DATA_SOURCE_ID=retail
+export DSA_CHAT_MOCK_CONTEXT_PATH="$PWD/apps/private_data_chat/mock-database.example.json"
+export DSA_CHAT_CLARIFIER_MODEL_NAME=openai:your-capable-untrusted-model
+export DSA_CHAT_CLARIFIER_MODEL_SETTINGS_JSON='{}'
+export DSA_CHAT_DATABASE_PATH=/absolute/path/to/real.duckdb
+export DSA_CHAT_RUNS_DIRECTORY=/absolute/path/to/dsa-runs
+export DSA_CHAT_TRUSTED_MODEL_NAME=openai:your-trusted-model
+export DSA_CHAT_TRUSTED_MODEL_SETTINGS_JSON='{}'
+export DSA_CHAT_DOCKER_IMAGE='repository/image@sha256:...'
+export DSA_CHAT_REPORT_TO_MLFLOW=false
+```
 
-The notebook is delivered as a persisted Open WebUI embed containing a fixed-name, base64-backed
-download link. Before emitting it, the adapter reopens the exact retained file without following
-symlinks and rechecks its byte length and SHA-256 digest. No host path is put in the chat.
+Provider credentials continue to come from the process environment. Neither model-settings
+variable may contain credentials or a provider endpoint; the same safe `ModelConfiguration`
+contract used by DSA validates both. Set `DSA_CHAT_REPORT_TO_MLFLOW=true` only when an MLflow
+backend is already configured.
 
-`clarification-skill.md` is a host-owned system prompt loaded by the Pipe. It improves the
+The Chainlit process needs access to the Docker CLI and daemon used for derivation replay. The
+configured database and runs directory must also be visible to that daemon at the same absolute
+paths.
+
+`DSA_CHAT_CLARIFIER_MODEL_NAME` selects the capable untrusted model. The application creates it as
+a tool-free Pydantic AI agent and sends only bounded user/assistant text plus the synthetic mock
+context. `DSA_CHAT_TRUSTED_MODEL_NAME` is resolved separately inside `DsaAnalysisExecutor`; its
+request includes the approved question and answer schema, not the clarification conversation.
+
+The notebook is delivered through Chainlit's native `File` element under a fixed download name.
+Before attaching it, the adapter reopens the exact retained file without following symlinks and
+rechecks its byte length and SHA-256 digest. No host path is put in the chat.
+
+`clarification-skill.md` is a host-owned system prompt loaded by the application. It improves the
 clarifier's behavior; the parsed contracts, confirmation digest, and trusted adapter enforce the
 actual boundary.
 
