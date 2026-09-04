@@ -68,22 +68,54 @@ invocation.
 ## Chainlit setup
 
 The application remains in the separate `apps.private_data_chat` namespace, but the project wheel
-includes it so a cloned checkout does not need a custom `PYTHONPATH`. Chainlit is an exact-pinned
-optional dependency and is not vendored. From the repository root, one command resolves the
-optional UI environment and starts the application:
+includes it so a cloned checkout does not need a custom `PYTHONPATH`. The product-level `dsa`
+command is only a dispatcher: `dsa chat` enters this application package, while `dsa run` and
+`dsa benchmark` enter their existing core CLI modules. Nothing under `src/dsa` imports the chat
+application or Chainlit.
+
+Chainlit is an exact-pinned optional dependency and is not vendored. Install it from the frozen
+project lockfile:
 
 ```bash
-source .private-data-chat.env
-uv run --python 3.12 --extra chat --frozen \
-  chainlit run apps/private_data_chat/chainlit_app.py \
-  --headless --host 127.0.0.1 --port 8001
+uv sync --python 3.12 --extra chat --frozen
 ```
 
-For a portable starting point, copy and edit the Online Retail II template:
+For a portable, non-secret starting point, copy and edit the Online Retail II TOML template:
 
 ```bash
-cp apps/private_data_chat/online-retail-ii.env.example .private-data-chat.env
+cp apps/private_data_chat/online-retail-ii.chat.toml.example private-data-chat.toml
 ```
+
+Paths in this file are resolved relative to the file itself. Its `[clarifier]` and `[trusted]`
+sections are parsed independently through the safe model-configuration contract; credentials and
+provider endpoints are rejected there and must remain in environment variables. For example, a
+remote OpenRouter clarifier and a trusted local llama-server use:
+
+```bash
+export OPENROUTER_API_KEY=<token>
+export OPENAI_BASE_URL=http://127.0.0.1:8000/v1
+export OPENAI_API_KEY=local
+export NO_PROXY="${NO_PROXY:+${NO_PROXY},}127.0.0.1,localhost"
+```
+
+Check the optional dependency, typed configuration, and synthetic context without starting a
+server or calling either model:
+
+```bash
+uv run dsa chat --config private-data-chat.toml --check
+```
+
+Then launch the application. Chainlit opens the browser by default:
+
+```bash
+uv run dsa chat --config private-data-chat.toml
+```
+
+For a remote or already-open browser, add `--headless`; `--host`, `--port`, `--watch`, and `--debug`
+are also available. Run `uv run dsa chat --help` for the exact interface.
+
+The previous environment-only configuration remains supported. Source and edit
+`online-retail-ii.env.example`, then run `uv run dsa chat` without `--config`.
 
 The database setting must name a regular verified database file. Hugging Face snapshot entries are
 normally symlinks and are intentionally rejected by the DSA run boundary; use the verified blob
@@ -93,18 +125,19 @@ remote OpenRouter clarifier. Export `OPENROUTER_API_KEY` separately rather than 
 template.
 
 Provider credentials continue to come from the process environment. Neither model-settings
-variable may contain credentials or a provider endpoint; the same safe `ModelConfiguration`
-contract used by DSA validates both. Set `DSA_CHAT_REPORT_TO_MLFLOW=true` only when an MLflow
-backend is already configured.
+section nor its environment-variable equivalent may contain credentials or a provider endpoint;
+the same safe `ModelConfiguration` contract used by DSA validates both. Enable MLflow reporting
+only when an MLflow backend is already configured.
 
-Analysis guidance is disabled by default. Set
-`DSA_CHAT_ENABLE_ANALYSIS_GUIDANCE=true` to let the clarifier add a short ordered plan with optional
-SQL or Python snippets to the proposal. The confirmation view includes the exact guidance and its
-digest. The application never executes those snippets directly: after approval, the adapter labels
-the guidance as untrusted and the trusted model must inspect the real database, correct or ignore
-the suggestions, and produce the ordinary DSA derivation. Only that final derivation is replayed
-and eligible for the notebook download. Guidance is also rendered separately as wrapped prose for
-readability; the canonical JSON remains beneath it as the exact approved representation.
+Analysis guidance is disabled by default. Set `enable_analysis_guidance = true` in the TOML file,
+or `DSA_CHAT_ENABLE_ANALYSIS_GUIDANCE=true` when using environment-only configuration, to let the
+clarifier add a short ordered plan with optional SQL or Python snippets to the proposal. The
+confirmation view includes the exact guidance and its digest. The application never executes those
+snippets directly: after approval, the adapter labels the guidance as untrusted and the trusted
+model must inspect the real database, correct or ignore the suggestions, and produce the ordinary
+DSA derivation. Only that final derivation is replayed and eligible for the notebook download.
+Guidance is also rendered separately as wrapped prose for readability; the canonical JSON remains
+beneath it as the exact approved representation.
 
 The Chainlit process needs access to the Docker CLI and daemon used for derivation replay. The
 configured database and runs directory must also be visible to that daemon at the same absolute

@@ -15,6 +15,7 @@ dependencies = [
 ]
 
 [project.scripts]
+dsa = "apps.cli:main"
 dsa-benchmark = "dsa.benchmark_cli:main"
 dsa-run = "dsa.run_cli:main"
 
