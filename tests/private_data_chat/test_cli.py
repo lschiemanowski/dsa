@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import tomllib
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
@@ -96,6 +97,14 @@ def test_launches_packaged_application_with_an_explicit_config(
         "--watch",
     ]
     assert environment["DSA_CHAT_CONFIG_PATH"] == str(config_path.resolve())
+    application_root = Path(environment["CHAINLIT_APP_ROOT"])
+    assert application_root == (Path(__file__).parents[2] / "apps/private_data_chat")
+    ui_configuration = tomllib.loads(
+        (application_root / ".chainlit/config.toml").read_text()
+    )
+    assert ui_configuration["UI"]["default_theme"] == "dark"
+    assert ui_configuration["UI"]["logo_file_url"] == "/public/dsa-mark.svg"
+    assert ui_configuration["UI"]["default_avatar_file_url"] == "/public/dsa-mark.svg"
     assert environment["OPENAI_API_KEY"] == "SECRET"
 
 

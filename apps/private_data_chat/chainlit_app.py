@@ -59,7 +59,7 @@ async def on_chat_start() -> None:
         content=_welcome_message(
             context,
             database_description,
-            configuration.clarifier_model.name,
+            _model_display_name(configuration.clarifier_model.name),
         )
     ).send()
 
@@ -148,7 +148,7 @@ def _welcome_message(
 ) -> str:
     """Combine the fixed trust flow with bounded dataset-owned public context."""
     sections = [
-        "# Instructions\n\n"
+        "## Instructions\n\n"
         "This chat interface allows you to ask quantitative questions about a DuckDB in plain "
         f"language. **{clarifier_model_name}** will turn your question into a request for a "
         "subagent, which is run by a trusted model. A typical session works as follows:\n\n"
@@ -171,3 +171,9 @@ def _welcome_message(
         )
     sections.append(f"Ask a question about **{context.display_name}** to begin.")
     return "\n\n".join(sections)
+
+
+def _model_display_name(configured_name: str) -> str:
+    """Project a provider-qualified model ID into a compact user-facing label."""
+    unqualified = configured_name.partition(":")[2] or configured_name
+    return unqualified.rsplit("/", maxsplit=1)[-1]

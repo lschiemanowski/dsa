@@ -81,6 +81,10 @@ project lockfile:
 uv sync --python 3.12 --extra chat --frozen
 ```
 
+`dsa chat` uses the application-owned Chainlit configuration and monochrome DSA mark. The demo
+keeps one dark theme, hides the theme control and generic watermark, and disables spontaneous file
+uploads and message editing.
+
 For a portable, non-secret starting point, copy and edit the Online Retail II TOML template:
 
 ```bash

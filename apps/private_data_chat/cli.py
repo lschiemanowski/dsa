@@ -97,6 +97,7 @@ def main(
 
     if config_path is not None:
         values["DSA_CHAT_CONFIG_PATH"] = str(config_path)
+    values["CHAINLIT_APP_ROOT"] = str(Path(__file__).parent)
     arguments = [
         "run",
         str(Path(__file__).with_name("chainlit_app.py")),

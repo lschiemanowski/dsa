@@ -32,11 +32,12 @@ def test_welcome_combines_fixed_trust_flow_with_dataset_context() -> None:
         context,
         "A dataset-owned description of the DuckDB.\n\n"
         "### Example questions\n\n- How did monthly net sales change?",
-        "openrouter:example/remote-model",
+        application._model_display_name("openrouter:example/remote-model"),
     )
 
-    assert message.startswith("# Instructions")
-    assert "**openrouter:example/remote-model**" in message
+    assert message.startswith("## Instructions")
+    assert "**remote-model**" in message
+    assert "openrouter" not in message
     assert "request for a subagent" in message
     assert "run by a trusted model" in message
     assert "ask a follow-up question" in message
@@ -46,6 +47,17 @@ def test_welcome_combines_fixed_trust_flow_with_dataset_context() -> None:
     assert "## About Online Retail II" in message
     assert "A dataset-owned description of the DuckDB." in message
     assert "- How did monthly net sales change?" in message
+
+
+def test_model_display_name_omits_provider_and_routing_qualifiers() -> None:
+    pytest.importorskip("chainlit")
+    application = importlib.import_module("apps.private_data_chat.chainlit_app")
+
+    assert (
+        application._model_display_name("openrouter:deepseek/deepseek-v4-flash-0731")
+        == "deepseek-v4-flash-0731"
+    )
+    assert application._model_display_name("openai-chat:local-model") == "local-model"
 
 
 def test_chainlit_adapter_imports_and_strictly_checks_actions() -> None:
