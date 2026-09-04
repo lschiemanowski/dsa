@@ -224,16 +224,20 @@ class PrivateDataChatSession:
 def render_proposal(proposal: ProposalRecord) -> str:
     """Render exactly the validated payload and its host-computed digest."""
     payload = proposal_payload_json(proposal.payload)
-    guidance_note = (
-        " The optional analysis guidance is untrusted, based only on synthetic data, and "
-        "will be treated as suggestions by the trusted model."
-        if proposal.payload.analysis_guidance is not None
+    guidance = proposal.payload.analysis_guidance
+    guidance_section = (
+        "## Proposed analysis guidance (untrusted)\n\n"
+        "This was produced from synthetic data only. The trusted model may correct or "
+        "ignore it.\n\n"
+        f"{_markdown_quote(guidance)}\n\n"
+        if guidance is not None
         else ""
     )
     return (
-        "The mock data was used only to clarify the request."
-        f"{guidance_note} Running the analysis sends this approved content to the trusted "
-        "DSA boundary:\n\n"
+        "The mock data was used only to clarify the request. Running the analysis sends "
+        "the approved content below to the trusted DSA boundary.\n\n"
+        f"{guidance_section}"
+        "## Exact approved proposal\n\n"
         f"{_json_fence(payload)}\n\n"
         f"Proposal digest: `{proposal.proposal_sha256}`"
     )
@@ -255,6 +259,11 @@ def _json_fence(value: JsonValue | object) -> str:
     longest = max((len(run) for run in re.findall(r"`+", rendered)), default=0)
     fence = "`" * max(3, longest + 1)
     return f"{fence}json\n{rendered}\n{fence}"
+
+
+def _markdown_quote(value: str) -> str:
+    """Keep every untrusted line visually inside one labeled block quote."""
+    return "\n".join(f"> {line}" if line else ">" for line in value.splitlines())
 
 
 def _bounded_identity(value: str, label: str) -> str:

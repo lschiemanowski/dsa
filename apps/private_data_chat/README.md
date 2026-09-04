@@ -20,7 +20,8 @@ ends the conversation: another user message is refused before either model is ca
    synthetic `MockDatabaseContext` only;
 2. the clarifier asks questions until it emits a validated quantitative proposal, optionally with
    untrusted analysis guidance when the host enables it;
-3. Chainlit displays the canonical proposal with native confirmation actions;
+3. Chainlit retains the canonical proposal as an ordinary chat message, then shows native
+   confirmation actions in a separate transient prompt;
 4. exact confirmation invokes the host-owned `DsaAnalysisExecutor` against the real database;
 5. the application returns the structured answer and attaches a notebook download when DSA
    retained a verified derivation; and
@@ -102,7 +103,8 @@ SQL or Python snippets to the proposal. The confirmation view includes the exact
 digest. The application never executes those snippets directly: after approval, the adapter labels
 the guidance as untrusted and the trusted model must inspect the real database, correct or ignore
 the suggestions, and produce the ordinary DSA derivation. Only that final derivation is replayed
-and eligible for the notebook download.
+and eligible for the notebook download. Guidance is also rendered separately as wrapped prose for
+readability; the canonical JSON remains beneath it as the exact approved representation.
 
 The Chainlit process needs access to the Docker CLI and daemon used for derivation replay. The
 configured database and runs directory must also be visible to that daemon at the same absolute

@@ -7,6 +7,7 @@ from typing import Any, cast
 
 from apps.private_data_chat.chat import PrivateDataChatSession, render_proposal
 from apps.private_data_chat.clarifier import PydanticClarifier, load_mock_context
+from apps.private_data_chat.contracts import ProposalRecord
 from apps.private_data_chat.dsa_adapter import DsaAnalysisExecutor
 from apps.private_data_chat.settings import load_configuration
 
@@ -66,36 +67,7 @@ async def on_message(message: Any) -> None:
         ).send()
         return
 
-    async def confirm(proposal: Any) -> bool:
-        response = await cl.AskActionMessage(
-            content=render_proposal(proposal),
-            actions=[
-                cl.Action(
-                    name="dsa_approve",
-                    payload={
-                        "decision": "approve",
-                        "proposal_sha256": proposal.proposal_sha256,
-                    },
-                    label="Run analysis",
-                ),
-                cl.Action(
-                    name="dsa_revise",
-                    payload={
-                        "decision": "revise",
-                        "proposal_sha256": proposal.proposal_sha256,
-                    },
-                    label="Keep refining",
-                ),
-            ],
-            timeout=_CONFIRM_SECONDS,
-            raise_on_timeout=False,
-        ).send()
-        approved = _approved_action(response, proposal.proposal_sha256)
-        if approved:
-            await cl.Message(content="Running the approved analysis…").send()
-        return approved
-
-    response = await session.handle(str(message.content), confirm)
+    response = await session.handle(str(message.content), _confirm_proposal)
     elements: list[object] = []
     if response.notebook is not None:
         elements.append(
@@ -106,6 +78,38 @@ async def on_message(message: Any) -> None:
             )
         )
     await cl.Message(content=response.content, elements=elements).send()
+
+
+async def _confirm_proposal(proposal: ProposalRecord) -> bool:
+    """Persist the proposal before showing the transient native action prompt."""
+    await cl.Message(content=render_proposal(proposal)).send()
+    response = await cl.AskActionMessage(
+        content=f"Run proposal `{proposal.proposal_sha256}` against the private database?",
+        actions=[
+            cl.Action(
+                name="dsa_approve",
+                payload={
+                    "decision": "approve",
+                    "proposal_sha256": proposal.proposal_sha256,
+                },
+                label="Run analysis",
+            ),
+            cl.Action(
+                name="dsa_revise",
+                payload={
+                    "decision": "revise",
+                    "proposal_sha256": proposal.proposal_sha256,
+                },
+                label="Keep refining",
+            ),
+        ],
+        timeout=_CONFIRM_SECONDS,
+        raise_on_timeout=False,
+    ).send()
+    approved = _approved_action(response, proposal.proposal_sha256)
+    if approved:
+        await cl.Message(content="Running the approved analysis…").send()
+    return approved
 
 
 def _approved_action(response: object, expected_digest: str) -> bool:

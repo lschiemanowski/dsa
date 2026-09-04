@@ -338,4 +338,7 @@ async def test_proposal_render_shows_exact_untrusted_guidance_and_bound_digest()
     assert "analysis_guidance" in captured
     assert "quantity * unit_price_gbp" in captured
     assert "untrusted" in captured.lower()
+    assert "## Proposed analysis guidance (untrusted)" in captured
+    assert "> Filter to 2011" in captured
+    assert captured.index("## Proposed analysis guidance") < captured.index("```json")
     assert "Proposal digest:" in captured
