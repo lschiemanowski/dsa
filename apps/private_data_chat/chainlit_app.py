@@ -55,7 +55,13 @@ async def on_chat_start() -> None:
         ).send()
         return
 
-    await cl.Message(content=_welcome_message(context, database_description)).send()
+    await cl.Message(
+        content=_welcome_message(
+            context,
+            database_description,
+            configuration.clarifier_model.name,
+        )
+    ).send()
 
 
 @cl.on_message
@@ -138,19 +144,22 @@ def _session_identity(value: object, fallback: str) -> str:
 def _welcome_message(
     context: MockDatabaseContext,
     database_description: str | None,
+    clarifier_model_name: str,
 ) -> str:
     """Combine the fixed trust flow with bounded dataset-owned public context."""
     sections = [
-        "## How this works\n\n"
-        "1. Ask a quantitative question in ordinary language.\n"
-        "2. A capable but untrusted model helps make it precise. It sees only this chat, the "
-        "configured public context below, and synthetic example rows—not the real data.\n"
-        "3. You review the exact question, answer format, and any untrusted analysis guidance. "
-        "Nothing accesses the real database until you approve that proposal.\n"
-        "4. After approval, a separately configured trusted model runs DSA against the real "
-        "DuckDB. You receive its structured answer and, when derivation replay succeeds, a "
-        "downloadable Jupyter notebook.\n\n"
-        "The DSA result ends this conversation; start a new chat for another analysis.",
+        "# Instructions\n\n"
+        "This chat interface allows you to ask quantitative questions about a DuckDB in plain "
+        f"language. **{clarifier_model_name}** will turn your question into a request for a "
+        "subagent, which is run by a trusted model. A typical session works as follows:\n\n"
+        "1. Ask your question in ordinary language.\n"
+        f"2. **{clarifier_model_name}** will either ask a follow-up question or directly prepare "
+        "the request for the subagent.\n"
+        "3. Review the subagent request. If you are happy with it, run the request.\n"
+        "4. The agent returns the result. If it succeeds, you receive a structured answer and a "
+        "downloadable Jupyter notebook containing the derivation.\n"
+        "5. To prevent data from leaking to the untrusted model, the session ends after the "
+        "result is returned. Start a new session to ask another question.",
         f"## About {context.display_name}",
     ]
     if database_description is not None:

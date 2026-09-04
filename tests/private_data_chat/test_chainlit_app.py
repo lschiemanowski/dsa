@@ -32,15 +32,17 @@ def test_welcome_combines_fixed_trust_flow_with_dataset_context() -> None:
         context,
         "A dataset-owned description of the DuckDB.\n\n"
         "### Example questions\n\n- How did monthly net sales change?",
+        "openrouter:example/remote-model",
     )
 
-    assert message.startswith("## How this works")
-    assert "untrusted model" in message
-    assert "not the real data" in message
-    assert "until you approve" in message
-    assert "separately configured trusted model" in message
+    assert message.startswith("# Instructions")
+    assert "**openrouter:example/remote-model**" in message
+    assert "request for a subagent" in message
+    assert "run by a trusted model" in message
+    assert "ask a follow-up question" in message
+    assert "Review the subagent request" in message
     assert "downloadable Jupyter notebook" in message
-    assert "ends this conversation" in message
+    assert "session ends" in message
     assert "## About Online Retail II" in message
     assert "A dataset-owned description of the DuckDB." in message
     assert "- How did monthly net sales change?" in message
