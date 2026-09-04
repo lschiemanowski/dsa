@@ -5,11 +5,12 @@ This directory contains an application built on top of DSA. It is deliberately o
 analysis library.
 
 The application lets a user refine a question with a capable but untrusted model using only a
-small synthetic database description. After the user approves the exact quantitative question,
-a trusted broker runs DSA against the real database with a separately configured trusted model.
-The user receives the structured answer and, when DSA successfully validates a derivation, a
-download control for the generated notebook. That result ends the conversation: another user
-message is refused before either model is called.
+small synthetic database description. An opt-in mode also lets that model suggest concise analysis
+guidance, including code fragments, as part of the proposal. After the user approves the exact
+quantitative question and any guidance, a trusted broker runs DSA against the real database with a
+separately configured trusted model. The user receives the structured answer and, when DSA
+successfully validates a derivation, a download control for the generated notebook. That result
+ends the conversation: another user message is refused before either model is called.
 
 ## Implemented demo flow
 
@@ -17,7 +18,8 @@ message is refused before either model is called.
 
 1. it rebuilds the untrusted model request from bounded user/assistant text and the operator's
    synthetic `MockDatabaseContext` only;
-2. the clarifier asks questions until it emits a validated quantitative proposal;
+2. the clarifier asks questions until it emits a validated quantitative proposal, optionally with
+   untrusted analysis guidance when the host enables it;
 3. Chainlit displays the canonical proposal with native confirmation actions;
 4. exact confirmation invokes the host-owned `DsaAnalysisExecutor` against the real database;
 5. the application returns the structured answer and attaches a notebook download when DSA
@@ -27,7 +29,8 @@ message is refused before either model is called.
 
 The contracts supporting that flow are intentionally modest:
 
-- `ProposalPayload` is the only model-authored proposal content.
+- `ProposalPayload` is the only model-authored proposal content. Its optional
+  `analysis_guidance` is bounded and is treated as unexecuted advice, not a derivation receipt.
 - `ProposalBinding` is host-authored and binds the proposal to a user, conversation, and logical
   data source.
 - the user approves the digest of both objects, not mutable chat text;
@@ -93,6 +96,14 @@ variable may contain credentials or a provider endpoint; the same safe `ModelCon
 contract used by DSA validates both. Set `DSA_CHAT_REPORT_TO_MLFLOW=true` only when an MLflow
 backend is already configured.
 
+Analysis guidance is disabled by default. Set
+`DSA_CHAT_ENABLE_ANALYSIS_GUIDANCE=true` to let the clarifier add a short ordered plan with optional
+SQL or Python snippets to the proposal. The confirmation view includes the exact guidance and its
+digest. The application never executes those snippets directly: after approval, the adapter labels
+the guidance as untrusted and the trusted model must inspect the real database, correct or ignore
+the suggestions, and produce the ordinary DSA derivation. Only that final derivation is replayed
+and eligible for the notebook download.
+
 The Chainlit process needs access to the Docker CLI and daemon used for derivation replay. The
 configured database and runs directory must also be visible to that daemon at the same absolute
 paths.
@@ -100,7 +111,9 @@ paths.
 `DSA_CHAT_CLARIFIER_MODEL_NAME` selects the capable untrusted model. The application creates it as
 a tool-free Pydantic AI agent and sends only bounded user/assistant text plus the synthetic mock
 context. `DSA_CHAT_TRUSTED_MODEL_NAME` is resolved separately inside `DsaAnalysisExecutor`; its
-request includes the approved question and answer schema, not the clarification conversation.
+request includes the approved question, answer schema, and—only when enabled and explicitly
+approved—clearly labeled untrusted analysis guidance. It never receives the clarification
+conversation.
 
 The notebook is delivered through Chainlit's native `File` element under a fixed download name.
 Before attaching it, the adapter reopens the exact retained file without following symlinks and

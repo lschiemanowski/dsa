@@ -13,8 +13,11 @@ from apps.private_data_chat.contracts import (
     ClarifierTurn,
     MockDatabaseContext,
     MockRelation,
+    ProposalBinding,
     ProposalPayload,
     QuantitativeInterpretation,
+    proposal_digest,
+    proposal_payload_json,
 )
 
 
@@ -72,6 +75,39 @@ def test_proposal_copies_and_accepts_the_bounded_schema() -> None:
     retained_properties = payload.answer_schema["properties"]
     assert isinstance(retained_properties, dict)
     assert "secret" not in retained_properties
+
+
+def test_analysis_guidance_is_optional_bounded_and_bound_by_the_proposal_digest() -> None:
+    without_guidance = proposal_payload()
+    assert without_guidance.analysis_guidance is None
+    assert "analysis_guidance" not in proposal_payload_json(without_guidance)
+
+    guidance = "1. Filter to 2011.\n2. Aggregate line value by calendar month."
+    with_guidance = ProposalPayload.model_validate(
+        {
+            **without_guidance.model_dump(mode="python"),
+            "analysis_guidance": guidance,
+        }
+    )
+    binding = ProposalBinding(
+        user_id="user-1",
+        conversation_id="chat-1",
+        data_source_id="retail",
+    )
+    assert proposal_payload_json(with_guidance)["analysis_guidance"] == guidance
+    assert proposal_digest(binding, without_guidance) != proposal_digest(
+        binding,
+        with_guidance,
+    )
+
+    for invalid in ("   ", "x" * 12_001):
+        with pytest.raises(ValidationError):
+            ProposalPayload.model_validate(
+                {
+                    **without_guidance.model_dump(mode="python"),
+                    "analysis_guidance": invalid,
+                }
+            )
 
 
 @pytest.mark.parametrize(

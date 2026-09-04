@@ -22,6 +22,7 @@ class PrivateDataChatConfiguration(AppContract):
     mock_context_path: Path
     clarifier_model: ModelConfiguration
     dsa: DsaRuntimeConfiguration
+    enable_analysis_guidance: bool = False
 
     @field_validator("mock_context_path")
     @classmethod
@@ -46,6 +47,10 @@ def load_configuration(
     return PrivateDataChatConfiguration(
         data_source_id=data_source_id,
         mock_context_path=Path(_required(values, "DSA_CHAT_MOCK_CONTEXT_PATH")),
+        enable_analysis_guidance=_boolean(
+            values.get("DSA_CHAT_ENABLE_ANALYSIS_GUIDANCE", "false"),
+            "DSA_CHAT_ENABLE_ANALYSIS_GUIDANCE",
+        ),
         clarifier_model=ModelConfiguration(
             name=_required(values, "DSA_CHAT_CLARIFIER_MODEL_NAME"),
             settings=_settings(values, "DSA_CHAT_CLARIFIER_MODEL_SETTINGS_JSON"),
@@ -60,7 +65,10 @@ def load_configuration(
                 "DSA_CHAT_TRUSTED_MODEL_SETTINGS_JSON",
             ),
             docker_image=_required(values, "DSA_CHAT_DOCKER_IMAGE"),
-            report_to_mlflow=_boolean(values.get("DSA_CHAT_REPORT_TO_MLFLOW", "false")),
+            report_to_mlflow=_boolean(
+                values.get("DSA_CHAT_REPORT_TO_MLFLOW", "false"),
+                "DSA_CHAT_REPORT_TO_MLFLOW",
+            ),
         ),
     )
 
@@ -79,10 +87,10 @@ def _settings(environ: Mapping[str, str], name: str) -> dict[str, JsonValue]:
     return cast(dict[str, JsonValue], value)
 
 
-def _boolean(value: str) -> bool:
+def _boolean(value: str, name: str) -> bool:
     normalized = value.strip().lower()
     if normalized in {"1", "true", "yes"}:
         return True
     if normalized in {"0", "false", "no"}:
         return False
-    raise ValueError("DSA_CHAT_REPORT_TO_MLFLOW must be true or false")
+    raise ValueError(f"{name} must be true or false")

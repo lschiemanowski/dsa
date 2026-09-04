@@ -98,10 +98,59 @@ async def test_adapter_builds_privileged_derivation_request_and_maps_success(
     assert run_request.model.name == "trusted-model"
     assert run_request.model.settings == {"temperature": 0.0}
     assert run_request.derivation is not None
+    assert run_request.question == request().question
     assert kwargs["runs_directory"] == tmp_path / "runs"
     assert kwargs["report_to_mlflow"] is False
     identity_factory = kwargs["identity_factory"]
     assert callable(identity_factory) and identity_factory() == request().run_id
+
+
+async def test_adapter_labels_guidance_as_untrusted_without_changing_privileged_fields(
+    tmp_path: Path,
+) -> None:
+    calls: list[RunRequest] = []
+
+    async def runner(run_request: RunRequest, **kwargs: object) -> RunCompletion:
+        del kwargs
+        calls.append(run_request)
+        return RunCompletion(
+            record=TerminalRecord(
+                schema_version="2",
+                run_id=request().run_id,
+                started_at=datetime(2026, 9, 3, 12, tzinfo=UTC),
+                finished_at=datetime(2026, 9, 3, 12, 1, tzinfo=UTC),
+                request=run_request,
+                outcome=RunSuccess(answer={"total": 10.0, "months": ["2011-01"]}),
+            ),
+            retained_record=RetainedTerminalRecord(
+                path=tmp_path / "runs" / request().run_id / "terminal.json",
+                sha256="b" * 64,
+                byte_length=123,
+            ),
+        )
+
+    analysis_request = request().model_copy(
+        update={
+            "analysis_guidance": (
+                "Try SQL:\n```sql\nSELECT date_trunc('month', invoice_ts)\n```"
+            )
+        },
+        deep=True,
+    )
+    executor = DsaAnalysisExecutor(
+        configuration(tmp_path),
+        runner=runner,
+        executor_factory=lambda image: UnusedPythonExecutor(),
+    )
+    await executor.execute(analysis_request)
+
+    trusted_request = calls[0]
+    assert "UNTRUSTED ANALYSIS GUIDANCE" in trusted_request.question
+    assert "synthetic" in trusted_request.question
+    assert "date_trunc" in trusted_request.question
+    assert analysis_request.question in trusted_request.question
+    assert trusted_request.database_path == configuration(tmp_path).database_path
+    assert trusted_request.model.name == configuration(tmp_path).trusted_model_name
 
 
 async def test_adapter_returns_and_rereads_only_the_verified_notebook(tmp_path: Path) -> None:

@@ -28,11 +28,19 @@ def environment(tmp_path: Path) -> dict[str, str]:
 def test_configuration_keeps_clarifier_and_trusted_runtime_separate(tmp_path: Path) -> None:
     configuration = load_configuration(environment(tmp_path))
 
+    assert configuration.enable_analysis_guidance is False
     assert configuration.clarifier_model.name == "openai:untrusted"
     assert configuration.clarifier_model.settings == {"temperature": 0.2}
     assert configuration.dsa.trusted_model_name == "openai:trusted"
     assert configuration.dsa.database_path == tmp_path / "private.duckdb"
     assert configuration.dsa.report_to_mlflow is True
+
+
+def test_analysis_guidance_is_an_opt_in_host_setting(tmp_path: Path) -> None:
+    values = environment(tmp_path)
+    values["DSA_CHAT_ENABLE_ANALYSIS_GUIDANCE"] = "true"
+
+    assert load_configuration(values).enable_analysis_guidance is True
 
 
 @pytest.mark.parametrize(
@@ -73,3 +81,8 @@ def test_configuration_rejects_missing_invalid_or_relative_values(tmp_path: Path
     invalid_bool["DSA_CHAT_REPORT_TO_MLFLOW"] = "sometimes"
     with pytest.raises(ValueError, match="true or false"):
         load_configuration(invalid_bool)
+
+    invalid_guidance = environment(tmp_path)
+    invalid_guidance["DSA_CHAT_ENABLE_ANALYSIS_GUIDANCE"] = "sometimes"
+    with pytest.raises(ValueError, match="DSA_CHAT_ENABLE_ANALYSIS_GUIDANCE"):
+        load_configuration(invalid_guidance)

@@ -49,6 +49,31 @@ async def test_clarifier_receives_only_skill_mock_context_history_and_safe_model
     combined = instructions + prompt + configuration.model_dump_json()
     assert "/private/real.duckdb" not in combined
     assert "SECRET" not in combined
+    assert "Analysis guidance is disabled" in instructions
+
+
+async def test_clarifier_can_be_instructed_to_propose_untrusted_analysis_guidance() -> None:
+    calls: list[str] = []
+
+    async def runner(
+        instructions: str,
+        prompt: str,
+        configuration: ModelConfiguration,
+    ) -> ClarifierTurn:
+        del prompt, configuration
+        calls.append(instructions)
+        return ClarifierTurn(kind="clarification", message="Which year?")
+
+    clarifier = PydanticClarifier(
+        ModelConfiguration(name="openai:untrusted"),
+        mock_context(),
+        enable_analysis_guidance=True,
+        runner=runner,
+    )
+    await clarifier.clarify((ConversationMessage(role="user", content="Analyze sales."),))
+
+    assert "Analysis guidance is enabled" in calls[0]
+    assert "must not claim" in calls[0]
 
 
 async def test_clarifier_revalidates_untrusted_structured_output() -> None:

@@ -31,8 +31,13 @@ async def on_chat_start() -> None:
             user_id=user_id,
             conversation_id=conversation_id,
             context=context,
-            clarifier=PydanticClarifier(configuration.clarifier_model, context),
+            clarifier=PydanticClarifier(
+                configuration.clarifier_model,
+                context,
+                enable_analysis_guidance=configuration.enable_analysis_guidance,
+            ),
             executor=DsaAnalysisExecutor(configuration.dsa),
+            enable_analysis_guidance=configuration.enable_analysis_guidance,
         )
         cl.user_session.set(_SESSION_KEY, session)
     except Exception:

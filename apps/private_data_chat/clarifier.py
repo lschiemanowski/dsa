@@ -51,12 +51,16 @@ class PydanticClarifier:
         configuration: ModelConfiguration,
         context: MockDatabaseContext,
         *,
+        enable_analysis_guidance: bool = False,
         runner: ClarifierRunner | None = None,
     ) -> None:
         self.configuration = ModelConfiguration.model_validate_json(
             configuration.model_dump_json()
         )
-        self._instructions = _clarifier_instructions(context)
+        self._instructions = _clarifier_instructions(
+            context,
+            enable_analysis_guidance=enable_analysis_guidance,
+        )
         self._runner = runner or _run_pydantic_clarifier
 
     async def clarify(self, history: Sequence[ConversationMessage]) -> ClarifierTurn:
@@ -99,11 +103,26 @@ def load_mock_context(path: Path) -> MockDatabaseContext:
     return MockDatabaseContext.model_validate_json(_read_regular_file(path, _MAX_CONTEXT_BYTES))
 
 
-def _clarifier_instructions(context: MockDatabaseContext) -> str:
+def _clarifier_instructions(
+    context: MockDatabaseContext,
+    *,
+    enable_analysis_guidance: bool,
+) -> str:
     skill_path = Path(__file__).with_name("clarification-skill.md")
     skill = _read_regular_file(skill_path, _MAX_CONTEXT_BYTES).decode("utf-8")
     context_json = canonical_json_bytes(context).decode("utf-8")
-    return f"{skill}\n\nSynthetic database context:\n{context_json}"
+    guidance_policy = (
+        "Analysis guidance is enabled. A proposal may include concise, ordered "
+        "analysis_guidance for a human verifier, with optional SQL or Python snippets. "
+        "It must not claim that mock-derived values answer the real question or that any "
+        "suggested code has been executed."
+        if enable_analysis_guidance
+        else "Analysis guidance is disabled. Omit analysis_guidance from proposals."
+    )
+    return (
+        f"{skill}\n\nHost analysis-guidance policy:\n{guidance_policy}\n\n"
+        f"Synthetic database context:\n{context_json}"
+    )
 
 
 def _conversation_prompt(history: Sequence[ConversationMessage]) -> str:
