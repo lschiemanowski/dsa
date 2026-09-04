@@ -73,6 +73,7 @@ async def test_clarifier_can_be_instructed_to_propose_untrusted_analysis_guidanc
     await clarifier.clarify((ConversationMessage(role="user", content="Analyze sales."),))
 
     assert "Analysis guidance is enabled" in calls[0]
+    assert "numbered list of 3 to 8 steps" in calls[0]
     assert "must not claim" in calls[0]
 
 

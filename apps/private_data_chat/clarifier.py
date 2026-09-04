@@ -112,8 +112,9 @@ def _clarifier_instructions(
     skill = _read_regular_file(skill_path, _MAX_CONTEXT_BYTES).decode("utf-8")
     context_json = canonical_json_bytes(context).decode("utf-8")
     guidance_policy = (
-        "Analysis guidance is enabled. A proposal may include concise, ordered "
-        "analysis_guidance for a human verifier, with optional SQL or Python snippets. "
+        "Analysis guidance is enabled. A proposal may include analysis_guidance for a "
+        "human verifier. When present, it must be a numbered list of 3 to 8 steps; each "
+        "step must be concise and may include an optional SQL or Python snippet. "
         "It must not claim that mock-derived values answer the real question or that any "
         "suggested code has been executed."
         if enable_analysis_guidance

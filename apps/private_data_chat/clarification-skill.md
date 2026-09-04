@@ -21,9 +21,10 @@ The proposal must use `dsa-question-proposal/v1` and contain:
 - `question`: a self-contained request for the real database;
 - `interpretation`: `measure`, `population`, `group_by`, `filters`, `time_window`, and `units`;
 - `answer_schema`: a Draft 2020-12 JSON Schema for an object answer.
-- `analysis_guidance`: optional concise instructions for performing and checking the analysis,
-  only when the host analysis-guidance policy says it is enabled. It may contain SQL or Python
-  snippets, but it is an unexecuted suggestion based only on the synthetic context.
+- `analysis_guidance`: optional instructions for performing and checking the analysis, only when
+  the host analysis-guidance policy says it is enabled. When present, write it as a numbered list
+  of 3 to 8 concise steps. Individual steps may contain SQL or Python snippets, but the complete
+  guidance remains an unexecuted suggestion based only on the synthetic context.
 
 Use only these schema keywords: `$schema`, `type`, `properties`, `required`,
 `additionalProperties`, `items`, `description`, `title`, `enum`, `const`, numeric/string/array
