@@ -1,9 +1,7 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="DSA">
   <!-- Checker cells under w = (z + 0.26) / (0.26z + 1), cropped before degeneration. -->
   <defs><clipPath id="pattern-disk"><circle cx="32" cy="32" r="24"/></clipPath></defs>
-  <circle cx="32" cy="32" r="30" fill="#fff"/>
-  <circle cx="32" cy="32" r="29" fill="#fff" stroke="#000" stroke-width="2"/>
-  <g clip-path="url(#pattern-disk)">
+  <g clip-path="url(#pattern-disk)" transform="translate(32 32) scale(1.1875) translate(-32 -32)">
     <circle cx="32" cy="32" r="24" fill="#fff"/>
     <path d="M18.95,84.84L22.24,81.27L25.41,78.02L28.45,75.07L25.70,71.96L23.11,68.59L20.70,64.97L16.85,67.40L12.76,70.10L8.43,73.11L11.74,77.39L15.26,81.31Z" fill="#000"/>
     <path d="M36.87,67.68L39.44,65.62L41.91,63.73L44.27,61.98L42.65,59.60L41.14,57.09L39.76,54.46L37.00,55.83L34.09,57.33L31.01,58.98L32.82,62.05L34.78,64.96Z" fill="#000"/>
@@ -49,5 +47,5 @@
       <path d="M18.95,-20.84L21.83,-17.69L24.63,-14.80L27.32,-12.15L29.93,-9.70L32.44,-7.44L34.86,-5.35L37.19,-3.41L39.44,-1.62L41.61,0.05L43.69,1.60L45.70,3.04L47.64,4.38L49.50,5.64L51.30,6.81L53.03,7.92L54.70,8.95L56.31,9.91L57.87,10.82L59.37,11.68L60.82,12.49L62.22,13.25L63.58,13.96L64.88,14.64L66.15,15.28"/>
     </g>
   </g>
-  <circle cx="32" cy="32" r="24" fill="none" stroke="#000" stroke-width="1.2"/>
+  <circle cx="32" cy="32" r="28.5" fill="none" stroke="#fff" stroke-width="1.5"/>
 </svg>
