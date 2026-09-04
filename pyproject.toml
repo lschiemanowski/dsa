@@ -22,6 +22,7 @@ dsa-run = "dsa.run_cli:main"
 [project.optional-dependencies]
 chat = [
     "chainlit==2.12.0; python_version < '3.14'",
+    "huggingface-hub>=1,<2",
 ]
 huggingface = [
     "huggingface-hub>=1,<2",

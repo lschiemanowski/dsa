@@ -4,20 +4,21 @@ This directory contains an application built on top of DSA. It is deliberately o
 `src/dsa`: none of its UI, approval, identity, or deployment policy belongs to the reusable
 analysis library.
 
-The application lets a user refine a question with a capable but untrusted model using only a
-small synthetic database description. An opt-in mode also lets that model suggest concise analysis
-guidance, including code fragments, as part of the proposal. After the user approves the exact
-quantitative question and any guidance, a trusted broker runs DSA against the real database with a
-separately configured trusted model. The user receives the structured answer and, when DSA
-successfully validates a derivation, a download control for the generated notebook. That result
-ends the conversation: another user message is refused before either model is called.
+The application lets a user refine a question with a capable but untrusted model using only an
+operator-approved public database description and synthetic example rows. An opt-in mode also lets
+that model suggest concise analysis guidance, including code fragments, as part of the proposal.
+After the user approves the exact quantitative question and any guidance, a trusted broker runs
+DSA against the real database with a separately configured trusted model. The user receives the
+structured answer and, when DSA successfully validates a derivation, a download control for the
+generated notebook. That result ends the conversation: another user message is refused before
+either model is called.
 
 ## Implemented demo flow
 
 `chainlit_app.py` implements one deliberately small Chainlit application:
 
-1. it rebuilds the untrusted model request from bounded user/assistant text and the operator's
-   synthetic `MockDatabaseContext` only;
+1. it rebuilds the untrusted model request from bounded user/assistant text, the operator's
+   synthetic `MockDatabaseContext`, and an optional digest-pinned public description;
 2. the clarifier asks questions until it emits a validated quantitative proposal, optionally with
    untrusted analysis guidance when the host enables it;
 3. Chainlit retains the canonical proposal as an ordinary chat message, then shows native
@@ -86,10 +87,13 @@ For a portable, non-secret starting point, copy and edit the Online Retail II TO
 cp apps/private_data_chat/online-retail-ii.chat.toml.example private-data-chat.toml
 ```
 
-Paths in this file are resolved relative to the file itself. Its `[clarifier]` and `[trusted]`
-sections are parsed independently through the safe model-configuration contract; credentials and
-provider endpoints are rejected there and must remain in environment variables. For example, a
-remote OpenRouter clarifier and a trusted local llama-server use:
+Paths in this file are resolved relative to the file itself. Its `[description]` section pins an
+exact bounded Markdown description stored alongside the DuckDB in the Hugging Face dataset. The
+application verifies its repository, immutable commit, path, and SHA-256 digest before showing it
+or sending it to the untrusted clarifier. Its `[clarifier]` and `[trusted]` sections are parsed
+independently through the safe model-configuration contract; credentials and provider endpoints
+are rejected there and must remain in environment variables. For example, a remote OpenRouter
+clarifier and a trusted local llama-server use:
 
 ```bash
 export OPENROUTER_API_KEY=<token>
@@ -98,8 +102,8 @@ export OPENAI_API_KEY=local
 export NO_PROXY="${NO_PROXY:+${NO_PROXY},}127.0.0.1,localhost"
 ```
 
-Check the optional dependency, typed configuration, and synthetic context without starting a
-server or calling either model:
+Check the optional dependencies, typed configuration, synthetic context, and pinned public
+database description without starting a server or calling either model:
 
 ```bash
 uv run dsa chat --config private-data-chat.toml --check

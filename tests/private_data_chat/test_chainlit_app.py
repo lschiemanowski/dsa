@@ -7,6 +7,8 @@ from types import SimpleNamespace
 import pytest
 
 from apps.private_data_chat.contracts import (
+    MockDatabaseContext,
+    MockRelation,
     ProposalBinding,
     ProposalPayload,
     ProposalRecord,
@@ -15,6 +17,33 @@ from apps.private_data_chat.contracts import (
 )
 
 from .test_contracts import proposal_payload
+
+
+def test_welcome_combines_fixed_trust_flow_with_dataset_context() -> None:
+    pytest.importorskip("chainlit")
+    application = importlib.import_module("apps.private_data_chat.chainlit_app")
+    context = MockDatabaseContext(
+        data_source_id="retail",
+        display_name="Online Retail II",
+        relations=(MockRelation(name="analysis.lines", columns=("value",)),),
+    )
+
+    message = application._welcome_message(
+        context,
+        "A dataset-owned description of the DuckDB.\n\n"
+        "### Example questions\n\n- How did monthly net sales change?",
+    )
+
+    assert message.startswith("## How this works")
+    assert "untrusted model" in message
+    assert "not the real data" in message
+    assert "until you approve" in message
+    assert "separately configured trusted model" in message
+    assert "downloadable Jupyter notebook" in message
+    assert "ends this conversation" in message
+    assert "## About Online Retail II" in message
+    assert "A dataset-owned description of the DuckDB." in message
+    assert "- How did monthly net sales change?" in message
 
 
 def test_chainlit_adapter_imports_and_strictly_checks_actions() -> None:

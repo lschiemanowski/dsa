@@ -1,6 +1,6 @@
 {
   "data_source_id": "online_retail_ii",
-  "display_name": "Synthetic online retail data",
+  "display_name": "Online Retail II",
   "format": "dsa-mock-database/v1",
   "relations": [
     {

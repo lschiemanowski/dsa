@@ -770,6 +770,7 @@ dependencies = [
 [package.optional-dependencies]
 chat = [
     { name = "chainlit", marker = "python_full_version < '3.14'" },
+    { name = "huggingface-hub" },
 ]
 huggingface = [
     { name = "huggingface-hub" },
@@ -791,6 +792,7 @@ dev = [
 requires-dist = [
     { name = "chainlit", marker = "python_full_version < '3.14' and extra == 'chat'", specifier = "==2.12.0" },
     { name = "duckdb", specifier = "==1.5.5" },
+    { name = "huggingface-hub", marker = "extra == 'chat'", specifier = ">=1,<2" },
     { name = "huggingface-hub", marker = "extra == 'huggingface'", specifier = ">=1,<2" },
     { name = "jsonschema", specifier = ">=4.25,<5" },
     { name = "mlflow", extras = ["databricks"], marker = "extra == 'mlflow'", specifier = "==3.15.2" },

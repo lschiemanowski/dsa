@@ -51,6 +51,7 @@ class PydanticClarifier:
         configuration: ModelConfiguration,
         context: MockDatabaseContext,
         *,
+        database_description: str | None = None,
         enable_analysis_guidance: bool = False,
         runner: ClarifierRunner | None = None,
     ) -> None:
@@ -59,6 +60,7 @@ class PydanticClarifier:
         )
         self._instructions = _clarifier_instructions(
             context,
+            database_description=database_description,
             enable_analysis_guidance=enable_analysis_guidance,
         )
         self._runner = runner or _run_pydantic_clarifier
@@ -106,10 +108,11 @@ def load_mock_context(path: Path) -> MockDatabaseContext:
 def _clarifier_instructions(
     context: MockDatabaseContext,
     *,
+    database_description: str | None,
     enable_analysis_guidance: bool,
 ) -> str:
     skill_path = Path(__file__).with_name("clarification-skill.md")
-    skill = _read_regular_file(skill_path, _MAX_CONTEXT_BYTES).decode("utf-8")
+    skill_text = _read_regular_file(skill_path, _MAX_CONTEXT_BYTES).decode("utf-8")
     context_json = canonical_json_bytes(context).decode("utf-8")
     guidance_policy = (
         "Analysis guidance is enabled. A proposal may include analysis_guidance for a "
@@ -120,9 +123,14 @@ def _clarifier_instructions(
         if enable_analysis_guidance
         else "Analysis guidance is disabled. Omit analysis_guidance from proposals."
     )
+    public_description = (
+        f"\n\nPublic DuckDB description:\n{database_description}"
+        if database_description is not None
+        else ""
+    )
     return (
-        f"{skill}\n\nHost analysis-guidance policy:\n{guidance_policy}\n\n"
-        f"Synthetic database context:\n{context_json}"
+        f"{skill_text}\n\nHost analysis-guidance policy:\n{guidance_policy}\n\n"
+        f"Synthetic database context:\n{context_json}{public_description}"
     )
 
 
@@ -176,7 +184,6 @@ def _read_regular_file(path: Path, limit: int) -> bytes:
     if len(content) > limit:
         raise ValueError("configured file exceeds its byte limit")
     return content
-
 
 def _bounded_text(value: str, limit: int) -> str:
     if not value.strip():

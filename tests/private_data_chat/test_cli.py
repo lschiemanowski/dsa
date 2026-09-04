@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+import apps.private_data_chat.cli as cli_module
 from apps.private_data_chat.cli import main
 
 IMAGE = f"dsa-python@sha256:{'a' * 64}"
@@ -170,6 +171,91 @@ def test_mismatched_mock_context_is_rejected_before_launch(
         )
         == 2
     )
-    assert capsys.readouterr().out == (
-        '{"code":"chat_preflight_failed","status":"rejected"}\n'
+    assert json.loads(capsys.readouterr().out) == {
+        "code": "chat_preflight_failed",
+        "stage": "context",
+        "status": "rejected",
+    }
+
+
+def test_invalid_configuration_reports_only_safe_field_names(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    config_path = write_configuration(tmp_path)
+    content = config_path.read_text().replace(IMAGE, "SECRET-invalid-image")
+    config_path.write_text(content)
+
+    assert (
+        main(
+            ["--config", str(config_path)],
+            dependency_available=lambda: True,
+            environ={},
+        )
+        == 2
     )
+    output = capsys.readouterr().out
+    assert "SECRET" not in output
+    assert json.loads(output) == {
+        "code": "chat_preflight_failed",
+        "fields": ["docker_image"],
+        "stage": "configuration",
+        "status": "rejected",
+    }
+
+
+def test_invalid_arguments_are_distinguished_from_host_configuration(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert main(["--port", "70000"], environ={}) == 2
+    assert json.loads(capsys.readouterr().out) == {
+        "code": "chat_preflight_failed",
+        "stage": "arguments",
+        "status": "rejected",
+    }
+
+
+def test_description_download_failure_is_safely_classified(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    config_path = write_configuration(tmp_path)
+    content = config_path.read_text().replace(
+        "[clarifier]",
+        "\n".join(
+            (
+                "[description]",
+                'format = "dsa-huggingface-database-description/v1"',
+                'repo_id = "lschiemanowski/dsa-datasets"',
+                f'revision = "{"a" * 40}"',
+                'path = "online-retail-ii/1.0.0/DATABASE.md"',
+                f'sha256 = "{"b" * 64}"',
+                "",
+                "[clarifier]",
+            )
+        ),
+    )
+    config_path.write_text(content)
+
+    def fail(reference: object) -> str:
+        del reference
+        raise RuntimeError("SECRET provider detail")
+
+    monkeypatch.setattr(cli_module, "load_database_description", fail)
+
+    assert (
+        main(
+            ["--config", str(config_path)],
+            dependency_available=lambda: True,
+            environ={},
+        )
+        == 2
+    )
+    output = capsys.readouterr().out
+    assert "SECRET" not in output
+    assert json.loads(output) == {
+        "code": "chat_preflight_failed",
+        "stage": "description",
+        "status": "rejected",
+    }

@@ -35,6 +35,7 @@ async def test_clarifier_receives_only_skill_mock_context_history_and_safe_model
     clarifier = PydanticClarifier(
         ModelConfiguration(name="openai:untrusted", settings={"temperature": 0.2}),
         mock_context(),
+        database_description="Use the documented analysis view.",
         runner=runner,
     )
     result = await clarifier.clarify(
@@ -50,6 +51,8 @@ async def test_clarifier_receives_only_skill_mock_context_history_and_safe_model
     assert "/private/real.duckdb" not in combined
     assert "SECRET" not in combined
     assert "Analysis guidance is disabled" in instructions
+    assert "Public DuckDB description:" in instructions
+    assert "Use the documented analysis view." in instructions
 
 
 async def test_clarifier_can_be_instructed_to_propose_untrusted_analysis_guidance() -> None:
