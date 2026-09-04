@@ -17,7 +17,8 @@ approving user.
 - Chainlit chat content and bounded conversation history;
 - the clarification model and everything it emits;
 - the synthetic mock database context;
-- the exact public DuckDB description pinned from the Hugging Face dataset;
+- the exact public database card pinned from the Hugging Face dataset, including model-only
+  analysis notes;
 - proposal text, answer schema, and optional analysis guidance until server validation; and
 - future prompt skills or presentation code.
 

@@ -5,7 +5,7 @@ This directory contains an application built on top of DSA. It is deliberately o
 analysis library.
 
 The application lets a user refine a question with a capable but untrusted model using only an
-operator-approved public database description and synthetic example rows. An opt-in mode also lets
+operator-approved database card and synthetic example rows. An opt-in mode also lets
 that model suggest concise analysis guidance, including code fragments, as part of the proposal.
 After the user approves the exact quantitative question and any guidance, a trusted broker runs
 DSA against the real database with a separately configured trusted model. The user receives the
@@ -18,7 +18,7 @@ either model is called.
 `chainlit_app.py` implements one deliberately small Chainlit application:
 
 1. it rebuilds the untrusted model request from bounded user/assistant text, the operator's
-   synthetic `MockDatabaseContext`, and an optional digest-pinned public description;
+   synthetic `MockDatabaseContext`, and an optional digest-pinned database card;
 2. the clarifier asks questions until it emits a validated quantitative proposal, optionally with
    untrusted analysis guidance when the host enables it;
 3. Chainlit retains the canonical proposal as an ordinary chat message, then shows native
@@ -91,10 +91,12 @@ For a portable, non-secret starting point, copy and edit the Online Retail II TO
 cp apps/private_data_chat/online-retail-ii.chat.toml.example private-data-chat.toml
 ```
 
-Paths in this file are resolved relative to the file itself. Its `[description]` section pins an
-exact bounded Markdown description stored alongside the DuckDB in the Hugging Face dataset. The
-application verifies its repository, immutable commit, path, and SHA-256 digest before showing it
-or sending it to the untrusted clarifier. Its `[clarifier]` and `[trusted]` sections are parsed
+Paths in this file are resolved relative to the file itself. Its `[database_card]` section pins an
+exact bounded JSON card stored alongside the DuckDB in the Hugging Face dataset. The application
+verifies its repository, immutable commit, path, and SHA-256 digest before parsing it. The welcome
+message shows the card's user-facing inventory while the untrusted clarifier receives the complete
+card, including technical analysis notes. Those notes are never rendered in the welcome message.
+Its `[clarifier]` and `[trusted]` sections are parsed
 independently through the safe model-configuration contract; credentials and provider endpoints
 are rejected there and must remain in environment variables. For example, a remote OpenRouter
 clarifier and a trusted local llama-server use:
@@ -107,7 +109,7 @@ export NO_PROXY="${NO_PROXY:+${NO_PROXY},}127.0.0.1,localhost"
 ```
 
 Check the optional dependencies, typed configuration, synthetic context, and pinned public
-database description without starting a server or calling either model:
+database card without starting a server or calling either model:
 
 ```bash
 uv run dsa chat --config private-data-chat.toml --check

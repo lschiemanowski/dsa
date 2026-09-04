@@ -19,6 +19,7 @@ from apps.private_data_chat.contracts import (
     MockDatabaseContext,
     canonical_json_bytes,
 )
+from apps.private_data_chat.database_card import DatabaseCard
 from dsa import ModelConfiguration
 
 _MAX_CONTEXT_BYTES = 64 * 1024
@@ -51,7 +52,7 @@ class PydanticClarifier:
         configuration: ModelConfiguration,
         context: MockDatabaseContext,
         *,
-        database_description: str | None = None,
+        database_card: DatabaseCard | None = None,
         enable_analysis_guidance: bool = False,
         runner: ClarifierRunner | None = None,
     ) -> None:
@@ -60,7 +61,7 @@ class PydanticClarifier:
         )
         self._instructions = _clarifier_instructions(
             context,
-            database_description=database_description,
+            database_card=database_card,
             enable_analysis_guidance=enable_analysis_guidance,
         )
         self._runner = runner or _run_pydantic_clarifier
@@ -108,7 +109,7 @@ def load_mock_context(path: Path) -> MockDatabaseContext:
 def _clarifier_instructions(
     context: MockDatabaseContext,
     *,
-    database_description: str | None,
+    database_card: DatabaseCard | None,
     enable_analysis_guidance: bool,
 ) -> str:
     skill_path = Path(__file__).with_name("clarification-skill.md")
@@ -123,14 +124,16 @@ def _clarifier_instructions(
         if enable_analysis_guidance
         else "Analysis guidance is disabled. Omit analysis_guidance from proposals."
     )
-    public_description = (
-        f"\n\nPublic DuckDB description:\n{database_description}"
-        if database_description is not None
-        else ""
-    )
+    database_context = ""
+    if database_card is not None:
+        selected_card = DatabaseCard.model_validate_json(database_card.model_dump_json())
+        database_context = (
+            "\n\nDataset-owned database card:\n"
+            f"{canonical_json_bytes(selected_card).decode('utf-8')}"
+        )
     return (
         f"{skill_text}\n\nHost analysis-guidance policy:\n{guidance_policy}\n\n"
-        f"Synthetic database context:\n{context_json}{public_description}"
+        f"Synthetic database context:\n{context_json}{database_context}"
     )
 
 

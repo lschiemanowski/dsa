@@ -11,15 +11,15 @@ docker_image = "dsa-python@sha256:replace-with-local-image-digest"
 enable_analysis_guidance = false
 report_to_mlflow = false
 
-# Public, dataset-owned DuckDB documentation. The exact commit and digest are required.
-[description]
-format = "dsa-huggingface-database-description/v1"
+# Public, dataset-owned DuckDB card. The exact commit and digest are required.
+[database_card]
+format = "dsa-huggingface-database-card/v1"
 repo_id = "lschiemanowski/dsa-datasets"
-revision = "77aef7347aaa9db01042eb4544f002a2bf01c830"
-path = "online-retail-ii/1.0.0/DATABASE.md"
-sha256 = "e1dc59ff6a35790b0f68046790df668554e4543b88b5e1c0cd9c65f35ad8b1cd"
+revision = "a8d4bd60c13265fdd938cf8393d332fda5fb6910"
+path = "online-retail-ii/1.0.0/database-card.json"
+sha256 = "874d0d0512b0a7878663512aa1fdd41db0fdd720b2fd42c89126092b98d7d0fe"
 
-# This model receives only bounded conversation text, the public description, and synthetic rows.
+# This model receives only bounded conversation text, the public card, and synthetic rows.
 [clarifier]
 model = "openrouter:deepseek/deepseek-v4-flash-0731"
 settings = { thinking = "medium" }

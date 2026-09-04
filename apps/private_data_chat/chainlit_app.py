@@ -8,8 +8,12 @@ from typing import Any, cast
 from apps.private_data_chat.chat import PrivateDataChatSession, render_proposal
 from apps.private_data_chat.clarifier import PydanticClarifier, load_mock_context
 from apps.private_data_chat.contracts import MockDatabaseContext, ProposalRecord
+from apps.private_data_chat.database_card import (
+    DatabaseCard,
+    load_database_card,
+    render_database_overview,
+)
 from apps.private_data_chat.dsa_adapter import DsaAnalysisExecutor
-from apps.private_data_chat.public_description import load_database_description
 from apps.private_data_chat.settings import load_configuration
 
 cl: Any = import_module("chainlit")
@@ -24,9 +28,9 @@ async def on_chat_start() -> None:
     try:
         configuration = load_configuration()
         context = load_mock_context(configuration.mock_context_path)
-        database_description = (
-            load_database_description(configuration.database_description)
-            if configuration.database_description is not None
+        database_card = (
+            load_database_card(configuration.database_card)
+            if configuration.database_card is not None
             else None
         )
         if context.data_source_id != configuration.data_source_id:
@@ -41,7 +45,7 @@ async def on_chat_start() -> None:
             clarifier=PydanticClarifier(
                 configuration.clarifier_model,
                 context,
-                database_description=database_description,
+                database_card=database_card,
                 enable_analysis_guidance=configuration.enable_analysis_guidance,
             ),
             executor=DsaAnalysisExecutor(configuration.dsa),
@@ -58,7 +62,7 @@ async def on_chat_start() -> None:
     await cl.Message(
         content=_welcome_message(
             context,
-            database_description,
+            database_card,
             _model_display_name(configuration.clarifier_model.name),
         )
     ).send()
@@ -143,7 +147,7 @@ def _session_identity(value: object, fallback: str) -> str:
 
 def _welcome_message(
     context: MockDatabaseContext,
-    database_description: str | None,
+    database_card: DatabaseCard | None,
     clarifier_model_name: str,
 ) -> str:
     """Combine the fixed trust flow with bounded dataset-owned public context."""
@@ -162,8 +166,8 @@ def _welcome_message(
         "result is returned. Start a new session to ask another question.",
         f"## About {context.display_name}",
     ]
-    if database_description is not None:
-        sections.append(database_description)
+    if database_card is not None:
+        sections.append(render_database_overview(database_card))
     else:
         sections.append(
             "This configured data source provides a synthetic schema-compatible sample for "

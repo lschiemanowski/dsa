@@ -15,6 +15,7 @@ from apps.private_data_chat.contracts import (
     ProposalStatus,
     proposal_digest,
 )
+from tests.private_data_chat.test_database_card import MODEL_ONLY_NOTE, card
 
 from .test_contracts import proposal_payload
 
@@ -30,8 +31,7 @@ def test_welcome_combines_fixed_trust_flow_with_dataset_context() -> None:
 
     message = application._welcome_message(
         context,
-        "A dataset-owned description of the DuckDB.\n\n"
-        "### Example questions\n\n- How did monthly net sales change?",
+        card(),
         application._model_display_name("openrouter:example/remote-model"),
     )
 
@@ -45,8 +45,11 @@ def test_welcome_combines_fixed_trust_flow_with_dataset_context() -> None:
     assert "downloadable Jupyter notebook" in message
     assert "session ends" in message
     assert "## About Online Retail II" in message
-    assert "A dataset-owned description of the DuckDB." in message
-    assert "- How did monthly net sales change?" in message
+    assert "The original first paragraph." in message
+    assert "### Available data" in message
+    assert "1,044,848" in message
+    assert "- How did monthly sales change?" in message
+    assert MODEL_ONLY_NOTE not in message
 
 
 def test_model_display_name_omits_provider_and_routing_qualifiers() -> None:

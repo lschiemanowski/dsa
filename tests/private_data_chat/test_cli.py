@@ -224,7 +224,7 @@ def test_invalid_arguments_are_distinguished_from_host_configuration(
     }
 
 
-def test_description_download_failure_is_safely_classified(
+def test_database_card_download_failure_is_safely_classified(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -234,11 +234,11 @@ def test_description_download_failure_is_safely_classified(
         "[clarifier]",
         "\n".join(
             (
-                "[description]",
-                'format = "dsa-huggingface-database-description/v1"',
+                "[database_card]",
+                'format = "dsa-huggingface-database-card/v1"',
                 'repo_id = "lschiemanowski/dsa-datasets"',
                 f'revision = "{"a" * 40}"',
-                'path = "online-retail-ii/1.0.0/DATABASE.md"',
+                'path = "online-retail-ii/1.0.0/database-card.json"',
                 f'sha256 = "{"b" * 64}"',
                 "",
                 "[clarifier]",
@@ -251,7 +251,7 @@ def test_description_download_failure_is_safely_classified(
         del reference
         raise RuntimeError("SECRET provider detail")
 
-    monkeypatch.setattr(cli_module, "load_database_description", fail)
+    monkeypatch.setattr(cli_module, "load_database_card", fail)
 
     assert (
         main(
@@ -265,6 +265,6 @@ def test_description_download_failure_is_safely_classified(
     assert "SECRET" not in output
     assert json.loads(output) == {
         "code": "chat_preflight_failed",
-        "stage": "description",
+        "stage": "database_card",
         "status": "rejected",
     }

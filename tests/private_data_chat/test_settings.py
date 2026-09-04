@@ -107,7 +107,9 @@ def test_environment_can_select_the_toml_configuration(tmp_path: Path) -> None:
     assert configuration.data_source_id == "retail"
 
 
-def test_toml_configuration_accepts_a_pinned_huggingface_description(tmp_path: Path) -> None:
+def test_toml_configuration_accepts_a_pinned_huggingface_database_card(
+    tmp_path: Path,
+) -> None:
     path = tmp_path / "chat.toml"
     path.write_text(
         "\n".join(
@@ -119,11 +121,11 @@ def test_toml_configuration_accepts_a_pinned_huggingface_description(tmp_path: P
                 'runs_directory = "runs"',
                 f'docker_image = "{IMAGE}"',
                 "",
-                "[description]",
-                'format = "dsa-huggingface-database-description/v1"',
+                "[database_card]",
+                'format = "dsa-huggingface-database-card/v1"',
                 'repo_id = "lschiemanowski/dsa-datasets"',
                 f'revision = "{"a" * 40}"',
-                'path = "online-retail-ii/1.0.0/DATABASE.md"',
+                'path = "online-retail-ii/1.0.0/database-card.json"',
                 f'sha256 = "{"b" * 64}"',
                 "",
                 "[clarifier]",
@@ -139,8 +141,8 @@ def test_toml_configuration_accepts_a_pinned_huggingface_description(tmp_path: P
     configuration = load_configuration({}, config_path=path)
 
     assert configuration.mock_context_path == (tmp_path / "mock.json").resolve()
-    assert configuration.database_description is not None
-    assert configuration.database_description.revision == "a" * 40
+    assert configuration.database_card is not None
+    assert configuration.database_card.revision == "a" * 40
 
 
 @pytest.mark.parametrize(

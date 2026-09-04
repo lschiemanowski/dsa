@@ -14,6 +14,7 @@ from apps.private_data_chat.clarifier import (
 )
 from apps.private_data_chat.contracts import ClarifierTurn, MockDatabaseContext
 from dsa import ModelConfiguration
+from tests.private_data_chat.test_database_card import MODEL_ONLY_NOTE, card
 
 
 def mock_context() -> MockDatabaseContext:
@@ -35,7 +36,7 @@ async def test_clarifier_receives_only_skill_mock_context_history_and_safe_model
     clarifier = PydanticClarifier(
         ModelConfiguration(name="openai:untrusted", settings={"temperature": 0.2}),
         mock_context(),
-        database_description="Use the documented analysis view.",
+        database_card=card(),
         runner=runner,
     )
     result = await clarifier.clarify(
@@ -51,8 +52,9 @@ async def test_clarifier_receives_only_skill_mock_context_history_and_safe_model
     assert "/private/real.duckdb" not in combined
     assert "SECRET" not in combined
     assert "Analysis guidance is disabled" in instructions
-    assert "Public DuckDB description:" in instructions
-    assert "Use the documented analysis view." in instructions
+    assert "Dataset-owned database card:" in instructions
+    assert '"primary_relation":"analysis.lines"' in instructions
+    assert MODEL_ONLY_NOTE in instructions
 
 
 async def test_clarifier_can_be_instructed_to_propose_untrusted_analysis_guidance() -> None:
@@ -78,6 +80,17 @@ async def test_clarifier_can_be_instructed_to_propose_untrusted_analysis_guidanc
     assert "Analysis guidance is enabled" in calls[0]
     assert "numbered list of 3 to 8 steps" in calls[0]
     assert "must not claim" in calls[0]
+
+
+def test_clarifier_revalidates_a_mutated_typed_database_card() -> None:
+    selected = card().model_copy(update={"relations": ()})
+
+    with pytest.raises(ValidationError, match="at least 1 item"):
+        PydanticClarifier(
+            ModelConfiguration(name="openai:untrusted"),
+            mock_context(),
+            database_card=selected,
+        )
 
 
 async def test_clarifier_revalidates_untrusted_structured_output() -> None:

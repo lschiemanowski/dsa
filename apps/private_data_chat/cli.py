@@ -13,7 +13,7 @@ from typing import cast
 from pydantic import ValidationError
 
 from apps.private_data_chat.clarifier import load_mock_context
-from apps.private_data_chat.public_description import load_database_description
+from apps.private_data_chat.database_card import load_database_card
 from apps.private_data_chat.settings import load_configuration
 from dsa.cli import HelpRequested, Parser, emit
 
@@ -24,7 +24,7 @@ _SAFE_CONFIGURATION_FIELDS = frozenset(
         "clarifier",
         "data_source_id",
         "database_path",
-        "description",
+        "database_card",
         "docker_image",
         "enable_analysis_guidance",
         "format",
@@ -78,11 +78,11 @@ def main(
     except Exception as error:
         _emit_preflight_failure("context", error)
         return 2
-    if configuration.database_description is not None:
+    if configuration.database_card is not None:
         try:
-            load_database_description(configuration.database_description)
+            load_database_card(configuration.database_card)
         except Exception as error:
-            _emit_preflight_failure("description", error)
+            _emit_preflight_failure("database_card", error)
             return 2
 
     if parsed.check:

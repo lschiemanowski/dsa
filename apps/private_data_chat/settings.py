@@ -12,8 +12,8 @@ from typing import Literal, cast
 from pydantic import Field, JsonValue, field_validator, model_validator
 
 from apps.private_data_chat.contracts import AppContract
+from apps.private_data_chat.database_card import HuggingFaceDatabaseCardReference
 from apps.private_data_chat.dsa_adapter import DsaRuntimeConfiguration
-from apps.private_data_chat.public_description import HuggingFaceDescriptionReference
 from dsa import ModelConfiguration
 from dsa.cli import read_contract
 
@@ -23,7 +23,7 @@ class PrivateDataChatConfiguration(AppContract):
 
     data_source_id: str = Field(pattern=r"^[a-z][a-z0-9_-]{0,127}$")
     mock_context_path: Path
-    database_description: HuggingFaceDescriptionReference | None = None
+    database_card: HuggingFaceDatabaseCardReference | None = None
     clarifier_model: ModelConfiguration
     dsa: DsaRuntimeConfiguration
     enable_analysis_guidance: bool = False
@@ -63,7 +63,7 @@ class _FileConfiguration(AppContract):
     format: Literal["dsa-private-data-chat-config/v1"]
     data_source_id: str = Field(pattern=r"^[a-z][a-z0-9_-]{0,127}$")
     mock_context_path: str = Field(min_length=1, max_length=4096)
-    description: HuggingFaceDescriptionReference | None = None
+    database_card: HuggingFaceDatabaseCardReference | None = None
     database_path: str = Field(min_length=1, max_length=4096)
     runs_directory: str = Field(min_length=1, max_length=4096)
     docker_image: str
@@ -137,7 +137,7 @@ def _load_file_configuration(path: Path) -> PrivateDataChatConfiguration:
     return PrivateDataChatConfiguration(
         data_source_id=configured.data_source_id,
         mock_context_path=_configured_path(base, configured.mock_context_path),
-        database_description=configured.description,
+        database_card=configured.database_card,
         enable_analysis_guidance=configured.enable_analysis_guidance,
         clarifier_model=ModelConfiguration(
             name=configured.clarifier.model,
