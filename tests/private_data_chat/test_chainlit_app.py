@@ -45,10 +45,10 @@ def test_welcome_combines_fixed_trust_flow_with_dataset_context() -> None:
     assert "downloadable Jupyter notebook" in message
     assert "session ends" in message
     assert "## About Online Retail II" in message
-    assert "The original first paragraph." in message
+    assert r"The original first paragraph\." in message
     assert "### Available data" in message
     assert "1,044,848" in message
-    assert "- How did monthly sales change?" in message
+    assert r"- How did monthly sales change\?" in message
     assert MODEL_ONLY_NOTE not in message
 
 

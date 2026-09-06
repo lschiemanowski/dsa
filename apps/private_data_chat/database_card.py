@@ -14,6 +14,7 @@ from typing import Annotated, Literal, Protocol, cast
 from pydantic import Field, field_validator, model_validator
 
 from apps.private_data_chat.contracts import AppContract
+from apps.private_data_chat.presentation import escape_markdown_inline, escape_markdown_text
 
 _MAX_CARD_BYTES = 64 * 1024
 _SAFE_PATH_SEGMENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
@@ -220,16 +221,19 @@ def render_database_overview(card: DatabaseCard) -> str:
     relations = "\n".join(
         f"- `{relation.name}` ({relation.kind}, {relation.row_count:,} "
         f"{'row' if relation.row_count == 1 else 'rows'}): "
-        f"{relation.description}"
+        f"{escape_markdown_inline(relation.description)}"
         for relation in selected.relations
     )
     columns = "\n".join(
-        f"| `{column.name}` | `{column.data_type}` | {column.description} |"
+        f"| `{column.name}` | {escape_markdown_inline(column.data_type)} | "
+        f"{escape_markdown_inline(column.description)} |"
         for column in primary.columns
     )
-    examples = "\n".join(f"- {question}" for question in selected.example_questions)
+    examples = "\n".join(
+        f"- {escape_markdown_inline(question)}" for question in selected.example_questions
+    )
     return (
-        f"{selected.summary}\n\n"
+        f"{escape_markdown_text(selected.summary)}\n\n"
         "### At a glance\n\n"
         f"- **Coverage:** {coverage.period_start} through {coverage.period_end}\n"
         f"- **Transaction lines:** {coverage.transaction_lines:,}\n"

@@ -26,6 +26,7 @@ from apps.private_data_chat.contracts import (
     ProposalRecord,
     proposal_payload_json,
 )
+from apps.private_data_chat.presentation import escape_markdown_text
 
 Confirmation = Callable[[ProposalRecord], Awaitable[bool]]
 
@@ -263,7 +264,8 @@ def _json_fence(value: JsonValue | object) -> str:
 
 def _markdown_quote(value: str) -> str:
     """Keep every untrusted line visually inside one labeled block quote."""
-    return "\n".join(f"> {line}" if line else ">" for line in value.splitlines())
+    escaped = escape_markdown_text(value)
+    return "\n".join(f"> {line}" if line else ">" for line in escaped.splitlines())
 
 
 def _bounded_identity(value: str, label: str) -> str:

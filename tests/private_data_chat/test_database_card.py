@@ -125,11 +125,11 @@ def test_loads_one_exact_card_from_a_snapshot_symlink(tmp_path: Path) -> None:
 def test_user_projection_describes_contents_but_omits_analysis_notes() -> None:
     overview = render_database_overview(card())
 
-    assert overview.startswith("The original first paragraph.")
+    assert overview.startswith(r"The original first paragraph\.")
     assert "1,044,848" in overview
     assert "`analysis.lines` (view, 1,044,848 rows)" in overview
-    assert "| `quantity` | `INTEGER` | Signed item quantity. |" in overview
-    assert "- How did monthly sales change?" in overview
+    assert r"| `quantity` | INTEGER | Signed item quantity\. |" in overview
+    assert r"- How did monthly sales change\?" in overview
     assert MODEL_ONLY_NOTE not in overview
 
 
@@ -211,3 +211,25 @@ def test_user_projection_revalidates_a_mutated_typed_card() -> None:
 
     with pytest.raises(ValidationError, match="at least 1 item"):
         render_database_overview(selected)
+
+
+def test_user_projection_neutralizes_markdown_in_every_free_text_field() -> None:
+    values = card_values()
+    values["summary"] = "![summary](https://attacker.example/summary)"
+    values["example_questions"] = ["[Question](https://attacker.example/question)"]
+    relations = cast(list[dict[str, object]], values["relations"])
+    primary = dict(relations[0])
+    primary["description"] = "![relation](https://attacker.example/relation)"
+    columns = cast(list[dict[str, object]], primary["columns"])
+    first_column = dict(columns[0])
+    first_column["data_type"] = "[type](https://attacker.example/type)"
+    first_column["description"] = "![column](https://attacker.example/column)"
+    primary["columns"] = [first_column, *columns[1:]]
+    values["relations"] = [primary, *relations[1:]]
+
+    overview = render_database_overview(DatabaseCard.model_validate(values))
+
+    assert "![" not in overview
+    assert "](https://" not in overview
+    assert "\\!\\[summary\\]\\(https\\:\\/\\/attacker\\.example\\/summary\\)" in overview
+    assert "\\[Question\\]\\(https\\:\\/\\/attacker\\.example\\/question\\)" in overview

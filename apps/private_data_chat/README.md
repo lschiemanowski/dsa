@@ -95,7 +95,8 @@ Paths in this file are resolved relative to the file itself. Its `[database_card
 exact bounded JSON card stored alongside the DuckDB in the Hugging Face dataset. The application
 verifies its repository, immutable commit, path, and SHA-256 digest before parsing it. The welcome
 message shows the card's user-facing inventory while the untrusted clarifier receives the complete
-card, including technical analysis notes. Those notes are never rendered in the welcome message.
+card, including technical analysis notes. Card fields are escaped as literal text before Markdown
+rendering, and those notes are never rendered in the welcome message.
 Its `[clarifier]` and `[trusted]` sections are parsed
 independently through the safe model-configuration contract; credentials and provider endpoints
 are rejected there and must remain in environment variables. For example, a remote OpenRouter
@@ -146,8 +147,9 @@ confirmation view includes the exact guidance and its digest. The application ne
 snippets directly: after approval, the adapter labels the guidance as untrusted and the trusted
 model must inspect the real database, correct or ignore the suggestions, and produce the ordinary
 DSA derivation. Only that final derivation is replayed and eligible for the notebook download.
-Guidance is also rendered separately as wrapped prose for readability; the canonical JSON remains
-beneath it as the exact approved representation.
+Guidance is also rendered separately as wrapped literal text for readability, with Markdown
+punctuation neutralized; the canonical JSON remains beneath it as the exact approved
+representation.
 
 The Chainlit process needs access to the Docker CLI and daemon used for derivation replay. The
 configured database and runs directory must also be visible to that daemon at the same absolute

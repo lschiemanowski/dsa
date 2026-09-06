@@ -342,3 +342,38 @@ async def test_proposal_render_shows_exact_untrusted_guidance_and_bound_digest()
     assert "> Filter to 2011" in captured
     assert captured.index("## Proposed analysis guidance") < captured.index("```json")
     assert "Proposal digest:" in captured
+
+
+async def test_proposal_render_neutralizes_markdown_from_untrusted_guidance() -> None:
+    dangerous = (
+        "1. ![tracking pixel](https://attacker.example/pixel)\n"
+        "2. [Run analysis](https://attacker.example/deceptive)"
+    )
+    payload = ProposalPayload.model_validate(
+        {
+            **proposal_payload().model_dump(mode="python"),
+            "analysis_guidance": dangerous,
+        }
+    )
+    turn = ClarifierTurn(
+        kind="proposal",
+        message="The proposal is ready.",
+        proposal=payload,
+    )
+    captured = ""
+
+    async def inspect(record: ProposalRecord) -> bool:
+        nonlocal captured
+        captured = render_proposal(record)
+        return False
+
+    await session(
+        StubClarifier(turn),
+        StubExecutor(),
+        enable_analysis_guidance=True,
+    ).handle("Use the proposal.", inspect)
+
+    guidance = captured.partition("## Exact approved proposal")[0]
+    assert "![tracking pixel](" not in guidance
+    assert "[Run analysis](" not in guidance
+    assert "\\!\\[tracking pixel\\]\\(https\\:\\/\\/attacker\\.example\\/pixel\\)" in guidance

@@ -15,9 +15,9 @@ report_to_mlflow = false
 [database_card]
 format = "dsa-huggingface-database-card/v1"
 repo_id = "lschiemanowski/dsa-datasets"
-revision = "a8d4bd60c13265fdd938cf8393d332fda5fb6910"
+revision = "d158855c9b240d1fcc470b7835fe6e255bef6d0f"
 path = "online-retail-ii/1.0.0/database-card.json"
-sha256 = "874d0d0512b0a7878663512aa1fdd41db0fdd720b2fd42c89126092b98d7d0fe"
+sha256 = "1148ccca3d69e5e256f32418dbd40b3fb4facf07f1cdd1a078bd87c5d7a4a6de"
 
 # This model receives only bounded conversation text, the public card, and synthetic rows.
 [clarifier]
