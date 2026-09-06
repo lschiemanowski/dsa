@@ -17,7 +17,9 @@ approving user.
 - Chainlit chat content and bounded conversation history;
 - the clarification model and everything it emits;
 - the synthetic mock database context;
-- proposal text and answer schema until server validation; and
+- the exact public database card pinned from the Hugging Face dataset, including model-only
+  analysis notes;
+- proposal text, answer schema, and optional analysis guidance until server validation; and
 - future prompt skills or presentation code.
 
 The untrusted side receives no real rows, private schema metadata beyond what an operator chose to
@@ -41,6 +43,11 @@ DSA remains responsible for request validation, model/tool limits, database isol
 replay, terminalization, and retained notebook integrity. The application consumes its public API;
 it does not reproduce those mechanisms.
 
+When analysis guidance is enabled, it remains untrusted model output based only on synthetic data.
+The user approves its exact text, and the adapter labels it as untrusted before sending it to the
+trusted model. The application never executes suggested SQL or Python directly. The trusted model
+may correct or ignore it, and only the trusted model's ordinary DSA derivation is replayed.
+
 ## Approval invariant
 
 The approved digest covers the versioned proposal payload plus the authenticated user,
@@ -62,6 +69,9 @@ The host constructs the DSA request. The model-authored proposal cannot select o
 - run limits or Docker configuration;
 - run/artifact directories; or
 - whether derivation validation is requested.
+
+The host also decides whether analysis guidance is permitted. A disabled session rejects a model
+proposal that contains guidance instead of silently removing model-authored content.
 
 The first application profile requests a derivation. DSA may still return a successful answer
 without a notebook when no validated derivation receipt was produced. The UI must label that state

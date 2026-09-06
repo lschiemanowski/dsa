@@ -1,0 +1,38 @@
+[project]
+user_env = []
+cache = false
+persist_user_env = false
+
+[features]
+unsafe_allow_html = false
+latex = false
+edit_message = false
+allow_thread_sharing = false
+favorites = false
+
+[features.spontaneous_file_upload]
+enabled = false
+
+[features.audio]
+enabled = false
+
+[features.mcp]
+enabled = false
+
+[features.mcp.user_servers]
+enabled = false
+allowed_urls = []
+
+[UI]
+name = "DSA"
+description = "Ask quantitative questions about a private DuckDB"
+default_theme = "dark"
+confirm_new_chat = true
+cot = "hidden"
+custom_css = "/public/dsa.css"
+logo_file_url = "/public/dsa-mark.svg"
+default_avatar_file_url = "/public/dsa-mark.svg"
+avatar_size = 24
+
+[meta]
+generated_by = "2.12.0"

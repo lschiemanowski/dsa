@@ -13,8 +13,11 @@ from apps.private_data_chat.contracts import (
     ClarifierTurn,
     MockDatabaseContext,
     MockRelation,
+    ProposalBinding,
     ProposalPayload,
     QuantitativeInterpretation,
+    proposal_digest,
+    proposal_payload_json,
 )
 
 
@@ -74,6 +77,39 @@ def test_proposal_copies_and_accepts_the_bounded_schema() -> None:
     assert "secret" not in retained_properties
 
 
+def test_analysis_guidance_is_optional_bounded_and_bound_by_the_proposal_digest() -> None:
+    without_guidance = proposal_payload()
+    assert without_guidance.analysis_guidance is None
+    assert "analysis_guidance" not in proposal_payload_json(without_guidance)
+
+    guidance = "1. Filter to 2011.\n2. Aggregate line value by calendar month."
+    with_guidance = ProposalPayload.model_validate(
+        {
+            **without_guidance.model_dump(mode="python"),
+            "analysis_guidance": guidance,
+        }
+    )
+    binding = ProposalBinding(
+        user_id="user-1",
+        conversation_id="chat-1",
+        data_source_id="retail",
+    )
+    assert proposal_payload_json(with_guidance)["analysis_guidance"] == guidance
+    assert proposal_digest(binding, without_guidance) != proposal_digest(
+        binding,
+        with_guidance,
+    )
+
+    for invalid in ("   ", "x" * 12_001):
+        with pytest.raises(ValidationError):
+            ProposalPayload.model_validate(
+                {
+                    **without_guidance.model_dump(mode="python"),
+                    "analysis_guidance": invalid,
+                }
+            )
+
+
 @pytest.mark.parametrize(
     "mutation",
     [
@@ -130,6 +166,23 @@ def test_checked_in_mock_context_is_valid_and_explicitly_synthetic() -> None:
     path = Path(__file__).parents[2] / "apps/private_data_chat/mock-database.example.json"
     context = MockDatabaseContext.model_validate_json(path.read_bytes())
     assert context.synthetic is True
+    assert context.data_source_id == "online_retail_ii"
+    assert tuple(relation.name for relation in context.relations) == (
+        "analysis.transaction_lines_nonoverlapping",
+    )
+    assert context.relations[0].columns == (
+        "line_id",
+        "source_sheet",
+        "source_row",
+        "invoice_id",
+        "stock_code",
+        "description",
+        "quantity",
+        "invoice_ts",
+        "unit_price_gbp",
+        "customer_id",
+        "country",
+    )
     assert all(
         "FAKE" in str(value)
         for relation in context.relations

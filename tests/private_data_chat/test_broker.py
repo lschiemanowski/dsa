@@ -122,6 +122,7 @@ async def test_requires_exact_bound_approval_before_one_execution() -> None:
     request = executor.requests[0]
     assert request.data_source_id == "retail"
     assert request.request_derivation is True
+    assert request.analysis_guidance is None
     assert request.model_dump().keys().isdisjoint(
         {"database_path", "model", "credentials", "endpoint", "policy", "runs_directory"}
     )
@@ -131,6 +132,36 @@ async def test_requires_exact_bound_approval_before_one_execution() -> None:
         conversation_id="chat-1",
     )
     assert complete.status is ProposalStatus.SUCCEEDED
+
+
+async def test_broker_forwards_the_exact_approved_analysis_guidance() -> None:
+    clock = ManualClock()
+    executor = FakeAnalysisExecutor(successful_outcome())
+    service = broker(executor, clock)
+    payload = proposal_payload().model_copy(
+        update={"analysis_guidance": "Aggregate by month, then check missing months."},
+        deep=True,
+    )
+    proposal = await service.propose(
+        user_id="user-1",
+        conversation_id="chat-1",
+        data_source_id="retail",
+        payload=payload,
+    )
+    await service.approve(
+        proposal_id=proposal.proposal_id,
+        proposal_sha256=proposal.proposal_sha256,
+        user_id="user-1",
+        conversation_id="chat-1",
+    )
+
+    await service.execute(
+        proposal_id=proposal.proposal_id,
+        user_id="user-1",
+        conversation_id="chat-1",
+    )
+
+    assert executor.requests[0].analysis_guidance == payload.analysis_guidance
 
 
 async def test_identity_binding_hides_other_users_proposals() -> None:

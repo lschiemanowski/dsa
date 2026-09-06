@@ -19,6 +19,7 @@ from apps.private_data_chat.contracts import (
     MockDatabaseContext,
     canonical_json_bytes,
 )
+from apps.private_data_chat.database_card import DatabaseCard
 from dsa import ModelConfiguration
 
 _MAX_CONTEXT_BYTES = 64 * 1024
@@ -51,12 +52,18 @@ class PydanticClarifier:
         configuration: ModelConfiguration,
         context: MockDatabaseContext,
         *,
+        database_card: DatabaseCard | None = None,
+        enable_analysis_guidance: bool = False,
         runner: ClarifierRunner | None = None,
     ) -> None:
         self.configuration = ModelConfiguration.model_validate_json(
             configuration.model_dump_json()
         )
-        self._instructions = _clarifier_instructions(context)
+        self._instructions = _clarifier_instructions(
+            context,
+            database_card=database_card,
+            enable_analysis_guidance=enable_analysis_guidance,
+        )
         self._runner = runner or _run_pydantic_clarifier
 
     async def clarify(self, history: Sequence[ConversationMessage]) -> ClarifierTurn:
@@ -99,11 +106,35 @@ def load_mock_context(path: Path) -> MockDatabaseContext:
     return MockDatabaseContext.model_validate_json(_read_regular_file(path, _MAX_CONTEXT_BYTES))
 
 
-def _clarifier_instructions(context: MockDatabaseContext) -> str:
+def _clarifier_instructions(
+    context: MockDatabaseContext,
+    *,
+    database_card: DatabaseCard | None,
+    enable_analysis_guidance: bool,
+) -> str:
     skill_path = Path(__file__).with_name("clarification-skill.md")
-    skill = _read_regular_file(skill_path, _MAX_CONTEXT_BYTES).decode("utf-8")
+    skill_text = _read_regular_file(skill_path, _MAX_CONTEXT_BYTES).decode("utf-8")
     context_json = canonical_json_bytes(context).decode("utf-8")
-    return f"{skill}\n\nSynthetic database context:\n{context_json}"
+    guidance_policy = (
+        "Analysis guidance is enabled. A proposal may include analysis_guidance for a "
+        "human verifier. When present, it must be a numbered list of 3 to 8 steps; each "
+        "step must be concise and may include an optional SQL or Python snippet. "
+        "It must not claim that mock-derived values answer the real question or that any "
+        "suggested code has been executed."
+        if enable_analysis_guidance
+        else "Analysis guidance is disabled. Omit analysis_guidance from proposals."
+    )
+    database_context = ""
+    if database_card is not None:
+        selected_card = DatabaseCard.model_validate_json(database_card.model_dump_json())
+        database_context = (
+            "\n\nDataset-owned database card:\n"
+            f"{canonical_json_bytes(selected_card).decode('utf-8')}"
+        )
+    return (
+        f"{skill_text}\n\nHost analysis-guidance policy:\n{guidance_policy}\n\n"
+        f"Synthetic database context:\n{context_json}{database_context}"
+    )
 
 
 def _conversation_prompt(history: Sequence[ConversationMessage]) -> str:
@@ -156,7 +187,6 @@ def _read_regular_file(path: Path, limit: int) -> bytes:
     if len(content) > limit:
         raise ValueError("configured file exceeds its byte limit")
     return content
-
 
 def _bounded_text(value: str, limit: int) -> str:
     if not value.strip():

@@ -12,6 +12,7 @@ from apps.private_data_chat.contracts import (
     ClarifierTurn,
     MockDatabaseContext,
     MockRelation,
+    ProposalPayload,
     ProposalRecord,
 )
 
@@ -85,6 +86,22 @@ def proposal() -> ClarifierTurn:
     )
 
 
+def proposal_with_guidance() -> ClarifierTurn:
+    payload = ProposalPayload.model_validate(
+        {
+            **proposal_payload().model_dump(mode="python"),
+            "analysis_guidance": (
+                "Filter to 2011, compute quantity * unit_price_gbp, and aggregate by month."
+            ),
+        }
+    )
+    return ClarifierTurn(
+        kind="proposal",
+        message="The quantitative question and analysis guidance are ready.",
+        proposal=payload,
+    )
+
+
 def context() -> MockDatabaseContext:
     return MockDatabaseContext(
         data_source_id="retail",
@@ -102,6 +119,8 @@ def context() -> MockDatabaseContext:
 def session(
     clarifier: StubClarifier,
     executor: StubExecutor,
+    *,
+    enable_analysis_guidance: bool = False,
 ) -> PrivateDataChatSession:
     return PrivateDataChatSession(
         user_id="user-1",
@@ -109,6 +128,7 @@ def session(
         context=context(),
         clarifier=clarifier,
         executor=executor,
+        enable_analysis_guidance=enable_analysis_guidance,
     )
 
 
@@ -179,6 +199,26 @@ async def test_declined_confirmation_does_not_run_and_allows_refinement() -> Non
     assert continued.content == "Which calendar year should I use?"
     assert executor.requests == []
     assert len(clarifier.calls) == 2
+
+
+async def test_guidance_is_rejected_when_disabled_and_forwarded_exactly_when_enabled() -> None:
+    disabled_executor = StubExecutor()
+    disabled = session(StubClarifier(proposal_with_guidance()), disabled_executor)
+    rejected = await disabled.handle("Use the proposed plan.", approve)
+    assert "could not be prepared safely" in rejected.content
+    assert disabled_executor.requests == []
+
+    enabled_executor = StubExecutor()
+    enabled = session(
+        StubClarifier(proposal_with_guidance()),
+        enabled_executor,
+        enable_analysis_guidance=True,
+    )
+    result = await enabled.handle("Use the proposed plan.", approve)
+    assert result.terminal is True
+    assert enabled_executor.requests[0].analysis_guidance == (
+        "Filter to 2011, compute quantity * unit_price_gbp, and aggregate by month."
+    )
 
 
 async def test_verified_notebook_is_returned_as_exact_bytes_without_path() -> None:
@@ -279,3 +319,61 @@ async def test_proposal_render_contains_exact_payload_and_digest_without_privile
     assert proposal_payload().question in rendered
     assert "Proposal digest:" in rendered
     assert "/private/" not in rendered
+
+
+async def test_proposal_render_shows_exact_untrusted_guidance_and_bound_digest() -> None:
+    captured = ""
+
+    async def inspect(record: ProposalRecord) -> bool:
+        nonlocal captured
+        captured = render_proposal(record)
+        return False
+
+    await session(
+        StubClarifier(proposal_with_guidance()),
+        StubExecutor(),
+        enable_analysis_guidance=True,
+    ).handle("Use 2011.", inspect)
+
+    assert "analysis_guidance" in captured
+    assert "quantity * unit_price_gbp" in captured
+    assert "untrusted" in captured.lower()
+    assert "## Proposed analysis guidance (untrusted)" in captured
+    assert "> Filter to 2011" in captured
+    assert captured.index("## Proposed analysis guidance") < captured.index("```json")
+    assert "Proposal digest:" in captured
+
+
+async def test_proposal_render_neutralizes_markdown_from_untrusted_guidance() -> None:
+    dangerous = (
+        "1. ![tracking pixel](https://attacker.example/pixel)\n"
+        "2. [Run analysis](https://attacker.example/deceptive)"
+    )
+    payload = ProposalPayload.model_validate(
+        {
+            **proposal_payload().model_dump(mode="python"),
+            "analysis_guidance": dangerous,
+        }
+    )
+    turn = ClarifierTurn(
+        kind="proposal",
+        message="The proposal is ready.",
+        proposal=payload,
+    )
+    captured = ""
+
+    async def inspect(record: ProposalRecord) -> bool:
+        nonlocal captured
+        captured = render_proposal(record)
+        return False
+
+    await session(
+        StubClarifier(turn),
+        StubExecutor(),
+        enable_analysis_guidance=True,
+    ).handle("Use the proposal.", inspect)
+
+    guidance = captured.partition("## Exact approved proposal")[0]
+    assert "![tracking pixel](" not in guidance
+    assert "[Run analysis](" not in guidance
+    assert "\\!\\[tracking pixel\\]\\(https\\:\\/\\/attacker\\.example\\/pixel\\)" in guidance

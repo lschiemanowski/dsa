@@ -24,7 +24,9 @@ from apps.private_data_chat.contracts import (
     ClarifierTurn,
     MockDatabaseContext,
     ProposalRecord,
+    proposal_payload_json,
 )
+from apps.private_data_chat.presentation import escape_markdown_text
 
 Confirmation = Callable[[ProposalRecord], Awaitable[bool]]
 
@@ -71,12 +73,14 @@ class PrivateDataChatSession:
         context: MockDatabaseContext,
         clarifier: Clarifier,
         executor: SessionExecutor,
+        enable_analysis_guidance: bool = False,
     ) -> None:
         self._user_id = _bounded_identity(user_id, "user identity")
         self._conversation_id = _bounded_identity(conversation_id, "conversation identity")
         self._context = context.model_copy(deep=True)
         self._clarifier = clarifier
         self._executor = executor
+        self._enable_analysis_guidance = enable_analysis_guidance
         self._broker = PrivateDataBroker(
             store=InMemoryProposalStore(),
             executor=executor,
@@ -108,6 +112,14 @@ class PrivateDataChatSession:
                 return ChatResponse(turn.message)
 
             assert turn.proposal is not None
+            if (
+                turn.proposal.analysis_guidance is not None
+                and not self._enable_analysis_guidance
+            ):
+                return ChatResponse(
+                    "The proposed analysis could not be prepared safely. Refine the question "
+                    "and try again."
+                )
             try:
                 proposal = await self._broker.propose(
                     user_id=self._user_id,
@@ -126,7 +138,7 @@ class PrivateDataChatSession:
                 approved = await confirm(proposal)
             if not approved:
                 proposal_text = json.dumps(
-                    proposal.payload.model_dump(mode="json"),
+                    proposal_payload_json(proposal.payload),
                     ensure_ascii=False,
                     allow_nan=False,
                     sort_keys=True,
@@ -212,10 +224,21 @@ class PrivateDataChatSession:
 
 def render_proposal(proposal: ProposalRecord) -> str:
     """Render exactly the validated payload and its host-computed digest."""
-    payload = proposal.payload.model_dump(mode="json")
+    payload = proposal_payload_json(proposal.payload)
+    guidance = proposal.payload.analysis_guidance
+    guidance_section = (
+        "## Proposed analysis guidance (untrusted)\n\n"
+        "This was produced from synthetic data only. The trusted model may correct or "
+        "ignore it.\n\n"
+        f"{_markdown_quote(guidance)}\n\n"
+        if guidance is not None
+        else ""
+    )
     return (
-        "The mock data was used only to clarify the request. Running the analysis sends this "
-        "exact request to the trusted DSA model:\n\n"
+        "The mock data was used only to clarify the request. Running the analysis sends "
+        "the approved content below to the trusted DSA boundary.\n\n"
+        f"{guidance_section}"
+        "## Exact approved proposal\n\n"
         f"{_json_fence(payload)}\n\n"
         f"Proposal digest: `{proposal.proposal_sha256}`"
     )
@@ -237,6 +260,12 @@ def _json_fence(value: JsonValue | object) -> str:
     longest = max((len(run) for run in re.findall(r"`+", rendered)), default=0)
     fence = "`" * max(3, longest + 1)
     return f"{fence}json\n{rendered}\n{fence}"
+
+
+def _markdown_quote(value: str) -> str:
+    """Keep every untrusted line visually inside one labeled block quote."""
+    escaped = escape_markdown_text(value)
+    return "\n".join(f"> {line}" if line else ">" for line in escaped.splitlines())
 
 
 def _bounded_identity(value: str, label: str) -> str:

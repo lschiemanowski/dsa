@@ -1,11 +1,13 @@
 {
-  "data_source_id": "retail",
-  "display_name": "Synthetic online retail data",
+  "data_source_id": "online_retail_ii",
+  "display_name": "Online Retail II",
   "format": "dsa-mock-database/v1",
   "relations": [
     {
       "columns": [
         "line_id",
+        "source_sheet",
+        "source_row",
         "invoice_id",
         "stock_code",
         "description",
@@ -15,7 +17,7 @@
         "customer_id",
         "country"
       ],
-      "name": "analysis.transaction_lines",
+      "name": "analysis.transaction_lines_nonoverlapping",
       "sample_rows": [
         {
           "country": "Exampleland",
@@ -25,6 +27,8 @@
           "invoice_ts": "2011-01-03T10:15:00",
           "line_id": 1,
           "quantity": 2,
+          "source_row": 101,
+          "source_sheet": "Synthetic 2010-2011",
           "stock_code": "FAKE-SKU-1",
           "unit_price_gbp": 3.5
         },
@@ -36,6 +40,8 @@
           "invoice_ts": "2011-02-14T14:30:00",
           "line_id": 2,
           "quantity": 5,
+          "source_row": 202,
+          "source_sheet": "Synthetic 2010-2011",
           "stock_code": "FAKE-SKU-2",
           "unit_price_gbp": 1.25
         }

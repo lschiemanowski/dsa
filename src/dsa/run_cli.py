@@ -28,12 +28,13 @@ class _RunInterrupted(Exception):
 def main(
     argv: Sequence[str] | None = None,
     *,
+    prog: str = "dsa-run",
     runner: Runner = run_analysis,
     executor_factory: ExecutorFactory | None = None,
 ) -> int:
     """Validate and execute one standalone analysis request."""
     try:
-        parsed = _parser().parse_args(argv)
+        parsed = _parser(prog).parse_args(argv)
         request_path = Path(parsed.request)
         request = _load_request(request_path)
         runs_directory = Path(parsed.runs_directory).resolve()
@@ -100,8 +101,8 @@ def _cancelled_completion(error: asyncio.CancelledError) -> RunCompletion | None
         return None
 
 
-def _parser() -> Parser:
-    parser = Parser(prog="dsa-run", add_help=True)
+def _parser(prog: str = "dsa-run") -> Parser:
+    parser = Parser(prog=prog, add_help=True)
     parser.add_argument("--request", required=True)
     parser.add_argument("--runs-directory", required=True)
     parser.add_argument("--docker-image", required=True)

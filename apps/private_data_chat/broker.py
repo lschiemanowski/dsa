@@ -191,6 +191,7 @@ class PrivateDataBroker:
                 data_source_id=record.binding.data_source_id,
                 question=record.payload.question,
                 answer_schema=record.payload.answer_schema,
+                analysis_guidance=record.payload.analysis_guidance,
             )
             running = ProposalRecord.model_validate(
                 {

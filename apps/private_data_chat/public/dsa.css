@@ -1,0 +1,8 @@
+/* This demo has one fixed presentation and explains its own trust boundary. */
+#theme-toggle {
+  display: none !important;
+}
+
+.watermark {
+  display: none !important;
+}

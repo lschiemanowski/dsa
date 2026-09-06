@@ -28,11 +28,158 @@ def environment(tmp_path: Path) -> dict[str, str]:
 def test_configuration_keeps_clarifier_and_trusted_runtime_separate(tmp_path: Path) -> None:
     configuration = load_configuration(environment(tmp_path))
 
+    assert configuration.enable_analysis_guidance is False
     assert configuration.clarifier_model.name == "openai:untrusted"
     assert configuration.clarifier_model.settings == {"temperature": 0.2}
     assert configuration.dsa.trusted_model_name == "openai:trusted"
     assert configuration.dsa.database_path == tmp_path / "private.duckdb"
     assert configuration.dsa.report_to_mlflow is True
+
+
+def test_analysis_guidance_is_an_opt_in_host_setting(tmp_path: Path) -> None:
+    values = environment(tmp_path)
+    values["DSA_CHAT_ENABLE_ANALYSIS_GUIDANCE"] = "true"
+
+    assert load_configuration(values).enable_analysis_guidance is True
+
+
+def test_toml_configuration_resolves_paths_relative_to_itself(tmp_path: Path) -> None:
+    path = tmp_path / "chat.toml"
+    path.write_text(
+        "\n".join(
+            (
+                'format = "dsa-private-data-chat-config/v1"',
+                'data_source_id = "retail"',
+                'mock_context_path = "mock.json"',
+                'database_path = "data/private.duckdb"',
+                'runs_directory = "state/runs"',
+                f'docker_image = "{IMAGE}"',
+                "enable_analysis_guidance = true",
+                "report_to_mlflow = false",
+                "",
+                "[clarifier]",
+                'model = "openai:untrusted"',
+                "settings = { temperature = 0.2 }",
+                "",
+                "[trusted]",
+                'model = "openai:trusted"',
+                "settings = { temperature = 0 }",
+                "",
+            )
+        )
+    )
+
+    configuration = load_configuration({}, config_path=path)
+
+    assert configuration.data_source_id == "retail"
+    assert configuration.mock_context_path == (tmp_path / "mock.json").resolve()
+    assert configuration.clarifier_model.name == "openai:untrusted"
+    assert configuration.enable_analysis_guidance is True
+    assert configuration.dsa.database_path == (tmp_path / "data/private.duckdb").resolve()
+    assert configuration.dsa.runs_directory == (tmp_path / "state/runs").resolve()
+    assert configuration.dsa.trusted_model_name == "openai:trusted"
+
+
+def test_environment_can_select_the_toml_configuration(tmp_path: Path) -> None:
+    path = tmp_path / "chat.toml"
+    path.write_text(
+        "\n".join(
+            (
+                'format = "dsa-private-data-chat-config/v1"',
+                'data_source_id = "retail"',
+                'mock_context_path = "mock.json"',
+                'database_path = "private.duckdb"',
+                'runs_directory = "runs"',
+                f'docker_image = "{IMAGE}"',
+                "",
+                "[clarifier]",
+                'model = "openai:untrusted"',
+                "",
+                "[trusted]",
+                'model = "openai:trusted"',
+                "",
+            )
+        )
+    )
+
+    configuration = load_configuration({"DSA_CHAT_CONFIG_PATH": str(path)})
+
+    assert configuration.data_source_id == "retail"
+
+
+def test_toml_configuration_accepts_a_pinned_huggingface_database_card(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "chat.toml"
+    path.write_text(
+        "\n".join(
+            (
+                'format = "dsa-private-data-chat-config/v1"',
+                'data_source_id = "retail"',
+                'mock_context_path = "mock.json"',
+                'database_path = "private.duckdb"',
+                'runs_directory = "runs"',
+                f'docker_image = "{IMAGE}"',
+                "",
+                "[database_card]",
+                'format = "dsa-huggingface-database-card/v1"',
+                'repo_id = "lschiemanowski/dsa-datasets"',
+                f'revision = "{"a" * 40}"',
+                'path = "online-retail-ii/1.0.0/database-card.json"',
+                f'sha256 = "{"b" * 64}"',
+                "",
+                "[clarifier]",
+                'model = "openai:untrusted"',
+                "",
+                "[trusted]",
+                'model = "openai:trusted"',
+                "",
+            )
+        )
+    )
+
+    configuration = load_configuration({}, config_path=path)
+
+    assert configuration.mock_context_path == (tmp_path / "mock.json").resolve()
+    assert configuration.database_card is not None
+    assert configuration.database_card.revision == "a" * 40
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        'settings = { api_key = "SECRET" }',
+        'settings = { base_url = "https://private" }',
+    ],
+)
+def test_toml_configuration_rejects_credentials_and_endpoints(
+    tmp_path: Path,
+    extra: str,
+) -> None:
+    path = tmp_path / "chat.toml"
+    path.write_text(
+        "\n".join(
+            (
+                'format = "dsa-private-data-chat-config/v1"',
+                'data_source_id = "retail"',
+                'mock_context_path = "mock.json"',
+                'database_path = "private.duckdb"',
+                'runs_directory = "runs"',
+                f'docker_image = "{IMAGE}"',
+                "",
+                "[clarifier]",
+                'model = "openai:untrusted"',
+                extra,
+                "",
+                "[trusted]",
+                'model = "openai:trusted"',
+                "",
+            )
+        )
+    )
+
+    with pytest.raises(ValidationError):
+        load_configuration({}, config_path=path)
 
 
 @pytest.mark.parametrize(
@@ -73,3 +220,8 @@ def test_configuration_rejects_missing_invalid_or_relative_values(tmp_path: Path
     invalid_bool["DSA_CHAT_REPORT_TO_MLFLOW"] = "sometimes"
     with pytest.raises(ValueError, match="true or false"):
         load_configuration(invalid_bool)
+
+    invalid_guidance = environment(tmp_path)
+    invalid_guidance["DSA_CHAT_ENABLE_ANALYSIS_GUIDANCE"] = "sometimes"
+    with pytest.raises(ValueError, match="DSA_CHAT_ENABLE_ANALYSIS_GUIDANCE"):
+        load_configuration(invalid_guidance)

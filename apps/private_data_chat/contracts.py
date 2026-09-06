@@ -16,6 +16,7 @@ from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_validator, m
 
 DRAFT_2020_12 = "https://json-schema.org/draft/2020-12/schema"
 _MAX_ANSWER_SCHEMA_BYTES = 32 * 1024
+_MAX_ANALYSIS_GUIDANCE_LENGTH = 12_000
 _MAX_SCHEMA_DEPTH = 16
 _MAX_SCHEMA_NODES = 512
 _MAX_MOCK_CONTEXT_BYTES = 64 * 1024
@@ -98,12 +99,24 @@ class ProposalPayload(AppContract):
     question: str = Field(min_length=1, max_length=8_000)
     interpretation: QuantitativeInterpretation
     answer_schema: dict[str, JsonValue]
+    analysis_guidance: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=_MAX_ANALYSIS_GUIDANCE_LENGTH,
+    )
 
     @field_validator("question")
     @classmethod
     def reject_blank_question(cls, value: str) -> str:
         if not value.strip():
             raise ValueError("question must not be blank")
+        return value
+
+    @field_validator("analysis_guidance")
+    @classmethod
+    def reject_blank_guidance(cls, value: str | None) -> str | None:
+        if value is not None and not value.strip():
+            raise ValueError("analysis guidance must not be blank")
         return value
 
     @field_validator("answer_schema")
@@ -163,7 +176,19 @@ class AnalysisRequest(AppContract):
     data_source_id: str = Field(pattern=r"^[a-z][a-z0-9_-]{0,127}$")
     question: str = Field(min_length=1, max_length=8_000)
     answer_schema: dict[str, JsonValue]
+    analysis_guidance: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=_MAX_ANALYSIS_GUIDANCE_LENGTH,
+    )
     request_derivation: Literal[True] = True
+
+    @field_validator("analysis_guidance")
+    @classmethod
+    def reject_blank_guidance(cls, value: str | None) -> str | None:
+        if value is not None and not value.strip():
+            raise ValueError("analysis guidance must not be blank")
+        return value
 
     @field_validator("answer_schema")
     @classmethod
@@ -320,11 +345,19 @@ def canonical_json_bytes(value: BaseModel | dict[str, JsonValue]) -> bytes:
     ).encode("utf-8")
 
 
+def proposal_payload_json(payload: ProposalPayload) -> dict[str, JsonValue]:
+    """Project the exact proposal content shown to the user and covered by its digest."""
+    raw = cast(dict[str, JsonValue], payload.model_dump(mode="json"))
+    if raw.get("analysis_guidance") is None:
+        raw.pop("analysis_guidance", None)
+    return raw
+
+
 def proposal_digest(binding: ProposalBinding, payload: ProposalPayload) -> str:
     """Bind exactly what the user approves to its host-controlled context."""
     envelope = {
         "binding": cast(JsonValue, binding.model_dump(mode="json")),
-        "payload": cast(JsonValue, payload.model_dump(mode="json")),
+        "payload": cast(JsonValue, proposal_payload_json(payload)),
     }
     return sha256(canonical_json_bytes(envelope)).hexdigest()
 

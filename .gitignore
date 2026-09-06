@@ -215,6 +215,10 @@ tempCodeRunnerFile.py
 # Chainlit creates local configuration, translations, and uploaded-file state on first import
 /.chainlit/
 /.files/
+/apps/private_data_chat/.chainlit/translations/
+/apps/private_data_chat/.files/
+/.private-data-chat.env
+/.private-data-chat/
 
 # Marimo
 marimo/_static/

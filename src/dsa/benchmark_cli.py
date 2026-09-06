@@ -48,6 +48,7 @@ class Reporter(Protocol):
 def main(
     argv: Sequence[str] | None = None,
     *,
+    prog: str = "dsa-benchmark",
     current_revision: str | None = None,
     preparer: Preparer = prepare_benchmark,
     runner: Runner = run_prepared_benchmark,
@@ -55,7 +56,7 @@ def main(
 ) -> int:
     """Validate and execute one benchmark CLI operation."""
     try:
-        parsed = _parser().parse_args(argv)
+        parsed = _parser(prog).parse_args(argv)
         study = _load_study(Path(parsed.study))
         runtime = _load_runtime(Path(parsed.runtime))
         revision = current_revision or _current_git_revision()
@@ -134,8 +135,8 @@ def main(
     return 0 if complete else 1
 
 
-def _parser() -> Parser:
-    parser = Parser(prog="dsa-benchmark", add_help=True)
+def _parser(prog: str = "dsa-benchmark") -> Parser:
+    parser = Parser(prog=prog, add_help=True)
     commands = parser.add_subparsers(dest="command", required=True)
     plan = commands.add_parser("plan", add_help=True)
     _common_arguments(plan)
