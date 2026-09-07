@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import json
 from collections.abc import Sequence
 
 from apps.private_data_chat.chat import PrivateDataChatSession, render_proposal
@@ -15,8 +17,42 @@ from apps.private_data_chat.contracts import (
     ProposalPayload,
     ProposalRecord,
 )
+from tests.test_derivation_plots import png
 
 from .test_contracts import artifact, proposal_payload
+
+
+async def test_approved_plot_permission_and_images_stay_on_trusted_side() -> None:
+    payload = proposal_payload().model_copy(update={"allow_plots": True})
+    clarifier = StubClarifier(ClarifierTurn(kind="proposal", proposal=payload, message="Ready"))
+    content = png()
+    notebook = json.dumps(
+        {
+            "cells": [
+                {
+                    "metadata": {"dsa_plot": {"filename": "counts.png", "title": "Count"}},
+                    "outputs": [{"data": {"image/png": base64.b64encode(content).decode()}}],
+                }
+            ]
+        }
+    ).encode()
+    executor = StubExecutor(notebook=notebook)
+    chat = session(clarifier, executor)
+    approved: list[ProposalRecord] = []
+
+    async def confirm(record: ProposalRecord) -> bool:
+        approved.append(record)
+        return True
+
+    response = await chat.handle("Show a chart", confirm)
+    assert approved[0].payload.allow_plots
+    assert '"allow_plots": true' in render_proposal(approved[0])
+    assert executor.requests[0].allow_plots
+    assert response.plots[0].content == content
+    assert response.notebook is not None
+    assert response.terminal
+    await chat.handle("Explain this plot", confirm)
+    assert len(clarifier.calls) == 1
 
 
 class StubClarifier:
@@ -304,8 +340,9 @@ async def test_confirmation_exception_is_a_decline() -> None:
     assert executor.requests == []
 
 
-async def test_proposal_render_contains_exact_payload_and_digest_without_privileged_values(
-) -> None:
+async def test_proposal_render_contains_exact_payload_and_digest_without_privileged_values() -> (
+    None
+):
     # The broker-created record is covered in the async flow; this assertion targets rendering.
     captured = ""
 

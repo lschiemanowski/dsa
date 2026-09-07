@@ -58,8 +58,10 @@ def request() -> AnalysisRequest:
     )
 
 
+@pytest.mark.parametrize("allow_plots", [False, True])
 async def test_adapter_builds_privileged_derivation_request_and_maps_success(
     tmp_path: Path,
+    allow_plots: bool,
 ) -> None:
     calls: list[tuple[RunRequest, dict[str, object]]] = []
 
@@ -87,7 +89,7 @@ async def test_adapter_builds_privileged_derivation_request_and_maps_success(
         runner=runner,
         executor_factory=lambda image: UnusedPythonExecutor(),
     )
-    result = await executor.execute(request())
+    result = await executor.execute(request().model_copy(update={"allow_plots": allow_plots}))
 
     assert result.status == "succeeded"
     assert result.answer == {"total": 10.0, "months": ["2011-01"]}
@@ -98,6 +100,7 @@ async def test_adapter_builds_privileged_derivation_request_and_maps_success(
     assert run_request.model.name == "trusted-model"
     assert run_request.model.settings == {"temperature": 0.0}
     assert run_request.derivation is not None
+    assert run_request.derivation.allow_plots is allow_plots
     assert run_request.question == request().question
     assert kwargs["runs_directory"] == tmp_path / "runs"
     assert kwargs["report_to_mlflow"] is False

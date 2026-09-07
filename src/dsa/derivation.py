@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import os
 import shutil
@@ -20,10 +21,11 @@ from pydantic import JsonValue
 
 from dsa.contract import Derivation, DerivationCodeCell, RunPolicy
 from dsa.environment import AnalysisEnvironment, ArtifactError, PythonExecutor
+from dsa.plots import MAX_NOTEBOOK_BYTES, MAX_PLOT_BYTES, VerifiedPlot, validate_png
 from dsa.record import DerivationVerification, RetainedDerivationNotebook
 
 _RESULT_NAME = "result.json"
-_MAX_NOTEBOOK_BYTES = 2 * 1024 * 1024
+_MAX_NOTEBOOK_BYTES = MAX_NOTEBOOK_BYTES
 _INFRASTRUCTURE_CODES = frozenset(
     {
         "python_backend_error",
@@ -62,6 +64,7 @@ class ReplayedDerivation:
     derivation: Derivation
     answer: JsonValue
     runtime_identity: str | None
+    plots: tuple[VerifiedPlot, ...] = ()
 
 
 async def verify_derivation(
@@ -74,10 +77,12 @@ async def verify_derivation(
     run_directory: Path,
     policy: RunPolicy,
     python_executor: PythonExecutor | None,
+    allow_plots: bool = False,
 ) -> VerifiedDerivation:
     """Replay cells from a pristine database and retain their notebook projection."""
     replayed = await replay_derivation(
         derivation,
+        allow_plots=allow_plots,
         source_database=source_database,
         source_database_sha256=source_database_sha256,
         run_directory=run_directory,
@@ -106,9 +111,12 @@ async def replay_derivation(
     run_directory: Path,
     policy: RunPolicy,
     python_executor: PythonExecutor | None,
+    allow_plots: bool = False,
 ) -> ReplayedDerivation:
     """Replay a derivation without publishing its notebook."""
-    replayed_answer, runtime_identity = await _execute_derivation(
+    if derivation.plots and not allow_plots:
+        raise DerivationError("derivation_plots_disabled", "Plots are not enabled for this request")
+    replayed_answer, runtime_identity, plots = await _execute_derivation(
         derivation,
         source_database=source_database,
         source_database_sha256=source_database_sha256,
@@ -120,6 +128,7 @@ async def replay_derivation(
         derivation=derivation,
         answer=replayed_answer,
         runtime_identity=runtime_identity,
+        plots=plots,
     )
 
 
@@ -138,6 +147,7 @@ def retain_replayed_derivation(
         source_database_sha256=source_database_sha256,
         run_directory=run_directory,
         runtime_identity=replayed.runtime_identity,
+        plots=replayed.plots,
     )
 
 
@@ -149,7 +159,7 @@ async def _execute_derivation(
     run_directory: Path,
     policy: RunPolicy,
     python_executor: PythonExecutor | None,
-) -> tuple[JsonValue, str | None]:
+) -> tuple[JsonValue, str | None, tuple[VerifiedPlot, ...]]:
     """Replay cells from a pristine database without publishing a notebook."""
     if python_executor is None:
         raise DerivationError(
@@ -176,7 +186,7 @@ async def _execute_derivation(
         raw_result = await environment.run_python(
             _replay_source(derivation),
             (),
-            (_RESULT_NAME,),
+            (_RESULT_NAME, *(plot.filename for plot in derivation.plots)),
             tool_call_id="derivation-verification",
         )
         result = _parse_execution_result(raw_result)
@@ -193,7 +203,7 @@ async def _execute_derivation(
                 infrastructure=stable_code in _INFRASTRUCTURE_CODES,
             )
         outputs = result.get("outputs")
-        if not isinstance(outputs, list) or len(outputs) != 1:
+        if not isinstance(outputs, list) or len(outputs) != 1 + len(derivation.plots):
             raise DerivationError(
                 "derivation_result_unavailable",
                 "The derivation did not produce its required result",
@@ -207,8 +217,23 @@ async def _execute_derivation(
             )
         try:
             replayed_answer = environment.load_json_artifact(handle)
+            retained_plots: list[VerifiedPlot] = []
+            total = 0
+            for declaration, item in zip(derivation.plots, outputs[1:], strict=True):
+                plot_handle = item.get("handle") if isinstance(item, dict) else None
+                if not isinstance(plot_handle, str):
+                    raise ValueError("missing plot handle")
+                content = environment.load_png_artifact(plot_handle)
+                total += len(content)
+                if total > MAX_PLOT_BYTES:
+                    raise ValueError("combined plots exceed 5 MiB")
+                retained_plots.append(VerifiedPlot(declaration, content))
         except ArtifactError as error:
             raise DerivationError(error.code, error.message) from error
+        except (ValueError, OSError) as error:
+            raise DerivationError(
+                "derivation_plot_invalid", "Plots must be valid bounded PNGs"
+            ) from error
     finally:
         active_exception = sys.exc_info()[0]
         try:
@@ -225,7 +250,7 @@ async def _execute_derivation(
                     infrastructure=True,
                 ) from error
 
-    return replayed_answer, runtime_identity
+    return replayed_answer, runtime_identity, tuple(retained_plots)
 
 
 def _retain_verified_derivation(
@@ -236,9 +261,16 @@ def _retain_verified_derivation(
     source_database_sha256: str,
     run_directory: Path,
     runtime_identity: str | None,
+    plots: tuple[VerifiedPlot, ...] = (),
 ) -> VerifiedDerivation:
     derivation_bytes = _canonical_json_bytes(derivation.model_dump(mode="json"))
     try:
+        if tuple(plot.declaration for plot in plots) != derivation.plots:
+            raise ValueError("replayed plots must match their declarations")
+        if sum(len(plot.content) for plot in plots) > MAX_PLOT_BYTES:
+            raise ValueError("combined plot byte limit exceeded")
+        for plot in plots:
+            validate_png(plot.content)
         derivation_sha256 = sha256(derivation_bytes).hexdigest()
         notebook_bytes = _notebook_bytes(
             derivation,
@@ -246,6 +278,7 @@ def _retain_verified_derivation(
             source_database_sha256=source_database_sha256,
             runtime_identity=runtime_identity,
             derivation_sha256=derivation_sha256,
+            plots=plots,
         )
         notebook = RetainedDerivationNotebook(
             path=run_directory / "derivation.ipynb",
@@ -275,9 +308,7 @@ def _retain_verified_derivation(
 
 
 def _replay_source(derivation: Derivation) -> str:
-    sources = [
-        cell.source for cell in derivation.cells if isinstance(cell, DerivationCodeCell)
-    ]
+    sources = [cell.source for cell in derivation.cells if isinstance(cell, DerivationCodeCell)]
     encoded_sources = json.dumps(sources, ensure_ascii=False, allow_nan=False)
     return f"""\
 import json as __dsa_json
@@ -286,6 +317,7 @@ from pathlib import Path as __dsa_Path
 
 __dsa_namespace = {{
     "database_path": __dsa_Path(__dsa_os.environ["DSAGENT_DATABASE"]),
+    "plot_directory": __dsa_Path(__dsa_os.environ["DSAGENT_OUTPUTS"]),
 }}
 __dsa_sources = {encoded_sources}
 for __dsa_index, __dsa_source in enumerate(__dsa_sources, start=1):
@@ -384,6 +416,7 @@ def _notebook_bytes(
     source_database_sha256: str,
     runtime_identity: str | None,
     derivation_sha256: str,
+    plots: tuple[VerifiedPlot, ...] = (),
 ) -> bytes:
     cells: list[dict[str, Any]] = [
         _notebook_cell(
@@ -396,13 +429,45 @@ def _notebook_bytes(
         _notebook_cell(
             "code",
             "from pathlib import Path\n\n"
-            'database_path = Path("database.duckdb")',
+            'database_path = Path("database.duckdb")'
+            + (
+                '\nplot_directory = Path("plots")\nplot_directory.mkdir(exist_ok=True)'
+                if plots
+                else ""
+            ),
             1,
         ),
     ]
     for index, cell in enumerate(derivation.cells, start=2):
         cells.append(_notebook_cell(cell.type, cell.source, index))
     cells.append(_notebook_cell("code", "result", len(cells)))
+    for plot in plots:
+        # Captions are text/plain, never active Markdown or HTML.
+        description = plot.declaration.title + (
+            "\n" + plot.declaration.caption if plot.declaration.caption else ""
+        )
+        cell = _notebook_cell(
+            "code",
+            "from IPython.display import Image, display\n"
+            f"display(Image(filename=str(plot_directory / {plot.declaration.filename!r})))\n"
+            f"print({description!r})",
+            len(cells),
+        )
+        cell["metadata"]["dsa_plot"] = plot.declaration.model_dump(mode="json")
+        cell["outputs"] = [
+            {
+                "output_type": "display_data",
+                "metadata": {},
+                "data": {
+                    "image/png": base64.b64encode(plot.content).decode("ascii"),
+                    "text/plain": description,
+                },
+            }
+        ]
+        cell["outputs"].append(
+            {"output_type": "stream", "name": "stdout", "text": description + "\n"}
+        )
+        cells.append(cell)
     dsa_metadata: dict[str, JsonValue] = {
         "derivation_format": derivation.format,
         "derivation_sha256": derivation_sha256,

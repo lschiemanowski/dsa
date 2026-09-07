@@ -477,7 +477,7 @@ async def test_derivation_output_schema_prepares_for_openai(tmp_path: Path) -> N
     )
 
     assert isinstance(completion.outcome, RunSuccess)
-    assert observed["validation"]["required"] == ["format", "cells"]
+    assert observed["validation"]["required"] == ["format", "plots", "cells"]
 
 
 async def test_answer_only_run_keeps_legacy_terminal_and_creates_no_notebook(

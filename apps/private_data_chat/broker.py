@@ -192,6 +192,7 @@ class PrivateDataBroker:
                 question=record.payload.question,
                 answer_schema=record.payload.answer_schema,
                 analysis_guidance=record.payload.analysis_guidance,
+                allow_plots=record.payload.allow_plots,
             )
             running = ProposalRecord.model_validate(
                 {

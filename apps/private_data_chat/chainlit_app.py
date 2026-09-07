@@ -5,7 +5,7 @@ from __future__ import annotations
 from importlib import import_module
 from typing import Any, cast
 
-from apps.private_data_chat.chat import PrivateDataChatSession, render_proposal
+from apps.private_data_chat.chat import ChatResponse, PrivateDataChatSession, render_proposal
 from apps.private_data_chat.clarifier import PydanticClarifier, load_mock_context
 from apps.private_data_chat.contracts import MockDatabaseContext, ProposalRecord
 from apps.private_data_chat.database_card import (
@@ -14,6 +14,7 @@ from apps.private_data_chat.database_card import (
     render_database_overview,
 )
 from apps.private_data_chat.dsa_adapter import DsaAnalysisExecutor
+from apps.private_data_chat.presentation import escape_markdown_text
 from apps.private_data_chat.settings import load_configuration
 
 cl: Any = import_module("chainlit")
@@ -79,6 +80,11 @@ async def on_message(message: Any) -> None:
         return
 
     response = await session.handle(str(message.content), _confirm_proposal)
+    await _send_response(response)
+
+
+async def _send_response(response: ChatResponse) -> None:
+    """Display trusted results; only verified bytes become image/file elements."""
     elements: list[object] = []
     if response.notebook is not None:
         elements.append(
@@ -89,6 +95,19 @@ async def on_message(message: Any) -> None:
             )
         )
     await cl.Message(content=response.content, elements=elements).send()
+    for plot in response.plots:
+        await cl.Message(
+            content=escape_markdown_text(plot.declaration.title)
+            + (
+                "\n\n" + escape_markdown_text(plot.declaration.caption)
+                if plot.declaration.caption
+                else ""
+            ),
+            elements=[
+                cl.Image(name=plot.declaration.filename, content=plot.content, display="inline"),
+                cl.File(name=plot.declaration.filename, content=plot.content, display="inline"),
+            ],
+        ).send()
 
 
 async def _confirm_proposal(proposal: ProposalRecord) -> bool:

@@ -21,6 +21,10 @@ The proposal must use `dsa-question-proposal/v1` and contain:
 - `question`: a self-contained request for the real database;
 - `interpretation`: `measure`, `population`, `group_by`, `filters`, `time_window`, and `units`;
 - `answer_schema`: a Draft 2020-12 JSON Schema for an object answer.
+- `allow_plots`: optional boolean, false by default. Set true when the user requests a
+  chart or agrees to a suggested chart. The trusted model may produce up to three static
+  plots in its verified derivation. Plots supplement the structured answer; describe the
+  requested chart in the question without changing the answer schema to hold images.
 - `analysis_guidance`: optional instructions for performing and checking the analysis, only when
   the host analysis-guidance policy says it is enabled. When present, write it as a numbered list
   of 3 to 8 concise steps. Individual steps may contain SQL or Python snippets, but the complete

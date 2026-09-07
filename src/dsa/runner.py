@@ -209,12 +209,10 @@ async def _run_canonical_analysis(
     run_directory.mkdir(mode=0o700)
 
     try:
-        working_database, source_database_sha256, pristine_database = (
-            _prepare_working_database(
-                canonical_request.database_path,
-                run_directory,
-                preserve_pristine=canonical_request.derivation is not None,
-            )
+        working_database, source_database_sha256, pristine_database = _prepare_working_database(
+            canonical_request.database_path,
+            run_directory,
+            preserve_pristine=canonical_request.derivation is not None,
         )
     except _SourceDatabaseError as error:
         outcome = RunFailure(
@@ -471,6 +469,9 @@ async def _run_canonical_analysis(
         try:
             replayed = await replay_derivation(
                 derivation,
+                allow_plots=bool(
+                    canonical_request.derivation and canonical_request.derivation.allow_plots
+                ),
                 source_database=pristine_database,
                 source_database_sha256=source_database_sha256,
                 run_directory=run_directory,
@@ -685,7 +686,18 @@ async def _run_canonical_analysis(
                 artifact_output,
             ],
             instructions=(
-                _INSTRUCTIONS + _DERIVATION_INSTRUCTIONS
+                _INSTRUCTIONS
+                + _DERIVATION_INSTRUCTIONS
+                + (
+                    "\nPlots are allowed but optional: declare zero to three plots with filename, "
+                    "title, and optional caption in the derivation plots field. Use Matplotlib "
+                    "with the Agg backend; save each static PNG to plot_directory / filename. "
+                    "Use safe simple names ending in .png. Maximum 2048 pixels per dimension "
+                    "and 5 MiB combined. The replay-generated plots are embedded in the verified "
+                    "notebook. Plots supplement result; never change the answer schema.\n"
+                    if canonical_request.derivation and canonical_request.derivation.allow_plots
+                    else "\nPlots are disabled: omit plots or use an empty list.\n"
+                )
                 if derivation_requested
                 else _INSTRUCTIONS
             ),
@@ -694,9 +706,7 @@ async def _run_canonical_analysis(
             end_strategy="early",
             tools=tools,
             capabilities=(
-                [PrepareOutputTools(prepare_output_tools)]
-                if derivation_requested
-                else None
+                [PrepareOutputTools(prepare_output_tools)] if derivation_requested else None
             ),
         )
         agent.output_validator(validate_answer)
@@ -777,9 +787,7 @@ async def _run_canonical_analysis(
             working_database=working_database,
             keep_workdir=keep_workdir,
             retained_notebook=(
-                verified_derivation.notebook
-                if verified_derivation is not None
-                else None
+                verified_derivation.notebook if verified_derivation is not None else None
             ),
         )
         retained_error = cast(Any, error)
@@ -1305,13 +1313,13 @@ def _model_visible_tool_result_sizes(
             else:
                 sizes.append(
                     len(
-                    json.dumps(
-                        content,
-                        ensure_ascii=False,
-                        allow_nan=False,
-                        sort_keys=True,
-                        separators=(",", ":"),
-                    ).encode("utf-8")
+                        json.dumps(
+                            content,
+                            ensure_ascii=False,
+                            allow_nan=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ).encode("utf-8")
                     )
                 )
     return sizes

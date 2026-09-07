@@ -107,6 +107,22 @@ class DerivationRequest(ContractModel):
     """Opt into one versioned replayable human-verification derivation."""
 
     format: Literal["dsa-derivation/v1"] = "dsa-derivation/v1"
+    allow_plots: bool = Field(default=False, exclude_if=lambda value: not value)
+
+
+class DerivationPlot(ContractModel):
+    """A declared static plot produced by replay, not a model-supplied image."""
+
+    filename: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}\.png$")
+    title: str = Field(min_length=1, max_length=200)
+    caption: str | None = Field(default=None, max_length=1000)
+
+    @field_validator("title")
+    @classmethod
+    def nonblank_title(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("plot title must not be blank")
+        return value
 
 
 class DerivationMarkdownCell(ContractModel):
@@ -147,6 +163,17 @@ class Derivation(ContractModel):
     """Model-authored notebook cells without outputs or execution metadata."""
 
     format: Literal["dsa-derivation/v1"] = "dsa-derivation/v1"
+    plots: tuple[DerivationPlot, ...] = Field(
+        default=(),
+        max_length=3,
+        exclude_if=lambda value: not value,
+    )
+
+    @field_validator("plots", mode="before")
+    @classmethod
+    def snapshot_plots(cls, value: object) -> object:
+        return tuple(cast(list[object], value)) if isinstance(value, list) else value
+
     cells: tuple[DerivationCell, ...] = Field(
         min_length=2,
         max_length=_MAX_DERIVATION_CELLS,
@@ -161,6 +188,8 @@ class Derivation(ContractModel):
 
     @model_validator(mode="after")
     def validate_human_verification_shape(self) -> Derivation:
+        if len({plot.filename for plot in self.plots}) != len(self.plots):
+            raise ValueError("plot filenames must be distinct")
         if not isinstance(self.cells[0], DerivationMarkdownCell):
             raise ValueError("derivation must begin with an explanatory markdown cell")
         if not isinstance(self.cells[-1], DerivationCodeCell):

@@ -27,6 +27,7 @@ from apps.private_data_chat.contracts import (
     proposal_payload_json,
 )
 from apps.private_data_chat.presentation import escape_markdown_text
+from dsa.plots import VerifiedPlot, notebook_plots
 
 Confirmation = Callable[[ProposalRecord], Awaitable[bool]]
 
@@ -60,6 +61,7 @@ class ChatResponse:
     content: str
     terminal: bool = False
     notebook: NotebookDownload | None = None
+    plots: tuple[VerifiedPlot, ...] = ()
 
 
 class PrivateDataChatSession:
@@ -112,10 +114,7 @@ class PrivateDataChatSession:
                 return ChatResponse(turn.message)
 
             assert turn.proposal is not None
-            if (
-                turn.proposal.analysis_guidance is not None
-                and not self._enable_analysis_guidance
-            ):
+            if turn.proposal.analysis_guidance is not None and not self._enable_analysis_guidance:
                 return ChatResponse(
                     "The proposed analysis could not be prepared safely. Refine the question "
                     "and try again."
@@ -200,6 +199,7 @@ class PrivateDataChatSession:
                 terminal=True,
             )
         notebook = None
+        plots: tuple[VerifiedPlot, ...] = ()
         notebook_note = "No verified derivation notebook was produced."
         if result.notebook is not None:
             try:
@@ -212,6 +212,11 @@ class PrivateDataChatSession:
                 notebook_note = (
                     "A verified notebook was retained, but its download could not be attached."
                 )
+        if notebook is not None:
+            try:
+                plots = notebook_plots(notebook.content)
+            except Exception:
+                notebook_note += " Plot previews could not be attached."
         return ChatResponse(
             "## Result\n\n"
             f"{_json_fence(result.answer)}\n\n"
@@ -219,6 +224,7 @@ class PrivateDataChatSession:
             "This analysis is complete. Start a new conversation for another question.",
             terminal=True,
             notebook=notebook,
+            plots=plots,
         )
 
 

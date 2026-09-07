@@ -171,3 +171,10 @@ clarifier's behavior; the parsed contracts, confirmation digest, and trusted ada
 actual boundary.
 
 See [THREAT_MODEL.md](THREAT_MODEL.md) for the boundary assumptions and demo limitations.
+
+## Optional plots
+
+Ask for a chart and review `allow_plots: true` in the proposal before approving.
+The trusted analysis may return up to three static PNGs alongside the answer, with
+downloads and embedded outputs in the verified notebook. Plots never return to the
+untrusted clarifier. See the [plot contract](../../docs/plots.md) for limits and scope.

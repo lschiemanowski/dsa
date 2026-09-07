@@ -97,6 +97,7 @@ class ProposalPayload(AppContract):
 
     format: Literal["dsa-question-proposal/v1"] = "dsa-question-proposal/v1"
     question: str = Field(min_length=1, max_length=8_000)
+    allow_plots: bool = Field(default=False, exclude_if=lambda value: not value)
     interpretation: QuantitativeInterpretation
     answer_schema: dict[str, JsonValue]
     analysis_guidance: str | None = Field(
@@ -182,6 +183,7 @@ class AnalysisRequest(AppContract):
         max_length=_MAX_ANALYSIS_GUIDANCE_LENGTH,
     )
     request_derivation: Literal[True] = True
+    allow_plots: bool = Field(default=False, exclude_if=lambda value: not value)
 
     @field_validator("analysis_guidance")
     @classmethod

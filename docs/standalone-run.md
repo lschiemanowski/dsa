@@ -58,6 +58,9 @@ experiment. Reporting failure does not change the local analysis outcome.
 
 ### Optional verified derivation
 
+For optional static plots, use `DerivationRequest(allow_plots=True)`. See the
+[plot contract](plots.md) for limits, notebook embedding, and privacy implications.
+
 Set `derivation=DerivationRequest()` on `RunRequest` when this task should ask for a
 concise human-verification derivation. Leaving the field unset preserves the answer-only
 contract. For example:

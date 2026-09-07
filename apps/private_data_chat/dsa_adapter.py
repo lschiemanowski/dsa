@@ -30,9 +30,10 @@ from dsa import (
     run_analysis,
 )
 from dsa.environment import PythonExecutor
+from dsa.plots import MAX_NOTEBOOK_BYTES
 from dsa.record import RetainedDerivationNotebook, RetainedTerminalRecord
 
-_MAX_NOTEBOOK_BYTES = 2 * 1024 * 1024
+_MAX_NOTEBOOK_BYTES = MAX_NOTEBOOK_BYTES
 
 
 class DsaRuntimeConfiguration(AppContract):
@@ -97,7 +98,7 @@ class DsaAnalysisExecutor:
                 database_path=self.configuration.database_path,
                 question=_trusted_question(request),
                 answer_schema=request.answer_schema,
-                derivation=DerivationRequest(),
+                derivation=DerivationRequest(allow_plots=request.allow_plots),
                 model=ModelConfiguration(
                     name=self.configuration.trusted_model_name,
                     settings=self.configuration.trusted_model_settings,
