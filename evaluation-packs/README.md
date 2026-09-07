@@ -27,7 +27,7 @@ have no versions. Existing commit-pinned references still resolve historical dat
 Download a current dataset with:
 
 ```bash
-uv run hf download lschiemanowski/dsa-datasets --repo-type dataset \
+uv run --extra huggingface hf download lschiemanowski/dsa-datasets --repo-type dataset \
   --revision f45a22879769fc02731f3dc55d126a8d6705d4b9 \
   --include 'online-retail-ii/*' --local-dir data
 ```
