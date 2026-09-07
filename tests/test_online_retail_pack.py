@@ -1,4 +1,4 @@
-"""Pinned identity and opt-in live verification of Online Retail II 1.0.0."""
+"""Pinned identity and opt-in live verification of Online Retail II 1.1.0."""
 
 from __future__ import annotations
 
@@ -13,8 +13,8 @@ from dsa import ModelConfiguration, RunPolicy, RunRequest, RunSuccess, run_analy
 from dsa.pack import HuggingFacePackReference, load_huggingface_evaluation_pack
 
 ROOT = Path(__file__).resolve().parents[1]
-LOCATOR = ROOT / "evaluation-packs/online-retail-ii-1.0.0.json"
-CASE_IDS = (
+LOCATOR = ROOT / "evaluation-packs/online-retail-ii-1.1.0.json"
+LEGACY_CASE_IDS = (
     "cohort-01",
     "cohort-02",
     "cohort-04",
@@ -47,10 +47,10 @@ def test_repository_pins_one_exact_public_pack_revision() -> None:
     value = reference()
 
     assert value.repo_id == "lschiemanowski/dsa-datasets"
-    assert value.revision == "897212ab5d9ad03631abccb5cc3e93f6a4396e65"
-    assert value.path == "online-retail-ii/1.0.0"
+    assert value.revision == "58958007cdf38eb9e563356f16ecd8011d5a3d67"
+    assert value.path == "online-retail-ii/1.1.0"
     assert value.manifest_sha256 == (
-        "703a821304f96a1ca7e301dcb5391a2c858ff4c265a2283d14739ef003e3e33d"
+        "d514cc6083264c0edabe9360d60949465ba8a97955a6378cbc088a1fffb75d30"
     )
     assert not (ROOT / "evaluation-packs/cases.jsonl").exists()
     assert not (ROOT / "evaluation-packs/online_retail_ii.duckdb").exists()
@@ -66,14 +66,27 @@ async def test_exact_public_online_retail_pack_download(tmp_path: Path) -> None:
     pack = load_huggingface_evaluation_pack(reference())
 
     assert pack.manifest.pack_id == "online-retail-ii"
-    assert pack.manifest.version == "1.0.0"
+    assert pack.manifest.version == "1.1.0"
     assert pack.manifest.database.sha256 == (
         "7439eff27b091d2cb4622ca9320e7f6aefccdc72af1895f983d838c7a518cbaf"
     )
     assert pack.manifest.cases.sha256 == (
-        "5cb9492096e7b8a7d3cbb5b033df42a51c30666eb1dcbb9aa1cf1faa17b06219"
+        "fb9b4e1b70bd2e5e8e5075f0344fc399e82b30c4e7c087e2db9f2ebe03be7618"
     )
-    assert tuple(case.case_id for case in pack.cases) == CASE_IDS
+    assert len(pack.cases) == 100
+    assert tuple(case.case_id for case in pack.cases[:20]) == LEGACY_CASE_IDS
+    assert all(case.case_id.startswith("retail-v2-") for case in pack.cases[20:])
+    families = {case.metadata.family for case in pack.cases}
+    assert {
+        "basket-analysis",
+        "customer-retention",
+        "data-quality",
+        "geography",
+        "market-basket",
+        "product-performance",
+        "returns",
+        "time-series",
+    } <= families
     assert pack.database_path.is_file()
     assert not pack.database_path.is_symlink()
 
