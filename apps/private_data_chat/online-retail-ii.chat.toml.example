@@ -5,7 +5,7 @@
 format = "dsa-private-data-chat-config/v1"
 data_source_id = "online_retail_ii"
 mock_context_path = "apps/private_data_chat/mock-database.example.json"
-database_path = "data/online-retail-ii/1.0.0/database/online_retail_ii.duckdb"
+database_path = "data/online-retail-ii/database/online_retail_ii.duckdb"
 runs_directory = ".private-data-chat/runs"
 docker_image = "dsa-python@sha256:replace-with-local-image-digest"
 enable_analysis_guidance = false
@@ -15,8 +15,8 @@ report_to_mlflow = false
 [database_card]
 format = "dsa-huggingface-database-card/v1"
 repo_id = "lschiemanowski/dsa-datasets"
-revision = "d158855c9b240d1fcc470b7835fe6e255bef6d0f"
-path = "online-retail-ii/1.0.0/database-card.json"
+revision = "f45a22879769fc02731f3dc55d126a8d6705d4b9"
+path = "online-retail-ii/database-card.json"
 sha256 = "1148ccca3d69e5e256f32418dbd40b3fb4facf07f1cdd1a078bd87c5d7a4a6de"
 
 # This model receives only bounded conversation text, the public card, and synthetic rows.

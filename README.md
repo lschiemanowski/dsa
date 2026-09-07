@@ -38,7 +38,7 @@ Hugging Face packs and native MLflow evaluation path:
 - an operator-only `report_to_mlflow` flag with context-local Pydantic AI tracing
 - exact terminal-record and artifact-manifest metadata export to MLflow
 - native MLflow Evaluation Datasets with lossless host-only expectations and pack scorers
-- one immutable public Online Retail II pack containing twenty evaluation cases
+- three immutable public evaluation packs containing 100 revised cases each
 - exact Hugging Face repository revision, manifest, case-export, and database identities
 - immutable content-addressed benchmark studies and deterministic matrix expansion
 - fresh subprocesses and private attempts for every pack-model-repetition cell
@@ -126,9 +126,11 @@ completion = await run_analysis(
 )
 ```
 
-The repository pins Online Retail II 1.0.0 through
-`evaluation-packs/online-retail-ii-1.0.0.json`. Load it from its exact public Hugging
-Face commit, then bind the machine-local model and policy only when evaluating:
+The repository pins the current 100-problem Online Retail II pack through
+`evaluation-packs/online-retail-ii.json`. See the [current pack index](evaluation-packs/README.md)
+for all three revised packs and download instructions. Older version-named locators
+are historical. Load the current pack from its exact public Hugging Face commit,
+then bind the machine-local model and policy only when evaluating:
 
 ```python
 from pathlib import Path
@@ -140,7 +142,7 @@ from dsa import (
 )
 
 reference = HuggingFacePackReference.model_validate_json(
-    Path("evaluation-packs/online-retail-ii-1.0.0.json").read_bytes()
+    Path("evaluation-packs/online-retail-ii.json").read_bytes()
 )
 pack = load_huggingface_evaluation_pack(reference)
 result = run_mlflow_evaluation(
