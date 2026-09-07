@@ -21,8 +21,8 @@ either model is called.
    synthetic `MockDatabaseContext`, and an optional digest-pinned database card;
 2. the clarifier asks questions until it emits a validated quantitative proposal, optionally with
    untrusted analysis guidance when the host enables it;
-3. Chainlit retains a lossless TOML presentation of the proposal as an ordinary chat
-   message (with the answer schema embedded as JSON), then shows native
+3. Chainlit retains the proposal as an ordinary chat message, with request fields in
+   TOML and the answer schema in a separate formatted JSON block, then shows native
    confirmation actions in a separate transient prompt;
 4. exact confirmation invokes the host-owned `DsaAnalysisExecutor` against the real database;
 5. the application returns the structured answer and attaches a notebook download when DSA

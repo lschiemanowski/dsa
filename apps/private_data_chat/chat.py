@@ -247,8 +247,9 @@ def render_proposal(proposal: ProposalRecord) -> str:
         "the approved content below to the trusted DSA boundary.\n\n"
         f"{guidance_section}"
         "## Exact approved proposal\n\n"
-        "The answer schema is embedded as JSON to preserve its exact types.\n\n"
-        f"{render_proposal_toml(payload)}"
+        f"{render_proposal_toml(payload)}\n\n"
+        "### Answer schema\n\n"
+        f"{_json_fence(payload['answer_schema'])}"
     )
 
 
@@ -269,17 +270,9 @@ def _json_fence(value: JsonValue | object) -> str:
 
 
 def render_proposal_toml(payload: dict[str, JsonValue]) -> str:
-    """Project proposal fields losslessly into a safe TOML code block."""
-    # JSON Schema can contain nulls, which TOML cannot represent. Keep the entire
-    # schema lossless as JSON rather than translating only some schema shapes.
+    """Render request fields as TOML; the schema is displayed separately as JSON."""
     displayed = dict(payload)
-    schema = displayed.pop("answer_schema")
-    displayed["answer_schema_json"] = json.dumps(
-        schema,
-        ensure_ascii=False,
-        allow_nan=False,
-        indent=2,
-    )
+    displayed.pop("answer_schema")
     rendered = tomli_w.dumps(displayed, multiline_strings=True).rstrip()
     # TOML multiline strings normalize CRLF. Keep the approved text exact.
     if tomllib.loads(rendered) != displayed:
