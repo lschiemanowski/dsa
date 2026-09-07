@@ -114,7 +114,7 @@ async def _confirm_proposal(proposal: ProposalRecord) -> bool:
     """Persist the proposal before showing the transient native action prompt."""
     await cl.Message(content=render_proposal(proposal)).send()
     response = await cl.AskActionMessage(
-        content=f"Run proposal `{proposal.proposal_sha256}` against the private database?",
+        content="Run this proposal against the private database?",
         actions=[
             cl.Action(
                 name="dsa_approve",

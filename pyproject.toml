@@ -13,6 +13,7 @@ dependencies = [
     "pydantic>=2.12,<3",
     "pydantic-ai-slim[openai]>=1.107,<2",
     "referencing>=0.37,<1",
+    "tomli-w>=1.2,<2",
 ]
 
 [project.scripts]

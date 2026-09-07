@@ -5,11 +5,13 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import tomllib
 from collections.abc import Awaitable, Callable, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from typing import Protocol
 
+import tomli_w
 from pydantic import JsonValue
 
 from apps.private_data_chat.broker import InMemoryProposalStore, PrivateDataBroker
@@ -229,11 +231,11 @@ class PrivateDataChatSession:
 
 
 def render_proposal(proposal: ProposalRecord) -> str:
-    """Render exactly the validated payload and its host-computed digest."""
+    """Render the validated content; the approval digest stays internal."""
     payload = proposal_payload_json(proposal.payload)
     guidance = proposal.payload.analysis_guidance
     guidance_section = (
-        "## Proposed analysis guidance (untrusted)\n\n"
+        "## Proposed analysis guidance\n\n"
         "This was produced from synthetic data only. The trusted model may correct or "
         "ignore it.\n\n"
         f"{_markdown_quote(guidance)}\n\n"
@@ -245,8 +247,8 @@ def render_proposal(proposal: ProposalRecord) -> str:
         "the approved content below to the trusted DSA boundary.\n\n"
         f"{guidance_section}"
         "## Exact approved proposal\n\n"
-        f"{_json_fence(payload)}\n\n"
-        f"Proposal digest: `{proposal.proposal_sha256}`"
+        "The answer schema is embedded as JSON to preserve its exact types.\n\n"
+        f"{render_proposal_toml(payload)}"
     )
 
 
@@ -263,9 +265,32 @@ def _closed_message() -> str:
 
 def _json_fence(value: JsonValue | object) -> str:
     rendered = json.dumps(value, ensure_ascii=False, allow_nan=False, indent=2, sort_keys=True)
+    return _code_fence(rendered, "json")
+
+
+def render_proposal_toml(payload: dict[str, JsonValue]) -> str:
+    """Project proposal fields losslessly into a safe TOML code block."""
+    # JSON Schema can contain nulls, which TOML cannot represent. Keep the entire
+    # schema lossless as JSON rather than translating only some schema shapes.
+    displayed = dict(payload)
+    schema = displayed.pop("answer_schema")
+    displayed["answer_schema_json"] = json.dumps(
+        schema,
+        ensure_ascii=False,
+        allow_nan=False,
+        indent=2,
+    )
+    rendered = tomli_w.dumps(displayed, multiline_strings=True).rstrip()
+    # TOML multiline strings normalize CRLF. Keep the approved text exact.
+    if tomllib.loads(rendered) != displayed:
+        rendered = tomli_w.dumps(displayed, multiline_strings=False).rstrip()
+    return _code_fence(rendered, "toml")
+
+
+def _code_fence(rendered: str, language: str) -> str:
     longest = max((len(run) for run in re.findall(r"`+", rendered)), default=0)
     fence = "`" * max(3, longest + 1)
-    return f"{fence}json\n{rendered}\n{fence}"
+    return f"{fence}{language}\n{rendered}\n{fence}"
 
 
 def _markdown_quote(value: str) -> str:

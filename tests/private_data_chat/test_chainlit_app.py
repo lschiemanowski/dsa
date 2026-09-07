@@ -186,7 +186,7 @@ async def test_confirmation_keeps_proposal_persistent_and_uses_a_small_action_pr
 
     assert await application._confirm_proposal(record) is True
     assert "analysis_guidance" in messages[0]
-    assert record.proposal_sha256 in messages[0]
+    assert record.proposal_sha256 not in messages[0]
     assert messages[1] == "Running the approved analysis…"
-    assert prompts == [f"Run proposal `{record.proposal_sha256}` against the private database?"]
+    assert prompts == ["Run this proposal against the private database?"]
     assert payload.question not in prompts[0]

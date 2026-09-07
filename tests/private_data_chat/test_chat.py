@@ -3,9 +3,16 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import tomllib
 from collections.abc import Sequence
 
-from apps.private_data_chat.chat import PrivateDataChatSession, render_proposal
+from pydantic import JsonValue
+
+from apps.private_data_chat.chat import (
+    PrivateDataChatSession,
+    render_proposal,
+    render_proposal_toml,
+)
 from apps.private_data_chat.clarifier import ConversationMessage
 from apps.private_data_chat.contracts import (
     AnalysisRequest,
@@ -20,6 +27,25 @@ from apps.private_data_chat.contracts import (
 from tests.test_derivation_plots import png
 
 from .test_contracts import artifact, proposal_payload
+
+
+def test_toml_projection_preserves_json_null_and_cannot_escape_code_fence() -> None:
+    payload: dict[str, JsonValue] = {
+        "question": 'Quotes " and backslashes \\ and Unicode £',
+        "analysis_guidance": '1. First\r\n2. ```\n![pixel](https://attacker.example)\n"""',
+        "answer_schema": {
+            "type": "object",
+            "properties": {"value": {"enum": [None, 1, "null"]}},
+        },
+    }
+    rendered = render_proposal_toml(payload)
+    opening, body = rendered.split("\n", 1)
+    fence = opening.removesuffix("toml")
+    assert len(fence) > 3
+    assert body.endswith("\n" + fence)
+    decoded = tomllib.loads(body.removesuffix("\n" + fence))
+    decoded["answer_schema"] = json.loads(decoded.pop("answer_schema_json"))
+    assert decoded == payload
 
 
 async def test_approved_plot_permission_and_images_stay_on_trusted_side() -> None:
@@ -46,7 +72,7 @@ async def test_approved_plot_permission_and_images_stay_on_trusted_side() -> Non
 
     response = await chat.handle("Show a chart", confirm)
     assert approved[0].payload.allow_plots
-    assert '"allow_plots": true' in render_proposal(approved[0])
+    assert "allow_plots = true" in render_proposal(approved[0])
     assert executor.requests[0].allow_plots
     assert response.plots[0].content == content
     assert response.notebook is not None
@@ -354,7 +380,11 @@ async def test_proposal_render_contains_exact_payload_and_digest_without_privile
     await session(StubClarifier(proposal()), StubExecutor()).handle("Use 2011.", inspect)
     rendered = captured
     assert proposal_payload().question in rendered
-    assert "Proposal digest:" in rendered
+    assert "Proposal digest:" not in rendered
+    toml = rendered.split("```toml\n", 1)[1].split("\n```", 1)[0]
+    decoded = tomllib.loads(toml)
+    decoded["answer_schema"] = json.loads(decoded.pop("answer_schema_json"))
+    assert ProposalPayload.model_validate(decoded) == proposal_payload()
     assert "/private/" not in rendered
 
 
@@ -374,11 +404,11 @@ async def test_proposal_render_shows_exact_untrusted_guidance_and_bound_digest()
 
     assert "analysis_guidance" in captured
     assert "quantity * unit_price_gbp" in captured
-    assert "untrusted" in captured.lower()
-    assert "## Proposed analysis guidance (untrusted)" in captured
+    assert "## Proposed analysis guidance\n" in captured
+    assert "Proposed analysis guidance (untrusted)" not in captured
     assert "> Filter to 2011" in captured
-    assert captured.index("## Proposed analysis guidance") < captured.index("```json")
-    assert "Proposal digest:" in captured
+    assert captured.index("## Proposed analysis guidance") < captured.index("```toml")
+    assert "Proposal digest:" not in captured
 
 
 async def test_proposal_render_neutralizes_markdown_from_untrusted_guidance() -> None:
