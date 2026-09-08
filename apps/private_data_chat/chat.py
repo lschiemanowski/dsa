@@ -273,6 +273,14 @@ def render_proposal_toml(payload: dict[str, JsonValue]) -> str:
     """Render request fields as TOML; the schema is displayed separately as JSON."""
     displayed = dict(payload)
     displayed.pop("answer_schema")
+    interpretation = displayed.get("interpretation")
+    if isinstance(interpretation, dict):
+        # TOML has no null. These optional fields default to None when omitted;
+        # omit them only in the display, without mutating the approved payload.
+        displayed["interpretation"] = {
+            key: value for key, value in interpretation.items()
+            if key not in {"time_window", "units"} or value is not None
+        }
     rendered = tomli_w.dumps(displayed, multiline_strings=True).rstrip()
     # TOML multiline strings normalize CRLF. Keep the approved text exact.
     if tomllib.loads(rendered) != displayed:

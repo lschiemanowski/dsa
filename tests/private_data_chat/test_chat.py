@@ -6,6 +6,7 @@ import json
 import tomllib
 from collections.abc import Sequence
 
+import pytest
 from pydantic import JsonValue
 
 from apps.private_data_chat.chat import (
@@ -245,6 +246,49 @@ async def test_exact_confirmation_runs_once_and_then_closes_conversation() -> No
     assert "already complete" in followup.content
     assert len(clarifier.calls) == 1
     assert len(executor.requests) == 1
+
+
+@pytest.mark.parametrize("fields", [
+    {}, {"time_window": None}, {"units": None},
+    {"time_window": None, "units": None},
+    {"time_window": "Calendar year 2024", "units": None},
+    {"time_window": None, "units": "GWh"},
+])
+async def test_nullable_interpretation_renders_and_can_be_approved(
+    fields: dict[str, str | None],
+) -> None:
+    raw = proposal_payload().model_dump(mode="json")
+    raw["interpretation"].pop("time_window")
+    raw["interpretation"].pop("units")
+    raw["interpretation"].update(fields)
+    payload = ProposalPayload.model_validate(raw)
+    before = payload.model_dump_json()
+    executor = StubExecutor()
+    seen: list[ProposalRecord] = []
+
+    async def confirm(record: ProposalRecord) -> bool:
+        rendered = render_proposal(record)
+        toml = rendered.split("```toml\n", 1)[1].split("\n```", 1)[0]
+        decoded = tomllib.loads(toml)
+        schema = rendered.split("```json\n", 1)[1].split("\n```", 1)[0]
+        decoded["answer_schema"] = json.loads(schema)
+        assert ProposalPayload.model_validate(decoded) == payload
+        for field in ("time_window", "units"):
+            if fields.get(field) is None:
+                assert field not in decoded["interpretation"]
+            else:
+                assert decoded["interpretation"][field] == fields[field]
+        seen.append(record)
+        return True
+
+    chat = session(
+        StubClarifier(ClarifierTurn(kind="proposal", message="Ready", proposal=payload)), executor,
+    )
+    result = await chat.handle("Analyze it.", confirm)
+    assert len(seen) == 1
+    assert len(executor.requests) == 1
+    assert result.terminal
+    assert payload.model_dump_json() == before
 
 
 async def test_declined_confirmation_does_not_run_and_allows_refinement() -> None:
