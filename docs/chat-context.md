@@ -64,8 +64,50 @@ receives only the approved request, not this raw public context.
 
 Legacy v1 cards and their historical pins remain readable. Retail's migration keeps
 all approved descriptions, notes, relation definitions, and coverage values unchanged.
-The v2 shape supports other datasets, but SMARD and EEA cards and synthetic examples
-have not been authored as part of this change.
+SMARD and EEA cards and synthetic examples are also published. Their cards describe
+the recommended analysis relations with complete column lists and actual row counts.
+SMARD has two fabricated quarter-hour rows; EEA has two fabricated sampling-point
+rows and their matching city-hour summaries. No observation rows were sampled.
+
+## SMARD and EEA pins
+
+Both datasets' assets are pinned at Hugging Face commit
+`c3dbcd3375a678eee85843f7ad738a1ded9edec3`. These are configuration fragments,
+not complete chat configurations: also set the matching `data_source_id` and trusted
+database path in your existing configuration. Keep your model settings unchanged.
+Do not configure `mock_context_path` together with these remote references.
+
+For SMARD, use `data_source_id = "smard-de-lu-2024"`:
+
+```toml
+[database_card]
+repo_id = "lschiemanowski/dsa-datasets"
+revision = "c3dbcd3375a678eee85843f7ad738a1ded9edec3"
+path = "smard-de-lu-2024/database-card.json"
+sha256 = "221aba0560d42e05cb9759ae88cfc51bad234db0fa34de28dc25ce93b19b9019"
+
+[synthetic_context]
+repo_id = "lschiemanowski/dsa-datasets"
+revision = "c3dbcd3375a678eee85843f7ad738a1ded9edec3"
+path = "smard-de-lu-2024/synthetic-context.json"
+sha256 = "583efd06ebe60398006c660a23168bd58f93ad6193c62c005126cccaa23499b7"
+```
+
+For EEA, use `data_source_id = "eea-air-quality-six-cities-2018-2024"`:
+
+```toml
+[database_card]
+repo_id = "lschiemanowski/dsa-datasets"
+revision = "c3dbcd3375a678eee85843f7ad738a1ded9edec3"
+path = "eea-air-quality-six-cities-2018-2024/database-card.json"
+sha256 = "beabbb895a7794f797f7318772ea1518eba3ba82cde7de4fed144bc469f8990e"
+
+[synthetic_context]
+repo_id = "lschiemanowski/dsa-datasets"
+revision = "c3dbcd3375a678eee85843f7ad738a1ded9edec3"
+path = "eea-air-quality-six-cities-2018-2024/synthetic-context.json"
+sha256 = "83d971bca7b6fa01aa70673ed6bc9b51a1fb9e68da8bf43afd0960b770bc8bbb"
+```
 
 Validate public downloads without making model calls:
 

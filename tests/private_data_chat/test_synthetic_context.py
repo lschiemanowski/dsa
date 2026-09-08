@@ -171,3 +171,42 @@ def test_published_chat_context_and_card_match() -> None:
     validate_context_card(loaded_context, loaded_card)
     assert loaded_card.format == "dsa-database-card/v2"
     assert sum(len(relation.sample_rows) for relation in loaded_context.relations) == 2
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(os.environ.get("DSA_HUGGINGFACE_TEST") != "1", reason="opt-in HF chat context")
+@pytest.mark.parametrize(
+    "dataset,card_digest,context_digest,relation_count,sample_count",
+    [
+        (
+            "smard-de-lu-2024",
+            "221aba0560d42e05cb9759ae88cfc51bad234db0fa34de28dc25ce93b19b9019",
+            "583efd06ebe60398006c660a23168bd58f93ad6193c62c005126cccaa23499b7",
+            2, 2,
+        ),
+        (
+            "eea-air-quality-six-cities-2018-2024",
+            "beabbb895a7794f797f7318772ea1518eba3ba82cde7de4fed144bc469f8990e",
+            "83d971bca7b6fa01aa70673ed6bc9b51a1fb9e68da8bf43afd0960b770bc8bbb",
+            5, 4,
+        ),
+    ],
+)
+def test_published_smard_and_eea_context(
+    dataset: str, card_digest: str, context_digest: str,
+    relation_count: int, sample_count: int,
+) -> None:
+    revision = "c3dbcd3375a678eee85843f7ad738a1ded9edec3"
+    card = load_database_card(HuggingFaceDatabaseCardReference(
+        repo_id="lschiemanowski/dsa-datasets", revision=revision,
+        path=f"{dataset}/database-card.json", sha256=card_digest,
+    ))
+    synthetic = load_synthetic_context(HuggingFaceSyntheticContextReference(
+        repo_id="lschiemanowski/dsa-datasets", revision=revision,
+        path=f"{dataset}/synthetic-context.json", sha256=context_digest,
+    ))
+    validate_context_card(synthetic, card)
+    assert card.data_source_id == dataset
+    assert len(card.relations) == relation_count
+    assert sum(len(relation.sample_rows) for relation in synthetic.relations) == sample_count
+    assert "synthetic examples only" in synthetic.display_name
