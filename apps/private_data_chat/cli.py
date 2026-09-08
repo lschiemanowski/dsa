@@ -15,6 +15,7 @@ from pydantic import ValidationError
 from apps.private_data_chat.clarifier import load_mock_context
 from apps.private_data_chat.database_card import load_database_card
 from apps.private_data_chat.settings import load_configuration
+from apps.private_data_chat.synthetic_context import validate_context_card
 from dsa.cli import HelpRequested, Parser, emit
 
 Launcher = Callable[[Sequence[str], Mapping[str, str]], int]
@@ -36,6 +37,7 @@ _SAFE_CONFIGURATION_FIELDS = frozenset(
         "revision",
         "runs_directory",
         "settings",
+        "synthetic_context",
         "sha256",
         "trusted",
     }
@@ -72,7 +74,9 @@ def main(
         _emit_preflight_failure("configuration", error)
         return 2
     try:
-        context = load_mock_context(configuration.mock_context_path)
+        context = load_mock_context(
+            configuration.mock_context_path, configuration.synthetic_context
+        )
         if context.data_source_id != configuration.data_source_id:
             raise ValueError("mock and configured data source IDs differ")
     except Exception as error:
@@ -80,7 +84,8 @@ def main(
         return 2
     if configuration.database_card is not None:
         try:
-            load_database_card(configuration.database_card)
+            card = load_database_card(configuration.database_card)
+            validate_context_card(context, card)
         except Exception as error:
             _emit_preflight_failure("database_card", error)
             return 2

@@ -12,7 +12,7 @@ from apps.private_data_chat.clarifier import (
     append_history,
     load_mock_context,
 )
-from apps.private_data_chat.contracts import ClarifierTurn, MockDatabaseContext
+from apps.private_data_chat.contracts import ClarifierTurn, MockDatabaseContext, ProposalPayload
 from dsa import ModelConfiguration
 from tests.private_data_chat.test_database_card import MODEL_ONLY_NOTE, card
 
@@ -35,7 +35,18 @@ async def test_clarifier_receives_only_skill_mock_context_history_and_safe_model
 
     clarifier = PydanticClarifier(
         ModelConfiguration(name="openai:untrusted", settings={"temperature": 0.2}),
-        mock_context(),
+        MockDatabaseContext.model_validate(
+            {
+                **mock_context().model_dump(mode="python"),
+                "relations": [
+                    {
+                        "name": "analysis.lines",
+                        "columns": ["invoice_id", "quantity"],
+                        "sample_rows": [{"invoice_id": "FAKE-1001", "quantity": 2}],
+                    }
+                ],
+            }
+        ),
         database_card=card(),
         runner=runner,
     )
@@ -80,6 +91,16 @@ async def test_clarifier_can_be_instructed_to_propose_untrusted_analysis_guidanc
     assert "Analysis guidance is enabled" in calls[0]
     assert "numbered list of 3 to 8 steps" in calls[0]
     assert "must not claim" in calls[0]
+    assert "Do not claim that notebooks cannot be delivered" in calls[0]
+    assert "Do not add annual totals" in calls[0]
+    assert "return a full" in calls[0]
+    schema = json.loads(calls[0].split("```json\n", 1)[1].split("```", 1)[0])
+    proposal = ProposalPayload.model_validate({
+        "question": "Report monthly values.",
+        "interpretation": {"measure": "monthly value", "population": "available rows"},
+        "answer_schema": schema,
+    })
+    assert proposal.answer_schema == schema
 
 
 def test_clarifier_revalidates_a_mutated_typed_database_card() -> None:
@@ -108,15 +129,12 @@ async def test_clarifier_revalidates_untrusted_structured_output() -> None:
         runner=runner,
     )
     with pytest.raises(ValidationError, match="only proposal turns"):
-        await clarifier.clarify(
-            (ConversationMessage(role="user", content="Analyze it."),)
-        )
+        await clarifier.clarify((ConversationMessage(role="user", content="Analyze it."),))
 
 
 def test_history_is_bounded_to_newest_messages_and_utf8_bytes() -> None:
     history = tuple(
-        ConversationMessage(role="user", content=f"message-{index}")
-        for index in range(40)
+        ConversationMessage(role="user", content=f"message-{index}") for index in range(40)
     )
     history = append_history(history, "assistant", "é" * 10_000)
 

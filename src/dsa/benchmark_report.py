@@ -49,6 +49,7 @@ from dsa.evaluation import (
 )
 from dsa.mlflow_config import MlflowConfigurationError, load_mlflow_destination
 from dsa.pack import LoadedEvaluationPack, load_huggingface_evaluation_pack
+from dsa.plots import MAX_NOTEBOOK_BYTES
 from dsa.record import (
     DerivationVerification,
     FailureStage,
@@ -96,7 +97,7 @@ _REPORT_MARKDOWN_BYTES = 64 * 1024 * 1024
 _MAX_REPORT_CASE_EXECUTIONS = 100_000
 _RECEIPT_BYTES = 64 * 1024 * 1024
 _TERMINAL_BYTES = 64 * 1024 * 1024
-_DERIVATION_NOTEBOOK_BYTES = 2 * 1024 * 1024
+_DERIVATION_NOTEBOOK_BYTES = MAX_NOTEBOOK_BYTES
 _MAX_CELL_ATTEMPTS = 10_000
 
 

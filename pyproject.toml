@@ -8,10 +8,12 @@ dependencies = [
     "duckdb==1.5.5",
     "jsonschema>=4.25,<5",
     "nbformat>=5.10,<6",
+    "pillow>=12.3,<13",
     "pyarrow==25.0.1",
     "pydantic>=2.12,<3",
     "pydantic-ai-slim[openai]>=1.107,<2",
     "referencing>=0.37,<1",
+    "tomli-w>=1.2,<2",
 ]
 
 [project.scripts]

@@ -6,3 +6,17 @@
 .watermark {
   display: none !important;
 }
+
+/* Chainlit 2.12 applies the same inline width to messages and the composer. */
+[style*="max-width: min(48rem, 100vw)"] {
+  max-width: min(60rem, 100vw) !important;
+}
+
+/* Keep structured proposals readable without changing their copied contents. */
+.message-content pre,
+.message-content pre code,
+.message-content pre code span {
+  white-space: pre-wrap !important;
+  overflow-wrap: anywhere;
+  word-break: normal;
+}

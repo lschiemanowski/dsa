@@ -102,6 +102,7 @@ class ArtifactRecord(ContractModel):
         if path.name.split(".", 1)[0] != self.handle:
             raise ValueError("artifact path must be named by its handle")
         expected_suffix = {
+            "image/png": ".png",
             "application/json": ".json",
             "application/vnd.apache.parquet": ".parquet",
         }.get(self.media_type)
@@ -156,11 +157,13 @@ class TerminalRecord(ContractModel):
             if (not derivation_requested and derivation_present) or derivation_present != (
                 verification is not None
             ):
-                raise ValueError(
-                    "successful terminal derivation must be requested and verified"
-                )
+                raise ValueError("successful terminal derivation must be requested and verified")
             if derivation_present:
                 assert self.outcome.derivation is not None
+                if self.outcome.derivation.plots and (
+                    self.request.derivation is None or not self.request.derivation.allow_plots
+                ):
+                    raise ValueError("terminal plots require explicit permission")
                 assert verification is not None
                 derivation_bytes = _canonical_json_bytes(
                     self.outcome.derivation.model_dump(mode="json")
@@ -172,12 +175,9 @@ class TerminalRecord(ContractModel):
                     raise ValueError("derivation result digest contradicts terminal answer")
                 if (
                     self.database is None
-                    or verification.source_database_sha256
-                    != self.database.source_sha256
+                    or verification.source_database_sha256 != self.database.source_sha256
                 ):
-                    raise ValueError(
-                        "derivation source digest contradicts terminal database"
-                    )
+                    raise ValueError("derivation source digest contradicts terminal database")
         expected_handles = [f"a{index}" for index in range(1, len(self.artifacts) + 1)]
         if [artifact.handle for artifact in self.artifacts] != expected_handles:
             raise ValueError("artifact handles must be unique and sequential")
@@ -207,9 +207,7 @@ def validate_retained_derivation_notebook(
 ) -> None:
     """Require one exact notebook reference for one verified derivation success."""
     verification = (
-        record.outcome.derivation_verification
-        if isinstance(record.outcome, RunSuccess)
-        else None
+        record.outcome.derivation_verification if isinstance(record.outcome, RunSuccess) else None
     )
     if verification is None:
         if retained_notebook is not None:

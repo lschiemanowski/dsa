@@ -105,6 +105,9 @@ def test_launches_packaged_application_with_an_explicit_config(
     assert ui_configuration["UI"]["default_theme"] == "dark"
     assert ui_configuration["UI"]["logo_file_url"] == "/public/dsa-mark.svg"
     assert ui_configuration["UI"]["default_avatar_file_url"] == "/public/dsa-mark.svg"
+    public = application_root / "public"
+    assert (public / "favicon.svg").read_bytes() == (public / "dsa-mark.svg").read_bytes()
+    assert 'stroke="#fff"' not in (public / "dsa-mark.svg").read_text()
     assert environment["OPENAI_API_KEY"] == "SECRET"
 
 
@@ -268,3 +271,13 @@ def test_database_card_download_failure_is_safely_classified(
         "stage": "database_card",
         "status": "rejected",
     }
+
+
+def test_chat_styles_widen_layout_and_wrap_code_without_mutating_content() -> None:
+    path = Path(__file__).resolve().parents[2] / "apps/private_data_chat/public/dsa.css"
+    css = path.read_text()
+    assert '[style*="max-width: min(48rem, 100vw)"]' in css
+    assert "max-width: min(60rem, 100vw) !important" in css
+    assert ".message-content pre code" in css
+    assert "white-space: pre-wrap !important" in css
+    assert "overflow-wrap: anywhere" in css

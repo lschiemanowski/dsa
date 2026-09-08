@@ -1,9 +1,19 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import json
+import tomllib
 from collections.abc import Sequence
 
-from apps.private_data_chat.chat import PrivateDataChatSession, render_proposal
+import pytest
+from pydantic import JsonValue
+
+from apps.private_data_chat.chat import (
+    PrivateDataChatSession,
+    render_proposal,
+    render_proposal_toml,
+)
 from apps.private_data_chat.clarifier import ConversationMessage
 from apps.private_data_chat.contracts import (
     AnalysisRequest,
@@ -15,8 +25,60 @@ from apps.private_data_chat.contracts import (
     ProposalPayload,
     ProposalRecord,
 )
+from tests.test_derivation_plots import png
 
 from .test_contracts import artifact, proposal_payload
+
+
+def test_toml_projection_preserves_text_and_cannot_escape_code_fence() -> None:
+    payload: dict[str, JsonValue] = {
+        "question": 'Quotes " and backslashes \\ and Unicode £',
+        "analysis_guidance": '1. First\r\n2. ```\n![pixel](https://attacker.example)\n"""',
+        "answer_schema": {
+            "type": "object",
+            "properties": {"value": {"enum": [None, 1, "null"]}},
+        },
+    }
+    rendered = render_proposal_toml(payload)
+    opening, body = rendered.split("\n", 1)
+    fence = opening.removesuffix("toml")
+    assert len(fence) > 3
+    assert body.endswith("\n" + fence)
+    decoded = tomllib.loads(body.removesuffix("\n" + fence))
+    assert decoded == {key: value for key, value in payload.items() if key != "answer_schema"}
+
+
+async def test_approved_plot_permission_and_images_stay_on_trusted_side() -> None:
+    payload = proposal_payload().model_copy(update={"allow_plots": True})
+    clarifier = StubClarifier(ClarifierTurn(kind="proposal", proposal=payload, message="Ready"))
+    content = png()
+    notebook = json.dumps(
+        {
+            "cells": [
+                {
+                    "metadata": {"dsa_plot": {"filename": "counts.png", "title": "Count"}},
+                    "outputs": [{"data": {"image/png": base64.b64encode(content).decode()}}],
+                }
+            ]
+        }
+    ).encode()
+    executor = StubExecutor(notebook=notebook)
+    chat = session(clarifier, executor)
+    approved: list[ProposalRecord] = []
+
+    async def confirm(record: ProposalRecord) -> bool:
+        approved.append(record)
+        return True
+
+    response = await chat.handle("Show a chart", confirm)
+    assert approved[0].payload.allow_plots
+    assert "allow_plots = true" in render_proposal(approved[0])
+    assert executor.requests[0].allow_plots
+    assert response.plots[0].content == content
+    assert response.notebook is not None
+    assert response.terminal
+    await chat.handle("Explain this plot", confirm)
+    assert len(clarifier.calls) == 1
 
 
 class StubClarifier:
@@ -186,6 +248,49 @@ async def test_exact_confirmation_runs_once_and_then_closes_conversation() -> No
     assert len(executor.requests) == 1
 
 
+@pytest.mark.parametrize("fields", [
+    {}, {"time_window": None}, {"units": None},
+    {"time_window": None, "units": None},
+    {"time_window": "Calendar year 2024", "units": None},
+    {"time_window": None, "units": "GWh"},
+])
+async def test_nullable_interpretation_renders_and_can_be_approved(
+    fields: dict[str, str | None],
+) -> None:
+    raw = proposal_payload().model_dump(mode="json")
+    raw["interpretation"].pop("time_window")
+    raw["interpretation"].pop("units")
+    raw["interpretation"].update(fields)
+    payload = ProposalPayload.model_validate(raw)
+    before = payload.model_dump_json()
+    executor = StubExecutor()
+    seen: list[ProposalRecord] = []
+
+    async def confirm(record: ProposalRecord) -> bool:
+        rendered = render_proposal(record)
+        toml = rendered.split("```toml\n", 1)[1].split("\n```", 1)[0]
+        decoded = tomllib.loads(toml)
+        schema = rendered.split("```json\n", 1)[1].split("\n```", 1)[0]
+        decoded["answer_schema"] = json.loads(schema)
+        assert ProposalPayload.model_validate(decoded) == payload
+        for field in ("time_window", "units"):
+            if fields.get(field) is None:
+                assert field not in decoded["interpretation"]
+            else:
+                assert decoded["interpretation"][field] == fields[field]
+        seen.append(record)
+        return True
+
+    chat = session(
+        StubClarifier(ClarifierTurn(kind="proposal", message="Ready", proposal=payload)), executor,
+    )
+    result = await chat.handle("Analyze it.", confirm)
+    assert len(seen) == 1
+    assert len(executor.requests) == 1
+    assert result.terminal
+    assert payload.model_dump_json() == before
+
+
 async def test_declined_confirmation_does_not_run_and_allows_refinement() -> None:
     clarifier = StubClarifier(proposal(), clarification())
     executor = StubExecutor()
@@ -304,8 +409,9 @@ async def test_confirmation_exception_is_a_decline() -> None:
     assert executor.requests == []
 
 
-async def test_proposal_render_contains_exact_payload_and_digest_without_privileged_values(
-) -> None:
+async def test_proposal_render_contains_exact_payload_and_digest_without_privileged_values() -> (
+    None
+):
     # The broker-created record is covered in the async flow; this assertion targets rendering.
     captured = ""
 
@@ -317,7 +423,16 @@ async def test_proposal_render_contains_exact_payload_and_digest_without_privile
     await session(StubClarifier(proposal()), StubExecutor()).handle("Use 2011.", inspect)
     rendered = captured
     assert proposal_payload().question in rendered
-    assert "Proposal digest:" in rendered
+    assert "Proposal digest:" not in rendered
+    toml = rendered.split("```toml\n", 1)[1].split("\n```", 1)[0]
+    decoded = tomllib.loads(toml)
+    schema_json = rendered.split("```json\n", 1)[1].split("\n```", 1)[0]
+    decoded["answer_schema"] = json.loads(schema_json)
+    assert ProposalPayload.model_validate(decoded) == proposal_payload()
+    assert "### Answer schema" in rendered
+    assert '"properties": {' in schema_json
+    assert "answer_schema_json" not in rendered
+    assert "The answer schema is embedded" not in rendered
     assert "/private/" not in rendered
 
 
@@ -337,11 +452,11 @@ async def test_proposal_render_shows_exact_untrusted_guidance_and_bound_digest()
 
     assert "analysis_guidance" in captured
     assert "quantity * unit_price_gbp" in captured
-    assert "untrusted" in captured.lower()
-    assert "## Proposed analysis guidance (untrusted)" in captured
+    assert "## Proposed analysis guidance\n" in captured
+    assert "Proposed analysis guidance (untrusted)" not in captured
     assert "> Filter to 2011" in captured
-    assert captured.index("## Proposed analysis guidance") < captured.index("```json")
-    assert "Proposal digest:" in captured
+    assert captured.index("## Proposed analysis guidance") < captured.index("```toml")
+    assert "Proposal digest:" not in captured
 
 
 async def test_proposal_render_neutralizes_markdown_from_untrusted_guidance() -> None:

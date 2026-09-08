@@ -5,7 +5,7 @@ from __future__ import annotations
 from importlib import import_module
 from typing import Any, cast
 
-from apps.private_data_chat.chat import PrivateDataChatSession, render_proposal
+from apps.private_data_chat.chat import ChatResponse, PrivateDataChatSession, render_proposal
 from apps.private_data_chat.clarifier import PydanticClarifier, load_mock_context
 from apps.private_data_chat.contracts import MockDatabaseContext, ProposalRecord
 from apps.private_data_chat.database_card import (
@@ -14,6 +14,7 @@ from apps.private_data_chat.database_card import (
     render_database_overview,
 )
 from apps.private_data_chat.dsa_adapter import DsaAnalysisExecutor
+from apps.private_data_chat.presentation import escape_markdown_inline, escape_markdown_text
 from apps.private_data_chat.settings import load_configuration
 
 cl: Any = import_module("chainlit")
@@ -27,7 +28,9 @@ async def on_chat_start() -> None:
     """Build one isolated application session from host-owned configuration."""
     try:
         configuration = load_configuration()
-        context = load_mock_context(configuration.mock_context_path)
+        context = load_mock_context(
+            configuration.mock_context_path, configuration.synthetic_context
+        )
         database_card = (
             load_database_card(configuration.database_card)
             if configuration.database_card is not None
@@ -79,6 +82,11 @@ async def on_message(message: Any) -> None:
         return
 
     response = await session.handle(str(message.content), _confirm_proposal)
+    await _send_response(response)
+
+
+async def _send_response(response: ChatResponse) -> None:
+    """Display trusted results; only verified bytes become image/file elements."""
     elements: list[object] = []
     if response.notebook is not None:
         elements.append(
@@ -89,13 +97,26 @@ async def on_message(message: Any) -> None:
             )
         )
     await cl.Message(content=response.content, elements=elements).send()
+    for plot in response.plots:
+        await cl.Message(
+            content=escape_markdown_text(plot.declaration.title)
+            + (
+                "\n\n" + escape_markdown_text(plot.declaration.caption)
+                if plot.declaration.caption
+                else ""
+            ),
+            elements=[
+                cl.Image(name=plot.declaration.filename, content=plot.content, display="inline"),
+                cl.File(name=plot.declaration.filename, content=plot.content, display="inline"),
+            ],
+        ).send()
 
 
 async def _confirm_proposal(proposal: ProposalRecord) -> bool:
     """Persist the proposal before showing the transient native action prompt."""
     await cl.Message(content=render_proposal(proposal)).send()
     response = await cl.AskActionMessage(
-        content=f"Run proposal `{proposal.proposal_sha256}` against the private database?",
+        content="Run this proposal against the private database?",
         actions=[
             cl.Action(
                 name="dsa_approve",
@@ -151,6 +172,7 @@ def _welcome_message(
     clarifier_model_name: str,
 ) -> str:
     """Combine the fixed trust flow with bounded dataset-owned public context."""
+    title = escape_markdown_inline(database_card.title) if database_card else "this database"
     sections = [
         "## Instructions\n\n"
         "This chat interface allows you to ask quantitative questions about a DuckDB in plain "
@@ -164,16 +186,15 @@ def _welcome_message(
         "downloadable Jupyter notebook containing the derivation.\n"
         "5. To prevent data from leaking to the untrusted model, the session ends after the "
         "result is returned. Start a new session to ask another question.",
-        f"## About {context.display_name}",
+        f"## About {title}",
     ]
     if database_card is not None:
         sections.append(render_database_overview(database_card))
     else:
         sections.append(
-            "This configured data source provides a synthetic schema-compatible sample for "
-            "question clarification."
+            "Ask quantitative questions about the configured database."
         )
-    sections.append(f"Ask a question about **{context.display_name}** to begin.")
+    sections.append(f"Ask a question about **{title}** to begin.")
     return "\n\n".join(sections)
 
 

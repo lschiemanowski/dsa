@@ -14,6 +14,7 @@ from pydantic import Field, JsonValue, field_validator, model_validator
 from apps.private_data_chat.contracts import AppContract
 from apps.private_data_chat.database_card import HuggingFaceDatabaseCardReference
 from apps.private_data_chat.dsa_adapter import DsaRuntimeConfiguration
+from apps.private_data_chat.synthetic_context import HuggingFaceSyntheticContextReference
 from dsa import ModelConfiguration
 from dsa.cli import read_contract
 
@@ -22,7 +23,8 @@ class PrivateDataChatConfiguration(AppContract):
     """Separate untrusted clarification inputs from privileged DSA configuration."""
 
     data_source_id: str = Field(pattern=r"^[a-z][a-z0-9_-]{0,127}$")
-    mock_context_path: Path
+    mock_context_path: Path | None = None
+    synthetic_context: HuggingFaceSyntheticContextReference | None = None
     database_card: HuggingFaceDatabaseCardReference | None = None
     clarifier_model: ModelConfiguration
     dsa: DsaRuntimeConfiguration
@@ -30,13 +32,24 @@ class PrivateDataChatConfiguration(AppContract):
 
     @field_validator("mock_context_path")
     @classmethod
-    def require_absolute_mock_path(cls, value: Path) -> Path:
-        if not value.is_absolute():
+    def require_absolute_mock_path(cls, value: Path | None) -> Path | None:
+        if value is not None and not value.is_absolute():
             raise ValueError("mock context path must be absolute")
         return value
 
     @model_validator(mode="after")
     def require_one_data_source(self) -> PrivateDataChatConfiguration:
+        if (self.mock_context_path is None) == (self.synthetic_context is None):
+            raise ValueError("configure exactly one local or Hugging Face synthetic context")
+        if self.synthetic_context is not None and (
+            self.database_card is None
+            or (
+                self.synthetic_context.repo_id,
+                self.synthetic_context.revision,
+            )
+            != (self.database_card.repo_id, self.database_card.revision)
+        ):
+            raise ValueError("remote context and card must pin the same repository revision")
         if self.data_source_id != self.dsa.data_source_id:
             raise ValueError("chat and DSA data source IDs must match")
         return self
@@ -62,7 +75,8 @@ class _ConfiguredModel(AppContract):
 class _FileConfiguration(AppContract):
     format: Literal["dsa-private-data-chat-config/v1"]
     data_source_id: str = Field(pattern=r"^[a-z][a-z0-9_-]{0,127}$")
-    mock_context_path: str = Field(min_length=1, max_length=4096)
+    mock_context_path: str | None = Field(default=None, min_length=1, max_length=4096)
+    synthetic_context: HuggingFaceSyntheticContextReference | None = None
     database_card: HuggingFaceDatabaseCardReference | None = None
     database_path: str = Field(min_length=1, max_length=4096)
     runs_directory: str = Field(min_length=1, max_length=4096)
@@ -74,8 +88,8 @@ class _FileConfiguration(AppContract):
 
     @field_validator("mock_context_path", "database_path", "runs_directory")
     @classmethod
-    def reject_blank_path(cls, value: str) -> str:
-        if not value.strip():
+    def reject_blank_path(cls, value: str | None) -> str | None:
+        if value is not None and not value.strip():
             raise ValueError("configuration paths must not be blank")
         return value
 
@@ -136,7 +150,12 @@ def _load_file_configuration(path: Path) -> PrivateDataChatConfiguration:
     base = absolute_path.parent
     return PrivateDataChatConfiguration(
         data_source_id=configured.data_source_id,
-        mock_context_path=_configured_path(base, configured.mock_context_path),
+        mock_context_path=(
+            _configured_path(base, configured.mock_context_path)
+            if configured.mock_context_path is not None
+            else None
+        ),
+        synthetic_context=configured.synthetic_context,
         database_card=configured.database_card,
         enable_analysis_guidance=configured.enable_analysis_guidance,
         clarifier_model=ModelConfiguration(

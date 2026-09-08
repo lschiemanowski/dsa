@@ -20,14 +20,20 @@ from apps.private_data_chat.contracts import (
     canonical_json_bytes,
 )
 from apps.private_data_chat.database_card import DatabaseCard
+from apps.private_data_chat.synthetic_context import (
+    HuggingFaceSyntheticContextReference,
+    load_synthetic_context,
+    parse_synthetic_context,
+    validate_context_card,
+)
 from dsa import ModelConfiguration
 
 _MAX_CONTEXT_BYTES = 64 * 1024
 _MAX_HISTORY_MESSAGES = 30
 _MAX_HISTORY_BYTES = 64 * 1024
 _MAX_MESSAGE_BYTES = 8 * 1024
-_MAX_CLARIFIER_TOKENS = 32_000
-_MAX_CLARIFIER_SECONDS = 120
+_MAX_CLARIFIER_TOKENS = 64_000
+_MAX_CLARIFIER_SECONDS = 300
 
 
 @dataclass(frozen=True)
@@ -56,9 +62,7 @@ class PydanticClarifier:
         enable_analysis_guidance: bool = False,
         runner: ClarifierRunner | None = None,
     ) -> None:
-        self.configuration = ModelConfiguration.model_validate_json(
-            configuration.model_dump_json()
-        )
+        self.configuration = ModelConfiguration.model_validate_json(configuration.model_dump_json())
         self._instructions = _clarifier_instructions(
             context,
             database_card=database_card,
@@ -99,11 +103,18 @@ def append_history(
     return tuple(retained)
 
 
-def load_mock_context(path: Path) -> MockDatabaseContext:
+def load_mock_context(
+    path: Path | None,
+    reference: HuggingFaceSyntheticContextReference | None = None,
+) -> MockDatabaseContext:
     """Read one bounded, regular, non-symlink synthetic context file."""
-    if not path.is_absolute():
+    if reference is not None:
+        if path is not None:
+            raise ValueError("configure only one synthetic context source")
+        return load_synthetic_context(reference)
+    if path is None or not path.is_absolute():
         raise ValueError("mock context path must be absolute")
-    return MockDatabaseContext.model_validate_json(_read_regular_file(path, _MAX_CONTEXT_BYTES))
+    return parse_synthetic_context(_read_regular_file(path, _MAX_CONTEXT_BYTES))
 
 
 def _clarifier_instructions(
@@ -127,6 +138,7 @@ def _clarifier_instructions(
     database_context = ""
     if database_card is not None:
         selected_card = DatabaseCard.model_validate_json(database_card.model_dump_json())
+        validate_context_card(context, selected_card)
         database_context = (
             "\n\nDataset-owned database card:\n"
             f"{canonical_json_bytes(selected_card).decode('utf-8')}"
@@ -150,7 +162,7 @@ async def _run_pydantic_clarifier(
     prompt: str,
     configuration: ModelConfiguration,
 ) -> ClarifierTurn:
-    settings = {**configuration.settings, "max_tokens": 4_096}
+    settings = {**configuration.settings, "max_tokens": 16_384}
     agent = Agent(
         configuration.name,
         output_type=ClarifierTurn,
@@ -187,6 +199,7 @@ def _read_regular_file(path: Path, limit: int) -> bytes:
     if len(content) > limit:
         raise ValueError("configured file exceeds its byte limit")
     return content
+
 
 def _bounded_text(value: str, limit: int) -> str:
     if not value.strip():

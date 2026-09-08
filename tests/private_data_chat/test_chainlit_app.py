@@ -20,12 +20,50 @@ from tests.private_data_chat.test_database_card import MODEL_ONLY_NOTE, card
 from .test_contracts import proposal_payload
 
 
+async def test_plot_elements_use_verified_bytes_and_escape_labels(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pytest.importorskip("chainlit")
+    from apps.private_data_chat.chat import ChatResponse
+    from dsa.contract import DerivationPlot
+    from dsa.plots import VerifiedPlot
+    from tests.test_derivation_plots import png
+
+    application = importlib.import_module("apps.private_data_chat.chainlit_app")
+    messages: list[dict[str, object]] = []
+
+    class Message:
+        def __init__(self, **kwargs: object) -> None:
+            self.kwargs = kwargs
+
+        async def send(self) -> None:
+            messages.append(self.kwargs)
+
+    def image(**kwargs: object) -> dict[str, object]:
+        return {"kind": "image", **kwargs}
+
+    def file(**kwargs: object) -> dict[str, object]:
+        return {"kind": "file", **kwargs}
+
+    monkeypatch.setattr(application, "cl", SimpleNamespace(Message=Message, Image=image, File=file))
+    content = png()
+    label = "![pixel](https://attacker.example)"
+    plot = VerifiedPlot(DerivationPlot(filename="counts.png", title=label, caption=label), content)
+    await application._send_response(ChatResponse("Answer", terminal=True, plots=(plot,)))
+    assert messages[0]["content"] == "Answer"
+    assert label not in str(messages[1]["content"])
+    assert messages[1]["elements"] == [
+        {"kind": kind, "name": "counts.png", "content": content, "display": "inline"}
+        for kind in ("image", "file")
+    ]
+
+
 def test_welcome_combines_fixed_trust_flow_with_dataset_context() -> None:
     pytest.importorskip("chainlit")
     application = importlib.import_module("apps.private_data_chat.chainlit_app")
     context = MockDatabaseContext(
         data_source_id="retail",
-        display_name="Online Retail II",
+        display_name="Online Retail II — synthetic examples only",
         relations=(MockRelation(name="analysis.lines", columns=("value",)),),
     )
 
@@ -44,12 +82,41 @@ def test_welcome_combines_fixed_trust_flow_with_dataset_context() -> None:
     assert "Review the subagent request" in message
     assert "downloadable Jupyter notebook" in message
     assert "session ends" in message
-    assert "## About Online Retail II" in message
+    assert "## About Retail data" in message
+    assert "Ask a question about **Retail data** to begin." in message
+    assert "synthetic" not in message
     assert r"The original first paragraph\." in message
     assert "### Available data" in message
     assert "1,044,848" in message
     assert r"- How did monthly sales change\?" in message
     assert MODEL_ONLY_NOTE not in message
+
+
+def test_welcome_without_card_keeps_mock_label_internal() -> None:
+    pytest.importorskip("chainlit")
+    application = importlib.import_module("apps.private_data_chat.chainlit_app")
+    context = MockDatabaseContext(
+        data_source_id="example", display_name="Internal synthetic examples only",
+        relations=(MockRelation(name="analysis.lines", columns=("value",)),),
+    )
+    message = application._welcome_message(context, None, "model")
+    assert "## About this database" in message
+    assert "synthetic" not in message
+    assert "Internal" not in message
+
+
+def test_welcome_escapes_database_title() -> None:
+    pytest.importorskip("chainlit")
+    application = importlib.import_module("apps.private_data_chat.chainlit_app")
+    context = MockDatabaseContext(
+        data_source_id="example", display_name="Internal",
+        relations=(MockRelation(name="analysis.lines", columns=("value",)),),
+    )
+    title = "![pixel](https://example.org/image)"
+    message = application._welcome_message(
+        context, card().model_copy(update={"title": title}), "model"
+    )
+    assert title not in message
 
 
 def test_model_display_name_omits_provider_and_routing_qualifiers() -> None:
@@ -148,7 +215,7 @@ async def test_confirmation_keeps_proposal_persistent_and_uses_a_small_action_pr
 
     assert await application._confirm_proposal(record) is True
     assert "analysis_guidance" in messages[0]
-    assert record.proposal_sha256 in messages[0]
+    assert record.proposal_sha256 not in messages[0]
     assert messages[1] == "Running the approved analysis…"
-    assert prompts == [f"Run proposal `{record.proposal_sha256}` against the private database?"]
+    assert prompts == ["Run this proposal against the private database?"]
     assert payload.question not in prompts[0]

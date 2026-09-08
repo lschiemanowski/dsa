@@ -5,11 +5,13 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import tomllib
 from collections.abc import Awaitable, Callable, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from typing import Protocol
 
+import tomli_w
 from pydantic import JsonValue
 
 from apps.private_data_chat.broker import InMemoryProposalStore, PrivateDataBroker
@@ -27,6 +29,7 @@ from apps.private_data_chat.contracts import (
     proposal_payload_json,
 )
 from apps.private_data_chat.presentation import escape_markdown_text
+from dsa.plots import VerifiedPlot, notebook_plots
 
 Confirmation = Callable[[ProposalRecord], Awaitable[bool]]
 
@@ -60,6 +63,7 @@ class ChatResponse:
     content: str
     terminal: bool = False
     notebook: NotebookDownload | None = None
+    plots: tuple[VerifiedPlot, ...] = ()
 
 
 class PrivateDataChatSession:
@@ -112,10 +116,7 @@ class PrivateDataChatSession:
                 return ChatResponse(turn.message)
 
             assert turn.proposal is not None
-            if (
-                turn.proposal.analysis_guidance is not None
-                and not self._enable_analysis_guidance
-            ):
+            if turn.proposal.analysis_guidance is not None and not self._enable_analysis_guidance:
                 return ChatResponse(
                     "The proposed analysis could not be prepared safely. Refine the question "
                     "and try again."
@@ -200,6 +201,7 @@ class PrivateDataChatSession:
                 terminal=True,
             )
         notebook = None
+        plots: tuple[VerifiedPlot, ...] = ()
         notebook_note = "No verified derivation notebook was produced."
         if result.notebook is not None:
             try:
@@ -212,6 +214,11 @@ class PrivateDataChatSession:
                 notebook_note = (
                     "A verified notebook was retained, but its download could not be attached."
                 )
+        if notebook is not None:
+            try:
+                plots = notebook_plots(notebook.content)
+            except Exception:
+                notebook_note += " Plot previews could not be attached."
         return ChatResponse(
             "## Result\n\n"
             f"{_json_fence(result.answer)}\n\n"
@@ -219,15 +226,16 @@ class PrivateDataChatSession:
             "This analysis is complete. Start a new conversation for another question.",
             terminal=True,
             notebook=notebook,
+            plots=plots,
         )
 
 
 def render_proposal(proposal: ProposalRecord) -> str:
-    """Render exactly the validated payload and its host-computed digest."""
+    """Render the validated content; the approval digest stays internal."""
     payload = proposal_payload_json(proposal.payload)
     guidance = proposal.payload.analysis_guidance
     guidance_section = (
-        "## Proposed analysis guidance (untrusted)\n\n"
+        "## Proposed analysis guidance\n\n"
         "This was produced from synthetic data only. The trusted model may correct or "
         "ignore it.\n\n"
         f"{_markdown_quote(guidance)}\n\n"
@@ -239,8 +247,9 @@ def render_proposal(proposal: ProposalRecord) -> str:
         "the approved content below to the trusted DSA boundary.\n\n"
         f"{guidance_section}"
         "## Exact approved proposal\n\n"
-        f"{_json_fence(payload)}\n\n"
-        f"Proposal digest: `{proposal.proposal_sha256}`"
+        f"{render_proposal_toml(payload)}\n\n"
+        "### Answer schema\n\n"
+        f"{_json_fence(payload['answer_schema'])}"
     )
 
 
@@ -257,9 +266,32 @@ def _closed_message() -> str:
 
 def _json_fence(value: JsonValue | object) -> str:
     rendered = json.dumps(value, ensure_ascii=False, allow_nan=False, indent=2, sort_keys=True)
+    return _code_fence(rendered, "json")
+
+
+def render_proposal_toml(payload: dict[str, JsonValue]) -> str:
+    """Render request fields as TOML; the schema is displayed separately as JSON."""
+    displayed = dict(payload)
+    displayed.pop("answer_schema")
+    interpretation = displayed.get("interpretation")
+    if isinstance(interpretation, dict):
+        # TOML has no null. These optional fields default to None when omitted;
+        # omit them only in the display, without mutating the approved payload.
+        displayed["interpretation"] = {
+            key: value for key, value in interpretation.items()
+            if key not in {"time_window", "units"} or value is not None
+        }
+    rendered = tomli_w.dumps(displayed, multiline_strings=True).rstrip()
+    # TOML multiline strings normalize CRLF. Keep the approved text exact.
+    if tomllib.loads(rendered) != displayed:
+        rendered = tomli_w.dumps(displayed, multiline_strings=False).rstrip()
+    return _code_fence(rendered, "toml")
+
+
+def _code_fence(rendered: str, language: str) -> str:
     longest = max((len(run) for run in re.findall(r"`+", rendered)), default=0)
     fence = "`" * max(3, longest + 1)
-    return f"{fence}json\n{rendered}\n{fence}"
+    return f"{fence}{language}\n{rendered}\n{fence}"
 
 
 def _markdown_quote(value: str) -> str:

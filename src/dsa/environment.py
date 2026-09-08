@@ -29,15 +29,18 @@ import pyarrow.parquet as parquet
 from pydantic import JsonValue
 
 from dsa.contract import RunPolicy
+from dsa.plots import MAX_PLOT_BYTES, validate_png
 from dsa.record import ArtifactRecord
 
 _PARQUET_MEDIA_TYPE = "application/vnd.apache.parquet"
 _JSON_MEDIA_TYPE = "application/json"
 _MEDIA_EXTENSIONS = {
+    "image/png": ".png",
     _JSON_MEDIA_TYPE: ".json",
     _PARQUET_MEDIA_TYPE: ".parquet",
 }
 _OUTPUT_MEDIA_TYPES = {
+    ".png": "image/png",
     ".json": _JSON_MEDIA_TYPE,
     ".parquet": _PARQUET_MEDIA_TYPE,
 }
@@ -53,9 +56,7 @@ _ALLOWED_BOUND_TABLE_FUNCTIONS = frozenset(
         "unnest",
     }
 )
-_FORBIDDEN_BOUND_SCALAR_FUNCTIONS = frozenset(
-    {"current_setting", "getvariable", "setvariable"}
-)
+_FORBIDDEN_BOUND_SCALAR_FUNCTIONS = frozenset({"current_setting", "getvariable", "setvariable"})
 _VIEW_DEFINITION = re.compile(
     r'^\s*CREATE\s+VIEW\s+(?:"(?:[^"]|"")*"|[A-Z_][A-Z0-9_$]*)'
     r'(?:\s*\.\s*(?:"(?:[^"]|"")*"|[A-Z_][A-Z0-9_$]*))?'
@@ -532,9 +533,7 @@ class AnalysisEnvironment:
                 preview_count = 0
         if preview_count:
             try:
-                preview_rows = _table_rows(
-                    materialization.table.slice(0, preview_count)
-                )
+                preview_rows = _table_rows(materialization.table.slice(0, preview_count))
             except (TypeError, ValueError):
                 preview_count = 0
                 preview_rows = []
@@ -621,9 +620,7 @@ class AnalysisEnvironment:
                 "The run artifact byte limit was reached. Reuse or reduce existing results",
             )
         self._attempts_directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-        staging = Path(
-            tempfile.mkdtemp(prefix="python-", dir=self._attempts_directory)
-        )
+        staging = Path(tempfile.mkdtemp(prefix="python-", dir=self._attempts_directory))
         inputs_directory = staging / "inputs"
         inputs_directory.mkdir(mode=0o700)
         output_directory = staging / "outputs"
@@ -657,8 +654,7 @@ class AnalysisEnvironment:
                     scratch_bytes=self.policy.max_python_scratch_bytes,
                     output_bytes=self.policy.max_python_output_bytes,
                     database_storage_bytes=(
-                        attempt_database.stat().st_size
-                        + self.policy.max_python_scratch_bytes
+                        attempt_database.stat().st_size + self.policy.max_python_scratch_bytes
                     ),
                     output_storage_bytes=max(1, remaining_output_bytes),
                 )
@@ -741,6 +737,17 @@ class AnalysisEnvironment:
                 "The private Python attempt workspace could not be removed",
             )
         return result
+
+    def load_png_artifact(self, handle: str) -> bytes:
+        """Read an integrity-checked bounded replay image, never inline model feedback."""
+        _, content = self._artifacts.read_verified_bytes(
+            handle,
+            max_bytes=MAX_PLOT_BYTES,
+            expected_media_type="image/png",
+            media_type_error=("plot_artifact_media_type", "Plot artifact must be PNG"),
+        )
+        validate_png(content)
+        return content
 
     def load_json_artifact(self, handle: str) -> JsonValue:
         record, content = self._artifacts.read_verified_bytes(
@@ -841,14 +848,12 @@ class AnalysisEnvironment:
         timer = _interrupt_after(connection, self.policy.max_query_seconds, timed_out)
         try:
             bounded_sql = (
-                "select * from query(?) as __dsa_query "
-                f"limit {self.policy.max_query_rows + 1}"
+                f"select * from query(?) as __dsa_query limit {self.policy.max_query_rows + 1}"
             )
             _validate_bound_query(connection, bounded_sql, sql)
             cursor = connection.execute(bounded_sql, [sql])
             columns: tuple[dict[str, JsonValue], ...] = tuple(
-                {"name": item[0], "type": str(item[1])}
-                for item in cursor.description
+                {"name": item[0], "type": str(item[1])} for item in cursor.description
             )
             reader = cursor.to_arrow_reader(batch_size=8_192)
             batches: list[pa.RecordBatch] = []
@@ -963,10 +968,11 @@ def _query_issue(sql: str) -> tuple[str, str] | None:
         return "query_invalid", "SQL must be valid DuckDB syntax"
     if len(statements) != 1:
         return "query_statement_count", "Submit exactly one SQL statement"
-    if (
-        statements[0].type != duckdb.StatementType.SELECT
-        or _first_sql_keyword(sql) not in {"SELECT", "WITH", "VALUES"}
-    ):
+    if statements[0].type != duckdb.StatementType.SELECT or _first_sql_keyword(sql) not in {
+        "SELECT",
+        "WITH",
+        "VALUES",
+    }:
         return "query_not_read_only", "Only SELECT, WITH, or VALUES queries are allowed"
     return None
 
@@ -1058,9 +1064,7 @@ def _validate_function_identities(
                 + " order by function_type limit 101",
                 function_parameters,
             ).fetchall()
-            if not function_type_rows or any(
-                row[0] != "table_macro" for row in function_type_rows
-            ):
+            if not function_type_rows or any(row[0] != "table_macro" for row in function_type_rows):
                 raise ArtifactError(
                     "query_external_access",
                     "Queries may use only pure generated tables and validated table macros",
@@ -1105,9 +1109,7 @@ def _validate_function_identities(
                     continue
                 _check_policy_expansion(len(expanded_macros) + len(expanded_views), definition)
                 expanded_macros.add(identity)
-                macro_sql = (
-                    definition if function_type == "table_macro" else f"select {definition}"
-                )
+                macro_sql = definition if function_type == "table_macro" else f"select {definition}"
                 pending_asts.append(_serialized_sql_ast(connection, macro_sql))
 
         for requested_schema, name in _persistent_relation_identities(ast):
@@ -1250,9 +1252,7 @@ def _persistent_relation_identities(
                 identities.add((schema.lower(), name.lower()))
         for key, child in mapping.items():
             if key != "cte_map":
-                identities.update(
-                    _persistent_relation_identities(child, frozenset(local_ctes))
-                )
+                identities.update(_persistent_relation_identities(child, frozenset(local_ctes)))
     elif isinstance(value, list):
         for child in cast(list[JsonValue], value):
             identities.update(_persistent_relation_identities(child, inherited_ctes))
@@ -1360,7 +1360,7 @@ def _python_request_issue(
         if not valid_name or Path(name).suffix not in _OUTPUT_MEDIA_TYPES:
             return (
                 "python_output_name_invalid",
-                "Expected outputs must be safe .json or .parquet file names",
+                "Expected outputs must be safe .json, .parquet or .png file names",
             )
     return None
 
@@ -1377,9 +1377,7 @@ def _snapshot_and_checkpoint_database(
             raise OSError("unexpected database-directory entries")
         source_descriptor = os.open(
             source,
-            os.O_RDONLY
-            | getattr(os, "O_NOFOLLOW", 0)
-            | getattr(os, "O_NONBLOCK", 0),
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0),
         )
         metadata = os.fstat(source_descriptor)
         if not stat.S_ISREG(metadata.st_mode):
@@ -1499,9 +1497,7 @@ async def _run_blocking[BlockingResult](
     plus event-loop polling retains the non-blocking boundary and avoids making
     event-loop progress depend on that callback path.
     """
-    outcomes: SimpleQueue[tuple[bool, BlockingResult | BaseException]] = (
-        SimpleQueue()
-    )
+    outcomes: SimpleQueue[tuple[bool, BlockingResult | BaseException]] = SimpleQueue()
 
     def invoke() -> None:
         try:
@@ -1737,6 +1733,10 @@ def _validate_executor_output(
                 path.read_bytes(),
                 parse_constant=lambda value: (_ for _ in ()).throw(ValueError(value)),
             )
+        elif media_type == "image/png":
+            if path.stat().st_size > MAX_PLOT_BYTES:
+                raise ValueError("plot exceeds byte limit")
+            validate_png(path.read_bytes())
         else:
             parquet_file = parquet.ParquetFile(  # pyright: ignore[reportUnknownMemberType]
                 path

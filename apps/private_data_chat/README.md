@@ -21,7 +21,8 @@ either model is called.
    synthetic `MockDatabaseContext`, and an optional digest-pinned database card;
 2. the clarifier asks questions until it emits a validated quantitative proposal, optionally with
    untrusted analysis guidance when the host enables it;
-3. Chainlit retains the canonical proposal as an ordinary chat message, then shows native
+3. Chainlit retains the proposal as an ordinary chat message, with request fields in
+   TOML and the answer schema in a separate formatted JSON block, then shows native
    confirmation actions in a separate transient prompt;
 4. exact confirmation invokes the host-owned `DsaAnalysisExecutor` against the real database;
 5. the application returns the structured answer and attaches a notebook download when DSA
@@ -91,12 +92,16 @@ For a portable, non-secret starting point, copy and edit the Online Retail II TO
 cp apps/private_data_chat/online-retail-ii.chat.toml.example private-data-chat.toml
 ```
 
-Paths in this file are resolved relative to the file itself. Its `[database_card]` section pins an
-exact bounded JSON card stored alongside the DuckDB in the Hugging Face dataset. The application
-verifies its repository, immutable commit, path, and SHA-256 digest before parsing it. The welcome
+Paths in this file are resolved relative to the file itself. Its `[database_card]` and
+`[synthetic_context]` sections pin the description and explicitly fake rows stored alongside
+the DuckDB on Hugging Face. Both pin the same repository revision, with separate content
+digests. The application verifies bounded downloads and checks that the represented
+relations and columns agree before any model call. The welcome
 message shows the card's user-facing inventory while the untrusted clarifier receives the complete
 card, including technical analysis notes. Card fields are escaped as literal text before Markdown
 rendering, and those notes are never rendered in the welcome message.
+The [chat context guide](../../docs/chat-context.md) documents the dataset-neutral v2
+card, publication rules, and the optional local `mock_context_path` alternative.
 Its `[clarifier]` and `[trusted]` sections are parsed
 independently through the safe model-configuration contract; credentials and provider endpoints
 are rejected there and must remain in environment variables. For example, a remote OpenRouter
@@ -171,3 +176,10 @@ clarifier's behavior; the parsed contracts, confirmation digest, and trusted ada
 actual boundary.
 
 See [THREAT_MODEL.md](THREAT_MODEL.md) for the boundary assumptions and demo limitations.
+
+## Optional plots
+
+Ask for a chart and review `allow_plots: true` in the proposal before approving.
+The trusted analysis may return up to three static PNGs alongside the answer, with
+downloads and embedded outputs in the verified notebook. Plots never return to the
+untrusted clarifier. See the [plot contract](../../docs/plots.md) for limits and scope.
