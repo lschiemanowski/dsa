@@ -51,7 +51,12 @@ class DsaRuntimeConfiguration(AppContract):
     @field_validator("docker_image")
     @classmethod
     def require_immutable_image(cls, value: str) -> str:
-        default_docker_configuration(value)
+        try:
+            default_docker_configuration(value)
+        except ValueError:
+            # Keep validation attached to this public configuration field rather
+            # than leaking the nested Docker configuration's field location.
+            raise ValueError("docker_image must be an immutable SHA-256 reference") from None
         return value
 
     @field_validator("database_path", "runs_directory")
