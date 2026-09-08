@@ -32,12 +32,9 @@ class CardDownload(Protocol):
     ) -> str: ...
 
 
-class HuggingFaceDatabaseCardReference(AppContract):
-    """One exact JSON card in a Hugging Face dataset repository."""
+class HuggingFaceContextReference(AppContract):
+    """Common immutable locator for bounded public chat context."""
 
-    format: Literal["dsa-huggingface-database-card/v1"] = (
-        "dsa-huggingface-database-card/v1"
-    )
     repo_id: str = Field(
         pattern=(
             r"^[A-Za-z0-9][A-Za-z0-9._-]{0,95}/"
@@ -54,6 +51,7 @@ class HuggingFaceDatabaseCardReference(AppContract):
         path = PurePosixPath(value)
         if (
             path.is_absolute()
+            or str(path) != value
             or not path.parts
             or len(value) > 1024
             or any(
@@ -63,6 +61,12 @@ class HuggingFaceDatabaseCardReference(AppContract):
         ):
             raise ValueError("database-card path must be a safe relative path")
         return value
+
+
+class HuggingFaceDatabaseCardReference(HuggingFaceContextReference):
+    """One exact JSON card in a Hugging Face dataset repository."""
+
+    format: Literal["dsa-huggingface-database-card/v1"] = "dsa-huggingface-database-card/v1"
 
 
 class DatabaseColumn(AppContract):
@@ -121,16 +125,50 @@ class DatabaseCoverage(AppContract):
     country_values: Annotated[int, Field(ge=0)]
 
 
+class CoverageFact(AppContract):
+    """One dataset-owned, user-facing coverage fact."""
+
+    label: str = Field(min_length=1, max_length=100)
+    value: Annotated[int, Field(ge=0)] | Annotated[str, Field(min_length=1, max_length=500)]
+
+    @field_validator("label", "value")
+    @classmethod
+    def reject_blank(cls, value: str | int) -> str | int:
+        if isinstance(value, str) and not value.strip():
+            raise ValueError("coverage facts must not be blank")
+        return value
+
+
+class DatasetCoverage(AppContract):
+    """Dataset-neutral facts; no retail-specific mandatory counters."""
+
+    facts: tuple[CoverageFact, ...] = Field(min_length=1, max_length=16)
+
+    @field_validator("facts", mode="before")
+    @classmethod
+    def snapshot_facts(cls, value: object) -> object:
+        return tuple(cast(list[object], value)) if isinstance(value, list) else value
+
+    @model_validator(mode="after")
+    def distinct_labels(self) -> DatasetCoverage:
+        if len({fact.label for fact in self.facts}) != len(self.facts):
+            raise ValueError("coverage labels must be distinct")
+        return self
+
+
 class DatabaseCard(AppContract):
     """Dataset-owned content with separate user and model projections."""
 
-    format: Literal["dsa-database-card/v1"] = "dsa-database-card/v1"
+    format: Literal["dsa-database-card/v1", "dsa-database-card/v2"] = "dsa-database-card/v1"
+    data_source_id: str | None = Field(
+        default=None,
+        pattern=r"^[a-z][a-z0-9_-]{0,127}$",
+        exclude_if=lambda value: value is None,
+    )
     title: str = Field(min_length=1, max_length=256)
     summary: str = Field(min_length=1, max_length=4_000)
-    coverage: DatabaseCoverage
-    primary_relation: str = Field(
-        pattern=r"^[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*$"
-    )
+    coverage: DatabaseCoverage | DatasetCoverage
+    primary_relation: str = Field(pattern=r"^[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*$")
     relations: tuple[DatabaseRelation, ...] = Field(min_length=1, max_length=32)
     example_questions: tuple[str, ...] = Field(min_length=1, max_length=12)
     analysis_notes: tuple[str, ...] = Field(default=(), max_length=64)
@@ -156,6 +194,11 @@ class DatabaseCard(AppContract):
 
     @model_validator(mode="after")
     def validate_relations(self) -> DatabaseCard:
+        if self.format == "dsa-database-card/v2":
+            if self.data_source_id is None or not isinstance(self.coverage, DatasetCoverage):
+                raise ValueError("v2 cards require a data source ID and generic coverage facts")
+        elif not isinstance(self.coverage, DatabaseCoverage):
+            raise ValueError("v1 cards require legacy coverage")
         names = [relation.name for relation in self.relations]
         if len(names) != len(set(names)):
             raise ValueError("database relation names must be unique")
@@ -180,14 +223,26 @@ def load_database_card(
     """Download, verify, parse, and snapshot one bounded JSON card."""
     try:
         selected = (
-            HuggingFaceDatabaseCardReference.model_validate_json(
-                reference.model_dump_json()
-            )
+            HuggingFaceDatabaseCardReference.model_validate_json(reference.model_dump_json())
             if isinstance(reference, HuggingFaceDatabaseCardReference)
             else HuggingFaceDatabaseCardReference.model_validate(reference)
         )
     except Exception:
         raise DatabaseCardError("database_card_reference_invalid") from None
+    content = download_context_bytes(selected, downloader=downloader)
+    try:
+        return DatabaseCard.model_validate_json(content)
+    except Exception:
+        raise DatabaseCardError("database_card_invalid") from None
+
+
+def download_context_bytes(
+    reference: HuggingFaceContextReference,
+    *,
+    downloader: CardDownload | None = None,
+) -> bytes:
+    """Read one bounded regular-file snapshot and verify its exact public digest."""
+    selected = type(reference).model_validate_json(reference.model_dump_json())
     download = downloader or _default_download
     try:
         downloaded = download(
@@ -205,16 +260,32 @@ def load_database_card(
     content = _read_downloaded_file(Path(downloaded))
     if sha256(content).hexdigest() != selected.sha256:
         raise DatabaseCardError("database_card_digest_mismatch")
-    try:
-        return DatabaseCard.model_validate_json(content)
-    except Exception:
-        raise DatabaseCardError("database_card_invalid") from None
+    return content
 
 
 def render_database_overview(card: DatabaseCard) -> str:
     """Render the user-facing projection without model-only analysis notes."""
     selected = DatabaseCard.model_validate_json(card.model_dump_json())
     coverage = selected.coverage
+    if isinstance(coverage, DatasetCoverage):
+        coverage_lines = "\n".join(
+            f"- **{escape_markdown_inline(fact.label)}:** "
+            + (
+                f"{fact.value:,}"
+                if isinstance(fact.value, int)
+                else escape_markdown_inline(fact.value)
+            )
+            for fact in coverage.facts
+        )
+    else:
+        coverage_lines = (
+            f"- **Coverage:** {coverage.period_start} through {coverage.period_end}\n"
+            f"- **Transaction lines:** {coverage.transaction_lines:,}\n"
+            f"- **Invoices:** {coverage.invoices:,}\n"
+            f"- **Identified customers:** {coverage.identified_customers:,}\n"
+            f"- **Product codes:** {coverage.product_codes:,}\n"
+            f"- **Country values:** {coverage.country_values:,}"
+        )
     primary = next(
         relation for relation in selected.relations if relation.name == selected.primary_relation
     )
@@ -235,12 +306,7 @@ def render_database_overview(card: DatabaseCard) -> str:
     return (
         f"{escape_markdown_text(selected.summary)}\n\n"
         "### At a glance\n\n"
-        f"- **Coverage:** {coverage.period_start} through {coverage.period_end}\n"
-        f"- **Transaction lines:** {coverage.transaction_lines:,}\n"
-        f"- **Invoices:** {coverage.invoices:,}\n"
-        f"- **Identified customers:** {coverage.identified_customers:,}\n"
-        f"- **Product codes:** {coverage.product_codes:,}\n"
-        f"- **Country values:** {coverage.country_values:,}\n\n"
+        f"{coverage_lines}\n\n"
         "### Available data\n\n"
         f"{relations}\n\n"
         f"### Main fields in `{primary.name}`\n\n"

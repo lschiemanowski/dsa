@@ -28,7 +28,9 @@ async def on_chat_start() -> None:
     """Build one isolated application session from host-owned configuration."""
     try:
         configuration = load_configuration()
-        context = load_mock_context(configuration.mock_context_path)
+        context = load_mock_context(
+            configuration.mock_context_path, configuration.synthetic_context
+        )
         database_card = (
             load_database_card(configuration.database_card)
             if configuration.database_card is not None

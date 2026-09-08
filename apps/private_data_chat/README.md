@@ -92,12 +92,16 @@ For a portable, non-secret starting point, copy and edit the Online Retail II TO
 cp apps/private_data_chat/online-retail-ii.chat.toml.example private-data-chat.toml
 ```
 
-Paths in this file are resolved relative to the file itself. Its `[database_card]` section pins an
-exact bounded JSON card stored alongside the DuckDB in the Hugging Face dataset. The application
-verifies its repository, immutable commit, path, and SHA-256 digest before parsing it. The welcome
+Paths in this file are resolved relative to the file itself. Its `[database_card]` and
+`[synthetic_context]` sections pin the description and explicitly fake rows stored alongside
+the DuckDB on Hugging Face. Both pin the same repository revision, with separate content
+digests. The application verifies bounded downloads and checks that the represented
+relations and columns agree before any model call. The welcome
 message shows the card's user-facing inventory while the untrusted clarifier receives the complete
 card, including technical analysis notes. Card fields are escaped as literal text before Markdown
 rendering, and those notes are never rendered in the welcome message.
+The [chat context guide](../../docs/chat-context.md) documents the dataset-neutral v2
+card, publication rules, and the optional local `mock_context_path` alternative.
 Its `[clarifier]` and `[trusted]` sections are parsed
 independently through the safe model-configuration contract; credentials and provider endpoints
 are rejected there and must remain in environment variables. For example, a remote OpenRouter

@@ -4,7 +4,6 @@
 
 format = "dsa-private-data-chat-config/v1"
 data_source_id = "online_retail_ii"
-mock_context_path = "apps/private_data_chat/mock-database.example.json"
 database_path = "data/online-retail-ii/database/online_retail_ii.duckdb"
 runs_directory = ".private-data-chat/runs"
 docker_image = "dsa-python@sha256:replace-with-local-image-digest"
@@ -15,9 +14,17 @@ report_to_mlflow = false
 [database_card]
 format = "dsa-huggingface-database-card/v1"
 repo_id = "lschiemanowski/dsa-datasets"
-revision = "f45a22879769fc02731f3dc55d126a8d6705d4b9"
+revision = "637fba846acb690d70324acd4ba52fae84c9a6a4"
 path = "online-retail-ii/database-card.json"
-sha256 = "1148ccca3d69e5e256f32418dbd40b3fb4facf07f1cdd1a078bd87c5d7a4a6de"
+sha256 = "7b8771424eb4958f71380b85c8e42438bd9f71b237ecbee064755b17d1c2177e"
+
+# Explicitly authored fake rows, never samples from the private database.
+[synthetic_context]
+format = "dsa-huggingface-synthetic-context/v1"
+repo_id = "lschiemanowski/dsa-datasets"
+revision = "637fba846acb690d70324acd4ba52fae84c9a6a4"
+path = "online-retail-ii/synthetic-context.json"
+sha256 = "6412a897b0d178edac2f9c587a8ceccae04dcbb3802ddebff8dba39fa7f48211"
 
 # This model receives only bounded conversation text, the public card, and synthetic rows.
 [clarifier]
