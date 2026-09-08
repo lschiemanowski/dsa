@@ -44,12 +44,15 @@ class DsaRuntimeConfiguration(AppContract):
     runs_directory: Path
     trusted_model_name: str = Field(min_length=1, max_length=512)
     trusted_model_settings: dict[str, JsonValue] = Field(default_factory=dict)
-    docker_image: str = Field(
-        pattern=r"^[A-Za-z0-9][A-Za-z0-9._/:@-]*@sha256:[0-9a-f]{64}$",
-        max_length=512,
-    )
+    docker_image: str = Field(max_length=512)
     report_to_mlflow: bool = False
     policy: RunPolicy = RunPolicy()
+
+    @field_validator("docker_image")
+    @classmethod
+    def require_immutable_image(cls, value: str) -> str:
+        default_docker_configuration(value)
+        return value
 
     @field_validator("database_path", "runs_directory")
     @classmethod

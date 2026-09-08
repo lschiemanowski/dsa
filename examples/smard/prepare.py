@@ -36,11 +36,7 @@ def main() -> None:
     config.update(
         database_path=str(DATABASE),
         runs_directory=str(output / "chat-runs"),
-        docker_image=(
-            f"dsa-python@{args.docker_image}"
-            if args.docker_image.startswith("sha256:")
-            else args.docker_image
-        ),
+        docker_image=args.docker_image,
     )
     chat_path = output / "chat.toml"
     chat_path.write_text(tomli_w.dumps(config))
