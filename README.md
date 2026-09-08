@@ -1,252 +1,120 @@
-# dsa
+This repo contains two tools:
 
-`dsa` is a small, auditable agent for answering one completely specified data
-science question about a supplied DuckDB database. The caller supplies the
-database path, question, exact JSON Schema for the answer, model configuration,
-and host-enforced run policy.
+- `dsa`, an LLM-based data analysis tool for DuckDB databases
+- `dsa chat`, a chat UI for using `dsa` while keeping the database and analysis on premises
 
-The project is a clean rewrite of the existing dsagent behavior. It is not a
-conversational task-definition system.
+Given a DuckDB database, `dsa` takes a request for a data analysis task along with a JSON Schema describing the answer. Depending on configuration, it can produce just the answer, or additionally a Jupyter notebook. The answer can also include up to 3 plots. In the initial request, `dsa` can also take guidance how to derive the answer. `dsa` is meant to be run by a trusted on premise model.
 
-## Current milestone
+The analysis is performed by the model using tools to query the SQL database and to execute Python code. Python code is executed in a Docker sandbox without network access. Analysis uses a copy of the database, leaving the original unchanged.
 
-Milestone 6A adds isolated, resumable benchmark orchestration over the content-pinned
-Hugging Face packs and native MLflow evaluation path:
+`dsa chat` is a web UI for working with `dsa`. The user interacts with an untrusted, off premise model, which has no access to the database, but only a description of the database and some synthetic data rows. In this interaction, the untrusted model helps the user design a request to `dsa`. Once the user has reviewed and approved the request, the request is sent to `dsa`. The user receives the answer, along with any verified Jupyter notebook and plots. Requesting a notebook does not guarantee one: an answer can succeed without a verified derivation. Plots are available only with a verified derivation. This ends the conversation. The off premise model never sees any privileged data, unless supplied by the user.
 
-- strict, serializable request and policy models
-- JSON Schema Draft 2020-12 validation
-- a Pydantic AI structured-output episode
-- schema feedback and bounded answer retries
-- typed terminal success and failure outcomes
-- native Pydantic AI messages and usage in one terminal record
-- atomic private record retention with one SHA-256 digest
-- deterministic schema inspection with unambiguous quoted DuckDB relation names
-- one structured-identity and bound-plan checked SQL statement per query tool call
-- complete small query results inline
-- automatic full-result Parquet retention with at most five preview rows
-- run-private artifact handles with same-descriptor integrity checks
-- transactional publication for complete multi-output Python batches
-- an injected Python executor protocol using managed database, input, and output paths
-- one private database copy per run with retained source and final SHA-256 identities
-- transactional per-call database mutation with rollback on every failed Python call
-- a digest-pinned, never-pull, non-root, networkless Docker backend with read-only binds
-- Docker memory, CPU, process, elapsed-time, writable-tmpfs, and diagnostic limits
-- disabled daemon logging and bounded host recovery of database and output bytes
-- trusted process quiescence and WAL checkpointing before database recovery
-- default cleanup of private working databases with an operator-only debug override
-- direct final answers or same-run retained JSON final answers
-- an operator-only `report_to_mlflow` flag with context-local Pydantic AI tracing
-- exact terminal-record and artifact-manifest metadata export to MLflow
-- native MLflow Evaluation Datasets with lossless host-only expectations and pack scorers
-- three immutable public evaluation packs containing 100 revised cases each
-- exact Hugging Face repository revision, manifest, case-export, and database identities
-- immutable content-addressed benchmark studies and deterministic matrix expansion
-- fresh subprocesses and private attempts for every pack-model-repetition cell
-- separate explicit MLflow case-worker and benchmark cell-worker bounds
-- atomic no-overwrite local receipts correlated to tagged MLflow evaluation runs
-- conservative explicit resume that never guesses about ambiguous remote work
-- runtime-only workspace paths, MLflow dataset names, and secrets outside study identity
+Three demo databases and problem sets are provided on [Hugging Face](https://huggingface.co/datasets/lschiemanowski/dsa-datasets).
 
-Model-authored Python is never executed on the host. The `run_python` tool is
-registered only when the host injects an executor. MLflow reporting supports either
-Databricks or a configured MLflow tracking server. See
-[`docs/local-mlflow.md`](docs/local-mlflow.md) for the loopback server setup.
+One of these datasets is a slice of the [SMARD](https://www.smard.de/en) electricity-market data for Germany and Luxembourg. It contains data on electricity generation by technology, consumption, forecasts, day-ahead prices and commercial cross-border net exports for the year 2024.
 
-## Public boundary
+Here is a question a user may ask:
 
-```python
-from pathlib import Path
+> How did Germany/Luxembourg’s electricity generation mix change month by month in 2024? Show a stacked bar chart of monthly generation in GWh, broken down by generation technology, and report each month’s renewable share as a percentage of total generation. Include a reproducible notebook with the calculations and plot.
 
-from dsa import ModelConfiguration, RunPolicy, RunRequest
+Upon this, the off premise model asks the user to clarify their question, for example asking to decide how to group generation technology: by class (fossil, renewable, nuclear) or by individual technology (solar, coal, ...). Once the user has clarified their question, a request to `dsa` is drafted. This request is more concrete and specific than the user question, may contain guidance how to arrive at the result, and comes with a JSON Schema to return the answer in a structured manner. The user can review this request and approve it.
 
-request = RunRequest(
-    database_path=Path("data/example.duckdb"),
-    question="How many rows are in the events relation?",
-    answer_schema={
-        "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "type": "object",
-        "properties": {"count": {"type": "integer", "minimum": 0}},
-        "required": ["count"],
-        "additionalProperties": False,
-    },
-    model=ModelConfiguration(
-        name="openrouter:example/model",
-        settings={"temperature": 0, "seed": 7},
-    ),
-    policy=RunPolicy(),
-)
+Here is a [video of the workflow](examples/smard/smard-monthly-generation-demo.mp4). The recording is played at twice the original speed, with most of the model waiting time removed.
+
+You can look at the [complete answer](examples/smard/smard-monthly-generation-demo-answer.json) and [notebook](examples/smard/smard-monthly-generation-demo.ipynb) from the recorded session. The notebook contains the derivation of the result by `dsa`. Its purpose is for the user to verify that the derivation and therefore the result is correct.
+
+To rerun the notebook, first download the database as described below. Open the notebook in Jupyter using a Python environment with DuckDB, pandas, Matplotlib and IPython installed. In its first code cell, replace `database_path = Path("database.duckdb")` with the absolute path to `data/smard-de-lu-2024/1.2.0/database/smard_de_lu_2024.duckdb` in your checkout, then run the cells in order. Plots are written to a `plots` directory relative to the notebook's working directory. Review the code before running it: execution in your own Jupyter environment is not protected by DSA's Docker sandbox.
+
+The recorded session groups generation into renewables, nuclear and conventional generation. The standalone example below is a separate request that splits conventional generation into fossil and other generation; its output is therefore not expected to match the recording exactly.
+
+<!-- For an inline GitHub video player, upload the MP4 in the web editor and insert the attachment URL here. -->
+
+## How to run this
+
+`dsa` can be run standalone or it can be invoked by the web UI. Run standalone, one LLM inference provider needs to be given, typically run locally. The web UI needs a second LLM provider, typically a hosted service. Here, I describe how to run `dsa` with `ollama` providing the local model and OpenRouter providing the hosted service.
+
+You will need `uv`, Docker and Ollama installed, with Docker running and accessible to your user. Run the following commands from the root of a cloned checkout of this repo.
+
+First, install the project with the chat dependencies:
+```bash
+uv sync --python 3.12 --extra chat --frozen
+```
+If Ollama is not already running as a service, start it in a separate terminal and leave it running:
+```bash
+ollama serve
+```
+In the original terminal, download the model and create its configuration:
+```bash
+ollama pull gemma4:e4b
+ollama create dsa-gemma4 -f examples/smard/Modelfile
+```
+Then, in that same terminal, run
+```bash
+export OPENAI_BASE_URL=http://127.0.0.1:11434/v1
+export OPENAI_API_KEY=ollama
+export NO_PROXY="${NO_PROXY:+${NO_PROXY},}127.0.0.1,localhost"
+```
+Download the demo datasets and problems:
+```bash
+uv run hf download lschiemanowski/dsa-datasets \
+  --repo-type dataset \
+  --revision 58958007cdf38eb9e563356f16ecd8011d5a3d67 \
+  --local-dir data
+```
+This downloads all three demo datasets and their problem sets at the revision whose directory layout is expected by the example script.
+
+Build the docker image for the sandbox:
+```bash
+docker build --tag dsa-python:local docker
+export DSA_IMAGE=$(docker image inspect --format '{{.Id}}' dsa-python:local)
+```
+Finally, prepare the individual request and the chat config using the example script:
+```bash
+uv run python examples/smard/prepare.py --docker-image "$DSA_IMAGE"
+```
+Run an individual request:
+```bash
+uv run dsa run \
+  --request examples/smard/local/task.json \
+  --runs-directory examples/smard/local/runs \
+  --docker-image "$DSA_IMAGE" \
+  > examples/smard/local/result.json
 ```
 
-Credentials, provider endpoints, and evaluator expectations are deliberately
-excluded from this request and from the terminal record. Provider credentials
-remain runtime environment configuration.
-
-Query transport is host-selected. A response marked `inline` is complete. A response
-marked `artifact` identifies a complete retained Parquet table and includes only a
-bounded orientation preview. The preview is not an analytical substitute for the
-artifact. Python receives selected artifacts through `DSAGENT_INPUTS` rather than
-through copied transcript content.
-
-The Docker image must be built or obtained before a run and supplied by immutable
-SHA-256 identity. Runtime execution never pulls or builds an image:
-
-```text
-docker build --tag dsa-python:m3 docker
-docker image inspect --format '{{.Id}}' dsa-python:m3
+To run the web UI, you first need to set an OpenRouter API key:
+```bash
+export OPENROUTER_API_KEY='your-openrouter-api-key'
 ```
-
-The resulting raw `sha256:...` image ID is valid for that local Docker store. A
-registry deployment should use its `repository@sha256:...` digest instead.
-
-```python
-from dsa import DockerPythonExecutor, default_docker_configuration, run_analysis
-
-executor = DockerPythonExecutor(default_docker_configuration("sha256:<64 hex digits>"))
-completion = await run_analysis(request, python_executor=executor)
+Then run the UI:
+```bash
+uv run dsa chat --config examples/smard/local/chat.toml --host 127.0.0.1
 ```
+This opens a web browser and shows the UI seen in the video. In this example configuration, DeepSeek V4 Flash through OpenRouter is used for clarification, while local Gemma 4 E4B performs the analysis. Edit `[clarifier]` and `[trusted]`, respectively, in `examples/smard/local/chat.toml` to change these models.
 
-Install the optional dependencies and provide operator-owned MLflow runtime
-configuration to resolve packs and report any ordinary run. This example uses
-Databricks; the [local MLflow guide](docs/local-mlflow.md) provides the equivalent
-tracking-server configuration:
+The recorded demo used DeepSeek V4 Flash for analysis of the public database as well. The local Gemma 4 E4B setup above has not yet been tested end to end.
 
-```text
-uv sync --all-groups --extra huggingface --extra mlflow --frozen
-export MLFLOW_TRACKING_URI=databricks
-export MLFLOW_EXPERIMENT_ID=<experiment-id>
-export DATABRICKS_HOST=<workspace-url>
-export DATABRICKS_TOKEN=<token>
-```
+## Benchmarks
 
-```python
-completion = await run_analysis(
-    request,
-    runs_directory=Path("runs"),
-    report_to_mlflow=True,
-)
-```
+We evaluated `dsa` with GPT-5.6 Luna, DeepSeek V4 Flash 0731, and GLM 5.3 Flash on the three demo datasets. For this comparison, we use 296 questions that ship with the demo datasets: 98 for Online Retail II, 100 for SMARD, and 98 for EEA air quality. Four questions whose rounding instructions were inaccurate have been dropped.
 
-The repository pins the current 100-problem Online Retail II pack through
-`evaluation-packs/online-retail-ii.json`. See the [current pack index](evaluation-packs/README.md)
-for all three revised packs and download instructions. Older version-named locators
-are historical. Load the current pack from its exact public Hugging Face commit,
-then bind the machine-local model and policy only when evaluating:
+Each question was run once in four configurations, with or without guidance and with or without a requested notebook. The guidance is part of the problem sets.
 
-```python
-from pathlib import Path
+| Guidance | Notebook requested | GPT-5.6 Luna | DeepSeek V4 Flash 0731 | GLM 5.3 Flash |
+|---|---|---:|---:|---:|
+| No | No | 256/296 (86.5%) | 257/296 (86.8%) | 221/296 (74.7%) |
+| No | Yes | 250/296 (84.5%) | 235/296 (79.4%) | 180/296 (60.8%) |
+| Yes | No | 257/296 (86.8%) | 255/296 (86.1%) | 225/296 (76.0%) |
+| Yes | Yes | 251/296 (84.8%) | 233/296 (78.7%) | 195/296 (65.9%) |
+| **All configurations** | | **1014/1,184 (85.6%)** | **980/1,184 (82.8%)** | **821/1,184 (69.3%)** |
 
-from dsa import (
-    HuggingFacePackReference,
-    load_huggingface_evaluation_pack,
-    run_mlflow_evaluation,
-)
+The following are observed OpenRouter inference costs in USD for the same 296 questions per configuration. Amounts marked * have incomplete cost coverage and are partial sums, not complete totals. Luna's costs reflect its Flex routing. These figures exclude local compute and the `dsa-chat` clarification conversation.
 
-reference = HuggingFacePackReference.model_validate_json(
-    Path("evaluation-packs/online-retail-ii.json").read_bytes()
-)
-pack = load_huggingface_evaluation_pack(reference)
-result = run_mlflow_evaluation(
-    pack,
-    dataset_name="<mlflow-dataset-name>",
-    runs_directory=Path("runs"),
-    model_configuration=request.model,
-    policy=request.policy,
-)
-```
+| Guidance | Notebook requested | GPT-5.6 Luna | DeepSeek V4 Flash 0731 | GLM 5.3 Flash |
+|---|---|---:|---:|---:|
+| No | No | $0.3155 * | $0.7721 * | $0.3074 |
+| No | Yes | $0.5329 * | $1.2674 * | $0.9333 * |
+| Yes | No | $0.3055 * | $0.6313 | $0.3015 |
+| Yes | Yes | $0.5104 * | $1.1805 | $0.7999 * |
+| **All configurations** | | $1.6643 * | $3.8513 * | $2.3420 * |
 
-Only case identity/version, database identity/digest, question, and answer schema enter
-MLflow dataset inputs. Reference answers and scorer policies remain evaluator-only
-expectations, encoded as canonical JSON strings so managed-dataset number coercion cannot
-change their meaning. Exact packs keep integers and floats exact; a pack may explicitly
-opt into bounded relative/absolute tolerance for expected floating-point leaves while
-integers remain type-exact. Hugging Face cache paths, model configuration, run policy,
-and executor configuration remain host runtime bindings.
-
-Benchmark studies bind exact pack references, model configurations, policy, Docker image,
-concurrency, repetitions, and the exact agent Git revision. Runtime files bind only a new
-local workspace and one distinct MLflow dataset per pack. Databricks uses a
-`catalog.schema.table` Unity Catalog name; a tracking server accepts a safe plain name.
-Both inputs must be canonical JSON. Preflight resolves every pack, checks the
-already-present immutable Docker image, requires the selected MLflow configuration, and
-verifies the running Git revision before starting any cell. Tracked or untracked changes
-under `src/dsa`, `pyproject.toml`, or `uv.lock` are rejected because they are not
-represented by that revision:
-
-```text
-dsa-benchmark plan --study study.json --runtime runtime.json
-dsa-benchmark run --study study.json --runtime runtime.json
-dsa-benchmark run --study study.json --runtime runtime.json --resume
-dsa-benchmark report --study study.json --runtime runtime.json --output reports
-```
-
-`plan` performs the same complete preflight as `run` but makes no model call or MLflow
-write. `--resume` skips only a locally verified completed receipt. A partial attempt or
-unverifiable receipt is reported as ambiguous and preserved for operator inspection.
-`report` requires a complete matrix of verified receipts, reads only their exact
-MLflow runs, recomputes the existing scorers against the pinned packs, and
-atomically publishes canonical JSON plus deterministic Markdown without running a
-model or modifying remote state. Literal exactness and pack-policy matches are retained
-as separate metrics, so an allowed floating-point tolerance never inflates exact
-accuracy. The execution and publication contracts are recorded
-in `docs/milestone-6a.md` and `docs/milestone-6b.md`.
-
-`completion.reporting` is `disabled`, `reported`, or `failed`. A reporting failure does
-not change `completion.outcome` or the canonical local `terminal.json`. Enabled reporting
-uploads the native Pydantic AI trace, the exact terminal record, and artifact metadata;
-it does not upload retained artifact contents, DuckDB files, or private workspaces.
-
-Each Python call receives a size-limited tmpfs copy of the private attempt database,
-explicitly selected read-only artifact inputs, and a size-limited tmpfs output directory.
-Only the database seed and selected inputs are host bind-mounted, both read-only; the
-host recovers database and output bytes through bounded streams. Model code resolves
-`DSAGENT_DATABASE`, `DSAGENT_INPUTS`, and `DSAGENT_OUTPUTS` through `os.environ`.
-Declared outputs must be `.json` or `.parquet`; `expected_outputs=[]` is valid for a
-database-only call. Successful database changes become visible to later tools in the
-same run. Any failed call is discarded. The source database is never mounted and is
-never modified.
-
-Once a valid run starts, it produces exactly one terminal outcome. Success
-contains the answer validated against the caller's schema. Failure contains a
-stage, stable code, safe message, and bounded diagnostics. Cancellation is
-recorded and then propagated to the caller.
-
-## Development
-
-```text
-uv sync --all-groups --frozen
-uv run ruff check .
-uv run pyright
-uv run pytest
-```
-
-The opt-in real Docker tier requires an already available immutable image:
-
-```text
-DSA_DOCKER_TEST_IMAGE=sha256:<64 hex digits> uv run pytest -m integration
-```
-
-The real Databricks acceptance test additionally requires the configuration above, a
-Unity Catalog dataset name in `DSA_MLFLOW_DATASET_NAME`, and explicit opt-in:
-
-```text
-DSA_DATABRICKS_TEST=1 uv run pytest -m databricks
-```
-
-The full benchmark-cell acceptance also needs the already-present Docker image and exact
-public pack access. It uses Pydantic AI's deterministic test model rather than a paid
-provider:
-
-```text
-DSA_BENCHMARK_DATABRICKS_TEST=1 \
-DSA_DOCKER_TEST_IMAGE=sha256:<64 hex digits> \
-uv run pytest tests/test_benchmark_databricks.py
-```
-
-The exact public Hugging Face boundary has a separate opt-in acceptance test:
-
-```text
-DSA_HUGGINGFACE_TEST=1 uv run pytest tests/test_online_retail_pack.py
-```
-
-Python 3.12 is the development and CI baseline. Dependencies are resolved in
-`uv.lock`.
+Cost records cover all retained responses in 1,179/1,184 runs for Luna, 1,182/1,184 for DeepSeek, and 1,119/1,184 for GLM. Luna's five remaining runs have no retained model responses. DeepSeek has two retained responses without costs; GLM has 66. Missing costs are not treated as zero. The amounts are summed from provider-reported costs, including available costs for failed runs, rather than estimated from token prices.

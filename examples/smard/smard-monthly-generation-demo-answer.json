@@ -1,0 +1,100 @@
+{
+  "months": [
+    {
+      "conventional_gwh": 20197.6,
+      "month": "2024-01",
+      "nuclear_gwh": 0.0,
+      "renewable_share_percent": 55.2,
+      "renewables_gwh": 24925.3,
+      "total_gwh": 45123.0
+    },
+    {
+      "conventional_gwh": 16031.6,
+      "month": "2024-02",
+      "nuclear_gwh": 0.0,
+      "renewable_share_percent": 59.6,
+      "renewables_gwh": 23687.9,
+      "total_gwh": 39719.5
+    },
+    {
+      "conventional_gwh": 16421.6,
+      "month": "2024-03",
+      "nuclear_gwh": 0.0,
+      "renewable_share_percent": 57.0,
+      "renewables_gwh": 21803.2,
+      "total_gwh": 38224.8
+    },
+    {
+      "conventional_gwh": 12465.5,
+      "month": "2024-04",
+      "nuclear_gwh": 0.0,
+      "renewable_share_percent": 64.9,
+      "renewables_gwh": 23093.1,
+      "total_gwh": 35558.7
+    },
+    {
+      "conventional_gwh": 11920.8,
+      "month": "2024-05",
+      "nuclear_gwh": 0.0,
+      "renewable_share_percent": 64.1,
+      "renewables_gwh": 21262.1,
+      "total_gwh": 33182.9
+    },
+    {
+      "conventional_gwh": 11974.4,
+      "month": "2024-06",
+      "nuclear_gwh": 0.0,
+      "renewable_share_percent": 63.4,
+      "renewables_gwh": 20733.5,
+      "total_gwh": 32708.0
+    },
+    {
+      "conventional_gwh": 12282.8,
+      "month": "2024-07",
+      "nuclear_gwh": 0.0,
+      "renewable_share_percent": 63.4,
+      "renewables_gwh": 21322.1,
+      "total_gwh": 33604.9
+    },
+    {
+      "conventional_gwh": 12869.6,
+      "month": "2024-08",
+      "nuclear_gwh": 0.0,
+      "renewable_share_percent": 60.9,
+      "renewables_gwh": 20008.7,
+      "total_gwh": 32878.3
+    },
+    {
+      "conventional_gwh": 12697.8,
+      "month": "2024-09",
+      "nuclear_gwh": 0.0,
+      "renewable_share_percent": 62.5,
+      "renewables_gwh": 21169.8,
+      "total_gwh": 33867.5
+    },
+    {
+      "conventional_gwh": 15871.3,
+      "month": "2024-10",
+      "nuclear_gwh": 0.0,
+      "renewable_share_percent": 54.4,
+      "renewables_gwh": 18963.6,
+      "total_gwh": 34835.0
+    },
+    {
+      "conventional_gwh": 20374.8,
+      "month": "2024-11",
+      "nuclear_gwh": 0.0,
+      "renewable_share_percent": 47.5,
+      "renewables_gwh": 18415.1,
+      "total_gwh": 38789.9
+    },
+    {
+      "conventional_gwh": 18488.0,
+      "month": "2024-12",
+      "nuclear_gwh": 0.0,
+      "renewable_share_percent": 54.2,
+      "renewables_gwh": 21850.7,
+      "total_gwh": 40338.6
+    }
+  ]
+}
