@@ -14,7 +14,7 @@ from apps.private_data_chat.database_card import (
     render_database_overview,
 )
 from apps.private_data_chat.dsa_adapter import DsaAnalysisExecutor
-from apps.private_data_chat.presentation import escape_markdown_text
+from apps.private_data_chat.presentation import escape_markdown_inline, escape_markdown_text
 from apps.private_data_chat.settings import load_configuration
 
 cl: Any = import_module("chainlit")
@@ -172,6 +172,7 @@ def _welcome_message(
     clarifier_model_name: str,
 ) -> str:
     """Combine the fixed trust flow with bounded dataset-owned public context."""
+    title = escape_markdown_inline(database_card.title) if database_card else "this database"
     sections = [
         "## Instructions\n\n"
         "This chat interface allows you to ask quantitative questions about a DuckDB in plain "
@@ -185,16 +186,15 @@ def _welcome_message(
         "downloadable Jupyter notebook containing the derivation.\n"
         "5. To prevent data from leaking to the untrusted model, the session ends after the "
         "result is returned. Start a new session to ask another question.",
-        f"## About {context.display_name}",
+        f"## About {title}",
     ]
     if database_card is not None:
         sections.append(render_database_overview(database_card))
     else:
         sections.append(
-            "This configured data source provides a synthetic schema-compatible sample for "
-            "question clarification."
+            "Ask quantitative questions about the configured database."
         )
-    sections.append(f"Ask a question about **{context.display_name}** to begin.")
+    sections.append(f"Ask a question about **{title}** to begin.")
     return "\n\n".join(sections)
 
 

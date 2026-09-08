@@ -32,8 +32,8 @@ _MAX_CONTEXT_BYTES = 64 * 1024
 _MAX_HISTORY_MESSAGES = 30
 _MAX_HISTORY_BYTES = 64 * 1024
 _MAX_MESSAGE_BYTES = 8 * 1024
-_MAX_CLARIFIER_TOKENS = 32_000
-_MAX_CLARIFIER_SECONDS = 120
+_MAX_CLARIFIER_TOKENS = 64_000
+_MAX_CLARIFIER_SECONDS = 300
 
 
 @dataclass(frozen=True)
@@ -162,7 +162,7 @@ async def _run_pydantic_clarifier(
     prompt: str,
     configuration: ModelConfiguration,
 ) -> ClarifierTurn:
-    settings = {**configuration.settings, "max_tokens": 4_096}
+    settings = {**configuration.settings, "max_tokens": 16_384}
     agent = Agent(
         configuration.name,
         output_type=ClarifierTurn,

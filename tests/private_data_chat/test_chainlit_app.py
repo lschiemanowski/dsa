@@ -63,7 +63,7 @@ def test_welcome_combines_fixed_trust_flow_with_dataset_context() -> None:
     application = importlib.import_module("apps.private_data_chat.chainlit_app")
     context = MockDatabaseContext(
         data_source_id="retail",
-        display_name="Online Retail II",
+        display_name="Online Retail II — synthetic examples only",
         relations=(MockRelation(name="analysis.lines", columns=("value",)),),
     )
 
@@ -82,12 +82,41 @@ def test_welcome_combines_fixed_trust_flow_with_dataset_context() -> None:
     assert "Review the subagent request" in message
     assert "downloadable Jupyter notebook" in message
     assert "session ends" in message
-    assert "## About Online Retail II" in message
+    assert "## About Retail data" in message
+    assert "Ask a question about **Retail data** to begin." in message
+    assert "synthetic" not in message
     assert r"The original first paragraph\." in message
     assert "### Available data" in message
     assert "1,044,848" in message
     assert r"- How did monthly sales change\?" in message
     assert MODEL_ONLY_NOTE not in message
+
+
+def test_welcome_without_card_keeps_mock_label_internal() -> None:
+    pytest.importorskip("chainlit")
+    application = importlib.import_module("apps.private_data_chat.chainlit_app")
+    context = MockDatabaseContext(
+        data_source_id="example", display_name="Internal synthetic examples only",
+        relations=(MockRelation(name="analysis.lines", columns=("value",)),),
+    )
+    message = application._welcome_message(context, None, "model")
+    assert "## About this database" in message
+    assert "synthetic" not in message
+    assert "Internal" not in message
+
+
+def test_welcome_escapes_database_title() -> None:
+    pytest.importorskip("chainlit")
+    application = importlib.import_module("apps.private_data_chat.chainlit_app")
+    context = MockDatabaseContext(
+        data_source_id="example", display_name="Internal",
+        relations=(MockRelation(name="analysis.lines", columns=("value",)),),
+    )
+    title = "![pixel](https://example.org/image)"
+    message = application._welcome_message(
+        context, card().model_copy(update={"title": title}), "model"
+    )
+    assert title not in message
 
 
 def test_model_display_name_omits_provider_and_routing_qualifiers() -> None:

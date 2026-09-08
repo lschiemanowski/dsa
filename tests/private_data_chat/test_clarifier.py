@@ -12,7 +12,7 @@ from apps.private_data_chat.clarifier import (
     append_history,
     load_mock_context,
 )
-from apps.private_data_chat.contracts import ClarifierTurn, MockDatabaseContext
+from apps.private_data_chat.contracts import ClarifierTurn, MockDatabaseContext, ProposalPayload
 from dsa import ModelConfiguration
 from tests.private_data_chat.test_database_card import MODEL_ONLY_NOTE, card
 
@@ -91,6 +91,16 @@ async def test_clarifier_can_be_instructed_to_propose_untrusted_analysis_guidanc
     assert "Analysis guidance is enabled" in calls[0]
     assert "numbered list of 3 to 8 steps" in calls[0]
     assert "must not claim" in calls[0]
+    assert "Do not claim that notebooks cannot be delivered" in calls[0]
+    assert "Do not add annual totals" in calls[0]
+    assert "return a full" in calls[0]
+    schema = json.loads(calls[0].split("```json\n", 1)[1].split("```", 1)[0])
+    proposal = ProposalPayload.model_validate({
+        "question": "Report monthly values.",
+        "interpretation": {"measure": "monthly value", "population": "available rows"},
+        "answer_schema": schema,
+    })
+    assert proposal.answer_schema == schema
 
 
 def test_clarifier_revalidates_a_mutated_typed_database_card() -> None:

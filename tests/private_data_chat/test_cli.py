@@ -105,6 +105,9 @@ def test_launches_packaged_application_with_an_explicit_config(
     assert ui_configuration["UI"]["default_theme"] == "dark"
     assert ui_configuration["UI"]["logo_file_url"] == "/public/dsa-mark.svg"
     assert ui_configuration["UI"]["default_avatar_file_url"] == "/public/dsa-mark.svg"
+    public = application_root / "public"
+    assert (public / "favicon.svg").read_bytes() == (public / "dsa-mark.svg").read_bytes()
+    assert 'stroke="#fff"' not in (public / "dsa-mark.svg").read_text()
     assert environment["OPENAI_API_KEY"] == "SECRET"
 
 
