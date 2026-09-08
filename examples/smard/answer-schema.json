@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "months": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "categories": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "category": {
+                  "enum": [
+                    "renewable",
+                    "nuclear",
+                    "fossil",
+                    "other"
+                  ],
+                  "type": "string"
+                },
+                "generation_gwh": {
+                  "type": "number"
+                }
+              },
+              "required": [
+                "category",
+                "generation_gwh"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "month": {
+            "type": "string"
+          },
+          "renewable_share_percent": {
+            "type": "number"
+          },
+          "total_generation_gwh": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "month",
+          "total_generation_gwh",
+          "renewable_share_percent",
+          "categories"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "months"
+  ],
+  "type": "object"
+}

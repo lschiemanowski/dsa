@@ -1,0 +1,30 @@
+format = "dsa-private-data-chat-config/v1"
+data_source_id = "smard-de-lu-2024"
+# prepare.py supplies absolute paths and the locally built Docker image ID.
+database_path = "REPLACED_BY_PREPARE"
+runs_directory = "REPLACED_BY_PREPARE"
+docker_image = "REPLACED_BY_PREPARE"
+enable_analysis_guidance = true
+report_to_mlflow = false
+
+[database_card]
+format = "dsa-huggingface-database-card/v1"
+repo_id = "lschiemanowski/dsa-datasets"
+revision = "c3dbcd3375a678eee85843f7ad738a1ded9edec3"
+path = "smard-de-lu-2024/database-card.json"
+sha256 = "221aba0560d42e05cb9759ae88cfc51bad234db0fa34de28dc25ce93b19b9019"
+
+[synthetic_context]
+format = "dsa-huggingface-synthetic-context/v1"
+repo_id = "lschiemanowski/dsa-datasets"
+revision = "c3dbcd3375a678eee85843f7ad738a1ded9edec3"
+path = "smard-de-lu-2024/synthetic-context.json"
+sha256 = "583efd06ebe60398006c660a23168bd58f93ad6193c62c005126cccaa23499b7"
+
+[clarifier]
+model = "openrouter:deepseek/deepseek-v4-flash-0731"
+settings = { thinking = "medium" }
+
+[trusted]
+model = "openai-chat:dsa-gemma4"
+settings = { temperature = 1.0, top_p = 0.95, timeout = 900.0 }
