@@ -100,8 +100,8 @@ relations and columns agree before any model call. The welcome
 message shows the card's user-facing inventory while the untrusted clarifier receives the complete
 card, including technical analysis notes. Card fields are escaped as literal text before Markdown
 rendering, and those notes are never rendered in the welcome message.
-The [chat context guide](../../docs/chat-context.md) documents the dataset-neutral v2
-card, publication rules, and the optional local `mock_context_path` alternative.
+For offline use, set `mock_context_path` to a local synthetic-context JSON file
+instead of configuring `[synthetic_context]`.
 Its `[clarifier]` and `[trusted]` sections are parsed
 independently through the safe model-configuration contract; credentials and provider endpoints
 are rejected there and must remain in environment variables. For example, a remote OpenRouter
@@ -182,4 +182,4 @@ See [THREAT_MODEL.md](THREAT_MODEL.md) for the boundary assumptions and demo lim
 Ask for a chart and review `allow_plots: true` in the proposal before approving.
 The trusted analysis may return up to three static PNGs alongside the answer, with
 downloads and embedded outputs in the verified notebook. Plots never return to the
-untrusted clarifier. See the [plot contract](../../docs/plots.md) for limits and scope.
+untrusted clarifier.
