@@ -19,13 +19,17 @@ Here is a question a user may ask:
 
 Upon this, the off premise model asks the user to clarify their question, for example asking to decide how to group generation technology: by class (fossil, renewable, nuclear) or by individual technology (solar, coal, ...). Once the user has clarified their question, a request to `dsa` is drafted. This request is more concrete and specific than the user question, may contain guidance how to arrive at the result, and comes with a JSON Schema to return the answer in a structured manner. The user can review this request and approve it.
 
-Here is a [video of the workflow](examples/smard/smard-monthly-generation-demo.mp4). The recording is played at twice the original speed, with most of the model waiting time removed.
+Here is a [video of the workflow](examples/smard/smard-monthly-generation-demo.mp4). (In the recording most of the model waiting time is removed.)
+
+https://github.com/user-attachments/assets/51677f20-86f9-41f6-bf70-f65534fb3886
 
 You can look at the [complete answer](examples/smard/smard-monthly-generation-demo-answer.json) and [notebook](examples/smard/smard-monthly-generation-demo.ipynb) from the recorded session. The notebook contains the derivation of the result by `dsa`. Its purpose is for the user to verify that the derivation and therefore the result is correct.
 
 To rerun the notebook, first download the database as described below. Open the notebook in Jupyter using a Python environment with DuckDB, pandas, Matplotlib and IPython installed. In its first code cell, replace `database_path = Path("database.duckdb")` with the absolute path to `data/smard-de-lu-2024/1.2.0/database/smard_de_lu_2024.duckdb` in your checkout, then run the cells in order. Plots are written to a `plots` directory relative to the notebook's working directory. Review the code before running it: execution in your own Jupyter environment is not protected by DSA's Docker sandbox.
 
-The recorded session groups generation into renewables, nuclear and conventional generation. The standalone example below is a separate request that splits conventional generation into fossil and other generation; its output is therefore not expected to match the recording exactly.
+
+
+
 
 <!-- For an inline GitHub video player, upload the MP4 in the web editor and insert the attachment URL here. -->
 
