@@ -57,7 +57,7 @@ def test_public_pack_benchmark_cell_reaches_databricks_once(
         timeout=5,
     ).stdout.decode().strip()
     reference = HuggingFacePackReference.model_validate_json(
-        (repository / "evaluation-packs" / "online-retail-ii-1.0.0.json").read_bytes()
+        (repository / "examples/evaluation" / "online-retail-ii-1.0.0.json").read_bytes()
     )
     study = BenchmarkStudy.model_validate(
         {

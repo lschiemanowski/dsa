@@ -13,7 +13,7 @@ from dsa import ModelConfiguration, RunPolicy, RunRequest, RunSuccess, run_analy
 from dsa.pack import HuggingFacePackReference, load_huggingface_evaluation_pack
 
 ROOT = Path(__file__).resolve().parents[1]
-LOCATOR = ROOT / "evaluation-packs/online-retail-ii-1.0.0.json"
+LOCATOR = ROOT / "examples/evaluation/online-retail-ii-1.0.0.json"
 CASE_IDS = (
     "cohort-01",
     "cohort-02",
@@ -52,8 +52,8 @@ def test_repository_pins_one_exact_public_pack_revision() -> None:
     assert value.manifest_sha256 == (
         "703a821304f96a1ca7e301dcb5391a2c858ff4c265a2283d14739ef003e3e33d"
     )
-    assert not (ROOT / "evaluation-packs/cases.jsonl").exists()
-    assert not (ROOT / "evaluation-packs/online_retail_ii.duckdb").exists()
+    assert not (ROOT / "examples/evaluation/cases.jsonl").exists()
+    assert not (ROOT / "examples/evaluation/online_retail_ii.duckdb").exists()
 
 
 @pytest.mark.integration
