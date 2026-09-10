@@ -95,17 +95,17 @@ The recorded demo used DeepSeek V4 Flash for analysis of the public database as 
 
 ## Benchmarks
 
-We evaluated `dsa` with GPT-5.6 Luna, DeepSeek V4 Flash 0731, and GLM 5.3 Flash on the three demo datasets. For this comparison, we use 296 questions that ship with the demo datasets: 98 for Online Retail II, 100 for SMARD, and 98 for EEA air quality. Four questions whose rounding instructions were inaccurate have been dropped.
+We evaluated `dsa` with GPT-5.6 Luna, DeepSeek V4 Flash 0731, GLM 5.3 Flash, and local Gemma 4 12B on the three demo datasets. For this comparison, we use 296 questions that ship with the demo datasets: 98 for Online Retail II, 100 for SMARD, and 98 for EEA air quality. Four questions whose rounding instructions were inaccurate have been dropped.
 
-Each question was run once in four configurations, with or without guidance and with or without a requested notebook. The guidance is part of the problem sets.
+Each question was evaluated in four configurations, with or without guidance and with or without a requested notebook. The guidance is part of the problem sets.
 
-| Guidance | Notebook requested | GPT-5.6 Luna | DeepSeek V4 Flash 0731 | GLM 5.3 Flash |
-|---|---|---:|---:|---:|
-| No | No | 256/296 (86.5%) | 257/296 (86.8%) | 221/296 (74.7%) |
-| No | Yes | 250/296 (84.5%) | 235/296 (79.4%) | 180/296 (60.8%) |
-| Yes | No | 257/296 (86.8%) | 255/296 (86.1%) | 225/296 (76.0%) |
-| Yes | Yes | 251/296 (84.8%) | 233/296 (78.7%) | 195/296 (65.9%) |
-| **All configurations** | | **1014/1,184 (85.6%)** | **980/1,184 (82.8%)** | **821/1,184 (69.3%)** |
+| Guidance | Notebook requested | GPT-5.6 Luna | DeepSeek V4 Flash 0731 | GLM 5.3 Flash | Gemma 4 12B Q8 MTP |
+|---|---|---:|---:|---:|---:|
+| No | No | 256/296 (86.5%) | 257/296 (86.8%) | 221/296 (74.7%) | 195/296 (65.9%) |
+| No | Yes | 250/296 (84.5%) | 235/296 (79.4%) | 180/296 (60.8%) | 95/296 (32.1%) |
+| Yes | No | 257/296 (86.8%) | 255/296 (86.1%) | 225/296 (76.0%) | 201/296 (67.9%) |
+| Yes | Yes | 251/296 (84.8%) | 233/296 (78.7%) | 195/296 (65.9%) | 112/296 (37.8%) |
+| **All configurations** | | **1014/1,184 (85.6%)** | **980/1,184 (82.8%)** | **821/1,184 (69.3%)** | **603/1,184 (50.9%)** |
 
 The following are observed OpenRouter inference costs in USD for the same 296 questions per configuration. Amounts marked * have incomplete cost coverage and are partial sums, not complete totals. Luna's costs reflect its Flex routing. These figures exclude local compute and the `dsa-chat` clarification conversation.
 

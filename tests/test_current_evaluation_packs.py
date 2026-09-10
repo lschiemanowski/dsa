@@ -20,7 +20,7 @@ CASES = {
 @pytest.mark.parametrize("slug", CASES)
 def test_current_locator_uses_versionless_path_and_immutable_revision(slug: str) -> None:
     ref = HuggingFacePackReference.model_validate_json(
-        (ROOT / "evaluation-packs" / f"{slug}.json").read_bytes()
+        (ROOT / "examples/evaluation" / f"{slug}.json").read_bytes()
     )
     assert ref.path == slug
     assert ref.revision == "f45a22879769fc02731f3dc55d126a8d6705d4b9"
@@ -31,7 +31,7 @@ def test_current_locator_uses_versionless_path_and_immutable_revision(slug: str)
 @pytest.mark.parametrize("slug", CASES)
 def test_current_pack_contains_the_latest_revised_cases(slug: str) -> None:
     ref = HuggingFacePackReference.model_validate_json(
-        (ROOT / "evaluation-packs" / f"{slug}.json").read_bytes()
+        (ROOT / "examples/evaluation" / f"{slug}.json").read_bytes()
     )
     pack = load_huggingface_evaluation_pack(ref)
     assert len(pack.cases) == 100
