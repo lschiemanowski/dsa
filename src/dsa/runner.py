@@ -182,6 +182,7 @@ async def run_analysis(
             now=now,
             keep_workdir=keep_workdir,
             telemetry=telemetry,
+            report_to_logfire=report_to_logfire,
         )
 
     return await run_with_logfire_reporting(
@@ -202,6 +203,7 @@ async def _run_canonical_analysis(
     now: Callable[[], datetime],
     keep_workdir: bool,
     telemetry: AnalysisTelemetry | None,
+    report_to_logfire: bool,
 ) -> RunCompletion:
     """Execute a validated request under its already-owned run identity."""
 
@@ -713,7 +715,8 @@ async def _run_canonical_analysis(
             tools=tools,
             capabilities=capabilities,
         )
-        agent.instrument = False
+        if report_to_logfire:
+            agent.instrument = False
         agent.output_validator(validate_answer)
         limits = UsageLimits(
             request_limit=canonical_request.policy.max_model_requests,

@@ -178,9 +178,12 @@ async def run_with_logfire_reporting[CompletionT: _ReportableCompletion](
             if isinstance(error, ModuleNotFoundError)
             else "logfire_setup_failed"
         )
-        return (await operation(None)).with_reporting(
-            LogfireReporting(status="failed", failure_code=code)
-        )
+        setup_failure = LogfireReporting(status="failed", failure_code=code)
+        try:
+            return (await operation(None)).with_reporting(setup_failure)
+        except asyncio.CancelledError as cancelled:
+            cast(Any, cancelled).reporting = setup_failure
+            raise
 
     failure_code: str | None = None
 

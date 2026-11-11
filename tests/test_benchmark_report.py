@@ -627,7 +627,10 @@ def test_report_case_rejects_exact_success_without_a_policy_match() -> None:
         )
 
 
-def test_report_aggregates_multiple_cells_from_case_counts(tmp_path: Path) -> None:
+@pytest.mark.parametrize("duplicate_trace_id", [False, True])
+def test_report_aggregates_multiple_cells_from_case_counts(
+    tmp_path: Path, duplicate_trace_id: bool
+) -> None:
     prepared = prepared_benchmark(tmp_path, cells=2)
     for index, cell in enumerate(prepared.cells):
         invocation = BenchmarkCellInvocation.from_prepared(prepared, cell, 1)
@@ -636,12 +639,26 @@ def test_report_aggregates_multiple_cells_from_case_counts(tmp_path: Path) -> No
             update={
                 "answer": {"count": 3 if index == 0 else 4},
                 "run_id": f"run-{index}",
+                "reporting": LogfireReporting(
+                    status="recorded",
+                    trace_id=f"{1 if duplicate_trace_id else index + 1:032x}",
+                ),
             }
         )
         selected = base.model_copy(update={"predictions": (prediction,)})
         retain_receipt_with_terminals(
             prepared, invocation, selected, total_tokens=100 + index
         )
+
+    if duplicate_trace_id:
+        with pytest.raises(ValueError, match="report analysis trace identities must be unique"):
+            build_benchmark_report(
+                prepared.study,
+                prepared.runtime,
+                reporter_revision=REPORTER_REVISION,
+                pack_loader=lambda _reference: prepared.packs[0][1],
+            )
+        return
 
     report = build_benchmark_report(
         prepared.study,

@@ -10,7 +10,7 @@ from collections.abc import Callable
 from copy import deepcopy
 from hashlib import sha256
 from pathlib import Path
-from typing import cast
+from typing import TypedDict, cast
 
 from pydantic import Field, JsonValue, TypeAdapter, model_validator
 from pydantic_ai.models import Model
@@ -161,78 +161,60 @@ def evaluation_prediction(
     )
 
 
-def end_to_end_exact_success(
-    outputs: EvaluationPrediction | dict[str, JsonValue],
-    expectations: dict[str, JsonValue],
-) -> bool:
-    prediction = _prediction(outputs)
-    expected, _scorer = _decode_scoring_expectations(expectations)
-    return (
-        prediction.accepted
-        and exact_json_equal(prediction.answer, expected)
-    )
+class PredictionScores(TypedDict):
+    end_to_end_exact_success: bool
+    end_to_end_policy_success: bool
+    conditional_exact_json: bool | None
+    conditional_policy_match: bool | None
+    agent_failure: bool
+    infrastructure_failure: bool
 
 
-def conditional_exact_json(
-    outputs: EvaluationPrediction | dict[str, JsonValue],
-    expectations: dict[str, JsonValue],
-) -> bool | None:
-    prediction = _prediction(outputs)
-    if not prediction.accepted:
-        return None
-    expected, _scorer = _decode_scoring_expectations(expectations)
-    return exact_json_equal(prediction.answer, expected)
-
-
-def end_to_end_policy_success(
-    outputs: EvaluationPrediction | dict[str, JsonValue],
-    expectations: dict[str, JsonValue],
-) -> bool:
-    """Score accepted answers under the pack comparison policy."""
-    prediction = _prediction(outputs)
-    return (
-        prediction.accepted
-        and json_answers_equal(prediction.answer, expectations)
-    )
-
-
-def conditional_policy_match(
-    outputs: EvaluationPrediction | dict[str, JsonValue],
-    expectations: dict[str, JsonValue],
-) -> bool | None:
-    """Score accepted answers under the pack policy without failures in the denominator."""
-    prediction = _prediction(outputs)
-    if not prediction.accepted:
-        return None
-    return json_answers_equal(prediction.answer, expectations)
-
-
-def agent_failure(
-    outputs: EvaluationPrediction | dict[str, JsonValue],
-    expectations: dict[str, JsonValue],
-) -> bool:
-    prediction = _prediction(outputs)
-    if infrastructure_failure(prediction):
-        return False
-    if not prediction.accepted:
-        return True
-    return not json_answers_equal(prediction.answer, expectations)
-
-
-def infrastructure_failure(
-    outputs: EvaluationPrediction | dict[str, JsonValue],
-) -> bool:
-    prediction = _prediction(outputs)
+def score_prediction(
+    prediction: EvaluationPrediction, expected: JsonValue, scorer: PackScorer
+) -> PredictionScores:
+    """Score a validated prediction against a verified pack case."""
+    exact: bool | None = None
+    policy: bool | None = None
     if prediction.accepted:
-        return False
-    if prediction.failure_stage in {"analysis_environment", "cancelled"}:
+        exact = exact_json_equal(prediction.answer, expected)
+        policy = exact or (
+            isinstance(scorer, JsonNumericToleranceScorer)
+            and _tolerant_json_equal(prediction.answer, expected, scorer)
+        )
+    return score_outcome(
+        prediction.accepted, prediction.failure_stage, prediction.failure_code, exact, policy
+    )
+
+
+def score_outcome(
+    accepted: bool,
+    failure_stage: FailureStage | None,
+    failure_code: str | None,
+    exact: bool | None,
+    policy: bool | None,
+) -> PredictionScores:
+    """Derive classifications from the outcome and conditional scores."""
+    infrastructure = not accepted and _infrastructure_failure(failure_stage, failure_code)
+    return {
+        "end_to_end_exact_success": exact is True,
+        "end_to_end_policy_success": policy is True,
+        "conditional_exact_json": exact,
+        "conditional_policy_match": policy,
+        "agent_failure": not infrastructure and policy is not True,
+        "infrastructure_failure": infrastructure,
+    }
+
+
+def _infrastructure_failure(stage: FailureStage | None, code: str | None) -> bool:
+    if stage in {"analysis_environment", "cancelled"}:
         return True
-    if prediction.failure_stage == "model" and prediction.failure_code in {
+    if stage == "model" and code in {
         "model_api_error",
         "model_http_error",
     }:
         return True
-    return prediction.failure_stage == "orchestration" and prediction.failure_code in {
+    return stage == "orchestration" and code in {
         "internal_error",
         "run_timeout",
         "tool_result_limit_exceeded",
@@ -349,17 +331,6 @@ def _verify_pack_database(pack: LoadedEvaluationPack) -> None:
         raise EvaluationError("evaluation_database_unavailable") from None
     if digest.hexdigest() != expected.sha256:
         raise EvaluationError("evaluation_database_mismatch")
-
-
-def _prediction(
-    value: EvaluationPrediction | dict[str, JsonValue],
-) -> EvaluationPrediction:
-    data = (
-        value.model_dump(mode="python")
-        if isinstance(value, EvaluationPrediction)
-        else value
-    )
-    return EvaluationPrediction.model_validate(data)
 
 
 def _canonical_json(value: JsonValue) -> str:

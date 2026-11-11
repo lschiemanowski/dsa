@@ -146,3 +146,68 @@ def test_logfire_experiment_exports_safe_scores_from_retained_predictions(
     serialized = json.dumps(spans, default=str)
     assert "87654321" not in serialized
     assert pack.cases[0].question not in serialized
+
+
+async def test_cancelled_run_keeps_logfire_setup_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from dsa.run_cli import _cancelled_completion  # pyright: ignore[reportPrivateUsage]
+
+    monkeypatch.delenv("LOGFIRE_TOKEN", raising=False)
+    request = valid_request(tmp_path)
+    model_started = asyncio.Event()
+
+    async def wait_for_cancellation(
+        _messages: list[ModelMessage], _info: AgentInfo
+    ) -> ModelResponse:
+        model_started.set()
+        await asyncio.Future[None]()
+        raise AssertionError("model should have been cancelled")
+
+    task = asyncio.create_task(run_analysis(
+        request,
+        runs_directory=tmp_path / "runs",
+        model=FunctionModel(wait_for_cancellation),
+        report_to_logfire=True,
+    ))
+    await asyncio.wait_for(model_started.wait(), timeout=5)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError) as caught:
+        await task
+
+    completion = _cancelled_completion(caught.value)
+    assert completion is not None
+    assert isinstance(completion.outcome, RunFailure)
+    assert completion.outcome.failure.code == "cancelled_by_caller"
+    assert completion.reporting.status == "failed"
+    assert completion.reporting.failure_code == "logfire_token_missing"
+
+
+async def test_host_instrumentation_is_preserved_without_logfire_opt_in(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pytest.importorskip("logfire")
+    from logfire.testing import TestExporter
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from pydantic_ai import Agent
+    from pydantic_ai.models.instrumented import InstrumentationSettings
+
+    exporter = TestExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    monkeypatch.setattr(
+        Agent, "_instrument_default", InstrumentationSettings(tracer_provider=provider)
+    )
+
+    try:
+        completion = await run_analysis(
+            valid_request(tmp_path),
+            runs_directory=tmp_path / "runs",
+            model=TestModel(call_tools=[], custom_output_args={"count": 3}),
+        )
+        assert isinstance(completion.outcome, RunSuccess)
+        assert completion.reporting.status == "disabled"
+        assert exporter.exported_spans
+    finally:
+        provider.shutdown()

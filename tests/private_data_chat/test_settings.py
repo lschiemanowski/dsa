@@ -225,3 +225,15 @@ def test_configuration_rejects_missing_invalid_or_relative_values(tmp_path: Path
     invalid_guidance["DSA_CHAT_ENABLE_ANALYSIS_GUIDANCE"] = "sometimes"
     with pytest.raises(ValueError, match="DSA_CHAT_ENABLE_ANALYSIS_GUIDANCE"):
         load_configuration(invalid_guidance)
+
+
+
+def test_legacy_environment_flag_requires_explicit_logfire_opt_in(tmp_path: Path) -> None:
+    values = environment(tmp_path)
+    del values["DSA_CHAT_REPORT_TO_LOGFIRE"]
+    values["DSA_CHAT_REPORT_TO_MLFLOW"] = "false"
+    assert load_configuration(values).dsa.report_to_logfire is False
+
+    values["DSA_CHAT_REPORT_TO_MLFLOW"] = "true"
+    with pytest.raises(ValueError, match="DSA_CHAT_REPORT_TO_LOGFIRE"):
+        load_configuration(values)

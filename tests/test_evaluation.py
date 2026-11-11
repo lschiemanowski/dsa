@@ -13,21 +13,18 @@ from pydantic_ai.models.test import TestModel
 from dsa import EvaluationError, LogfireReporting, RunCompletion, RunRequest
 from dsa.evaluation import (
     EvaluationPrediction,
-    agent_failure,
-    conditional_exact_json,
-    conditional_policy_match,
-    end_to_end_exact_success,
-    end_to_end_policy_success,
     exact_json_equal,
-    infrastructure_failure,
     json_answers_equal,
     run_evaluation,
+    score_prediction,
 )
 from dsa.pack import (
     EvaluationCaseMetadata,
     EvaluationPackCase,
     EvaluationPackManifest,
+    ExactJsonScorer,
     HuggingFacePackReference,
+    JsonNumericToleranceScorer,
     LoadedEvaluationPack,
 )
 
@@ -151,10 +148,8 @@ def test_case_rejects_expectation_outside_answer_schema(tmp_path: Path) -> None:
 
 
 def test_exact_json_and_failure_scorers_cover_the_all_case_denominator() -> None:
-    expectations: dict[str, JsonValue] = {
-        "answer": '{"count":3}',
-        "scorer": '{"name":"exact-json","version":"1"}',
-    }
+    scorer = ExactJsonScorer(name="exact-json", version="1")
+    expected: dict[str, JsonValue] = {"count": 3}
     exact = prediction()
     wrong = prediction(answer={"count": 4})
     provider = prediction(
@@ -178,41 +173,47 @@ def test_exact_json_and_failure_scorers_cover_the_all_case_denominator() -> None
 
     assert exact_json_equal({"b": 2, "a": 1}, {"a": 1, "b": 2}) is True
     assert exact_json_equal(1, 1.0) is False
-    assert end_to_end_exact_success(exact, expectations) is True
-    assert conditional_exact_json(exact, expectations) is True
-    assert agent_failure(exact, expectations) is False
-    assert infrastructure_failure(exact) is False
+    assert score_prediction(exact, expected, scorer) == {
+        "end_to_end_exact_success": True,
+        "end_to_end_policy_success": True,
+        "conditional_exact_json": True,
+        "conditional_policy_match": True,
+        "agent_failure": False,
+        "infrastructure_failure": False,
+    }
+    assert score_prediction(wrong, expected, scorer) == {
+        "end_to_end_exact_success": False,
+        "end_to_end_policy_success": False,
+        "conditional_exact_json": False,
+        "conditional_policy_match": False,
+        "agent_failure": True,
+        "infrastructure_failure": False,
+    }
+    provider_scores = score_prediction(provider, expected, scorer)
+    assert provider_scores == {
+        "end_to_end_exact_success": False,
+        "end_to_end_policy_success": False,
+        "conditional_exact_json": None,
+        "conditional_policy_match": None,
+        "agent_failure": False,
+        "infrastructure_failure": True,
+    }
+    invalid_scores = score_prediction(invalid, expected, scorer)
+    assert invalid_scores["infrastructure_failure"] is False
+    assert invalid_scores["agent_failure"] is True
 
-    assert end_to_end_exact_success(wrong, expectations) is False
-    assert conditional_exact_json(wrong, expectations) is False
-    assert agent_failure(wrong, expectations) is True
-
-    assert end_to_end_exact_success(provider, expectations) is False
-    assert conditional_exact_json(provider, expectations) is None
-    assert infrastructure_failure(provider) is True
-    assert agent_failure(provider, expectations) is False
-
-    assert infrastructure_failure(invalid) is False
-    assert agent_failure(invalid, expectations) is True
-
-    for code in (
-        "run_timeout",
-        "tool_result_limit_exceeded",
-        "usage_limit_exceeded",
-    ):
+    for code in ("run_timeout", "tool_result_limit_exceeded", "usage_limit_exceeded"):
         host_limit = prediction(
             accepted=False,
             answer=None,
             failure_stage="orchestration",
             failure_code=code,
         )
-        assert infrastructure_failure(host_limit) is True
-        assert agent_failure(host_limit, expectations) is False
+        assert score_prediction(host_limit, expected, scorer) == provider_scores
 
-    assert end_to_end_exact_success(reporting_failed, expectations) is True
-    assert conditional_exact_json(reporting_failed, expectations) is True
-    assert infrastructure_failure(reporting_failed) is False
-    assert agent_failure(reporting_failed, expectations) is False
+    assert score_prediction(reporting_failed, expected, scorer) == score_prediction(
+        exact, expected, scorer
+    )
 
 
 def test_numeric_tolerance_is_explicit_recursive_and_never_weakens_integers() -> None:
@@ -234,11 +235,19 @@ def test_numeric_tolerance_is_explicit_recursive_and_never_weakens_integers() ->
     tolerated = prediction(
         answer={"count": 3, "ratio": 0.10000000001, "values": [1, True]}
     )
-    assert conditional_exact_json(tolerated, expectations) is False
-    assert end_to_end_exact_success(tolerated, expectations) is False
-    assert conditional_policy_match(tolerated, expectations) is True
-    assert end_to_end_policy_success(tolerated, expectations) is True
-    assert agent_failure(tolerated, expectations) is False
+    scores = score_prediction(
+        tolerated,
+        {"count": 3, "ratio": 0.1, "values": [1.0, True]},
+        JsonNumericToleranceScorer.model_validate(scorer),
+    )
+    assert scores == {
+        "end_to_end_exact_success": False,
+        "end_to_end_policy_success": True,
+        "conditional_exact_json": False,
+        "conditional_policy_match": True,
+        "agent_failure": False,
+        "infrastructure_failure": False,
+    }
     assert json_answers_equal(
         {"count": 3.0, "ratio": 0.1, "values": [1, True]},
         expectations,

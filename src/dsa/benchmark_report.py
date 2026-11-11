@@ -34,16 +34,7 @@ from dsa.cost import (
     provider_cost_from_messages,
     safe_openrouter_response_ids,
 )
-from dsa.evaluation import (
-    EvaluationPrediction,
-    agent_failure,
-    conditional_exact_json,
-    conditional_policy_match,
-    end_to_end_exact_success,
-    end_to_end_policy_success,
-    exact_json_equal,
-    infrastructure_failure,
-)
+from dsa.evaluation import EvaluationPrediction, exact_json_equal, score_outcome, score_prediction
 from dsa.pack import EvaluationPackCase, LoadedEvaluationPack, load_huggingface_evaluation_pack
 from dsa.plots import MAX_NOTEBOOK_BYTES
 from dsa.record import (
@@ -234,34 +225,14 @@ class BenchmarkCaseOutcome(ContractModel):
             and self.conditional_policy_match is not True
         ):
             raise ValueError("exact match must satisfy the pack policy")
-        projection = EvaluationPrediction(
-            case_id=self.case_id,
-            run_id=self.run_id,
-            terminal_sha256=self.terminal_sha256,
-            accepted=self.accepted,
-            answer=None,
-            failure_stage=self.failure_stage,
-            failure_code=self.failure_code,
-            reporting=self.reporting,
+        scores = score_outcome(
+            self.accepted,
+            self.failure_stage,
+            self.failure_code,
+            self.conditional_exact_json,
+            self.conditional_policy_match,
         )
-        expected_infrastructure = infrastructure_failure(projection)
-        expected_agent = not expected_infrastructure and (
-            not self.accepted or self.conditional_policy_match is False
-        )
-        expected_end_to_end_exact = (
-            self.accepted
-            and self.conditional_exact_json is True
-        )
-        expected_end_to_end_policy = (
-            self.accepted
-            and self.conditional_policy_match is True
-        )
-        if (
-            self.infrastructure_failure != expected_infrastructure
-            or self.agent_failure != expected_agent
-            or self.end_to_end_exact_success != expected_end_to_end_exact
-            or self.end_to_end_policy_success != expected_end_to_end_policy
-        ):
+        if any(getattr(self, name) != value for name, value in scores.items()):
             raise ValueError("case scorer outcomes are inconsistent")
         return self
 
@@ -381,6 +352,13 @@ class BenchmarkReport(ContractModel):
         run_ids = tuple(item.run_id for item in case_outcomes)
         if len(run_ids) != len(set(run_ids)):
             raise ValueError("report analysis run identities must be unique")
+        trace_ids = [
+            outcome.reporting.trace_id
+            for outcome in case_outcomes
+            if outcome.reporting.trace_id is not None
+        ]
+        if len(trace_ids) != len(set(trace_ids)):
+            raise ValueError("report analysis trace identities must be unique")
         if tuple(item.model_id for item in self.models) != model_ids:
             raise ValueError("report model aggregates do not match its study")
         expected_pairs = tuple(
@@ -736,13 +714,7 @@ def _verify_and_compute_cell(
     for prediction in receipt.predictions:
         terminal = terminals[prediction.run_id]
         case = cases[prediction.case_id]
-        expectations = case.scoring_expectations(pack.manifest)
-        exact = end_to_end_exact_success(prediction, expectations)
-        conditional = conditional_exact_json(prediction, expectations)
-        policy = end_to_end_policy_success(prediction, expectations)
-        conditional_policy = conditional_policy_match(prediction, expectations)
-        agent = agent_failure(prediction, expectations)
-        infrastructure = infrastructure_failure(prediction)
+        scores = score_prediction(prediction, case.expected_answer, pack.manifest.scorer)
         computations.append(
             _CaseComputation(
                 outcome=BenchmarkCaseOutcome(
@@ -753,13 +725,8 @@ def _verify_and_compute_cell(
                     failure_stage=prediction.failure_stage,
                     failure_code=prediction.failure_code,
                     reporting=prediction.reporting,
-                    end_to_end_exact_success=exact,
-                    end_to_end_policy_success=policy,
-                    conditional_exact_json=conditional,
-                    conditional_policy_match=conditional_policy,
-                    agent_failure=agent,
-                    infrastructure_failure=infrastructure,
                     provider_cost=terminal.provider_cost,
+                    **scores,
                 ),
                 observations=terminal.observations,
             )

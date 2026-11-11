@@ -5,15 +5,7 @@ from __future__ import annotations
 import asyncio
 from typing import TYPE_CHECKING
 
-from dsa.evaluation import (
-    EvaluationPrediction,
-    agent_failure,
-    conditional_exact_json,
-    conditional_policy_match,
-    end_to_end_exact_success,
-    end_to_end_policy_success,
-    infrastructure_failure,
-)
+from dsa.evaluation import EvaluationPrediction, score_prediction
 from dsa.pack import LoadedEvaluationPack
 from dsa.reporting import (
     LogfireConfigurationMissing,
@@ -44,21 +36,11 @@ def record_experiment(
         scores: dict[str, dict[str, bool]] = {}
         for case in pack.cases:
             prediction = by_id[case.case_id]
-            expectations = case.scoring_expectations(pack.manifest)
-            flags = {
+            summary = score_prediction(prediction, case.expected_answer, pack.manifest.scorer)
+            scores[case.case_id] = {
                 "completion": prediction.accepted,
-                "end_to_end_exact_success": end_to_end_exact_success(prediction, expectations),
-                "end_to_end_policy_success": end_to_end_policy_success(prediction, expectations),
-                "agent_failure": agent_failure(prediction, expectations),
-                "infrastructure_failure": infrastructure_failure(prediction),
+                **{name: value for name, value in summary.items() if isinstance(value, bool)},
             }
-            exact = conditional_exact_json(prediction, expectations)
-            policy = conditional_policy_match(prediction, expectations)
-            if exact is not None:
-                flags["conditional_exact_json"] = exact
-            if policy is not None:
-                flags["conditional_policy_match"] = policy
-            scores[case.case_id] = flags
 
         def retained_case(case_id: str) -> dict[str, str]:
             prediction = by_id[case_id]

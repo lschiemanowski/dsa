@@ -149,6 +149,8 @@ set `LOGFIRE_TOKEN` in the host environment, and set `report_to_logfire = true` 
 or `DSA_CHAT_REPORT_TO_LOGFIRE=true` when using environment-only configuration.
 Logfire receives operational metadata such as timings, usage, and failure codes. Prompts,
 answers, tool arguments and results, and retained files stay out of telemetry.
+Existing MLflow settings set to false can stay in place. Remove any enabled MLflow setting
+and enable Logfire explicitly if you want telemetry.
 
 Analysis guidance is disabled by default. Set `enable_analysis_guidance = true` in the TOML file,
 or `DSA_CHAT_ENABLE_ANALYSIS_GUIDANCE=true` when using environment-only configuration, to let the
