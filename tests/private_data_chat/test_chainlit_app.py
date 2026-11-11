@@ -7,14 +7,13 @@ from types import SimpleNamespace
 import pytest
 
 from apps.private_data_chat.contracts import (
-    MockDatabaseContext,
-    MockRelation,
     ProposalBinding,
     ProposalPayload,
     ProposalRecord,
     ProposalStatus,
     proposal_digest,
 )
+from apps.private_data_chat.service import model_display_name, welcome_message
 from tests.private_data_chat.test_database_card import MODEL_ONLY_NOTE, card
 
 from .test_contracts import proposal_payload
@@ -59,19 +58,7 @@ async def test_plot_elements_use_verified_bytes_and_escape_labels(
 
 
 def test_welcome_combines_fixed_trust_flow_with_dataset_context() -> None:
-    pytest.importorskip("chainlit")
-    application = importlib.import_module("apps.private_data_chat.chainlit_app")
-    context = MockDatabaseContext(
-        data_source_id="retail",
-        display_name="Online Retail II — synthetic examples only",
-        relations=(MockRelation(name="analysis.lines", columns=("value",)),),
-    )
-
-    message = application._welcome_message(
-        context,
-        card(),
-        application._model_display_name("openrouter:example/remote-model"),
-    )
+    message = welcome_message(card(), model_display_name("openrouter:example/remote-model"))
 
     assert message.startswith("## Instructions")
     assert "**remote-model**" in message
@@ -92,42 +79,23 @@ def test_welcome_combines_fixed_trust_flow_with_dataset_context() -> None:
     assert MODEL_ONLY_NOTE not in message
 
 
-def test_welcome_without_card_keeps_mock_label_internal() -> None:
-    pytest.importorskip("chainlit")
-    application = importlib.import_module("apps.private_data_chat.chainlit_app")
-    context = MockDatabaseContext(
-        data_source_id="example", display_name="Internal synthetic examples only",
-        relations=(MockRelation(name="analysis.lines", columns=("value",)),),
-    )
-    message = application._welcome_message(context, None, "model")
+def test_welcome_without_card_uses_generic_database_description() -> None:
+    message = welcome_message(None, "model")
     assert "## About this database" in message
-    assert "synthetic" not in message
-    assert "Internal" not in message
+    assert "Ask quantitative questions about the configured database." in message
 
 
 def test_welcome_escapes_database_title() -> None:
-    pytest.importorskip("chainlit")
-    application = importlib.import_module("apps.private_data_chat.chainlit_app")
-    context = MockDatabaseContext(
-        data_source_id="example", display_name="Internal",
-        relations=(MockRelation(name="analysis.lines", columns=("value",)),),
-    )
     title = "![pixel](https://example.org/image)"
-    message = application._welcome_message(
-        context, card().model_copy(update={"title": title}), "model"
-    )
+    message = welcome_message(card().model_copy(update={"title": title}), "model")
     assert title not in message
 
 
 def test_model_display_name_omits_provider_and_routing_qualifiers() -> None:
-    pytest.importorskip("chainlit")
-    application = importlib.import_module("apps.private_data_chat.chainlit_app")
-
-    assert (
-        application._model_display_name("openrouter:deepseek/deepseek-v4-flash-0731")
-        == "deepseek-v4-flash-0731"
+    assert model_display_name("openrouter:deepseek/deepseek-v4-flash-0731") == (
+        "deepseek-v4-flash-0731"
     )
-    assert application._model_display_name("openai-chat:local-model") == "local-model"
+    assert model_display_name("openai-chat:local-model") == "local-model"
 
 
 def test_chainlit_adapter_imports_and_strictly_checks_actions() -> None:

@@ -255,6 +255,28 @@ async def test_approved_proposal_must_execute_before_expiry() -> None:
     assert executor.requests == []
 
 
+async def test_approval_claims_run_before_background_execution() -> None:
+    clock = ManualClock()
+    executor = FakeAnalysisExecutor(successful_outcome())
+    service = broker(executor, clock, ttl=timedelta(seconds=1))
+    proposal = await proposed(service)
+    clock.value += timedelta(milliseconds=999)
+    task = await service.approve_and_start(
+        proposal_id=proposal.proposal_id,
+        proposal_sha256=proposal.proposal_sha256,
+        user_id="user-1",
+        conversation_id="chat-1",
+    )
+    assert executor.requests == []
+
+    clock.value += timedelta(milliseconds=1)
+    result = await task
+
+    assert result.status == "succeeded"
+    assert len(executor.requests) == 1
+    assert executor.requests[0].proposal_sha256 == proposal.proposal_sha256
+
+
 async def test_concurrent_execute_does_not_duplicate_analysis() -> None:
     clock = ManualClock()
     gate = asyncio.Event()

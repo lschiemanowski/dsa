@@ -184,6 +184,40 @@ actual boundary.
 
 See [THREAT_MODEL.md](THREAT_MODEL.md) for the boundary assumptions and demo limitations.
 
+## HTTP API development
+
+Start the single-process API on loopback with the same host configuration as the chat launcher:
+
+```bash
+DSA_CHAT_CONFIG_PATH="$PWD/private-data-chat.toml" \
+  uv run --extra chat uvicorn apps.private_data_chat.http_api:create_app --factory \
+  --host 127.0.0.1 --port 8001
+```
+
+Use the interactive API docs at `http://127.0.0.1:8001/docs`. The API uses an HTTP-only cookie to
+identify the owning browser session. Keep the same cookie and conversation ID across requests.
+
+| Method and path | Request and result |
+| --- | --- |
+| `POST /api/conversations` | Create a conversation and set the session cookie. |
+| `POST /api/conversations/{id}/messages` | Send `{"text": "..."}` and get the updated conversation. |
+| `POST /api/conversations/{id}/proposals/{proposal_id}/decision` | Send `{"decision": "approve", "digest": "..."}` or use `"revise"`. Approval starts one run and returns HTTP 202. |
+| `GET /api/conversations/{id}` | Get the transcript, pending proposal ID, and run state. Poll while the status is `running`. |
+| `GET /api/conversations/{id}/notebook` | Download the verified notebook when the result includes a notebook URL. |
+
+Proposal messages contain a structured `payload` and server-serialized `request_json`. A successful
+result includes the structured `answer` and `response_json`. The serialized forms preserve the exact
+values for inspection. Review uses the stored proposal ID and digest, and repeated approvals
+return the existing run state. An approval accepted before expiry claims its run before the
+executor starts.
+
+The HTTP API keeps up to eight conversations per browser and 64 per process. Conversations are
+removed after one hour of inactivity. Clarification and analysis in progress are kept until they
+finish. Up to two analyses can run at a time. If both slots are occupied, approval returns HTTP
+429 with `analysis_capacity_reached` and the proposal can be approved again while it is valid.
+Sessions are held in memory and are lost on server restart. The API accepts localhost and IPv4
+and IPv6 loopback. `dsa chat` continues to launch the Chainlit UI during this stage of the migration.
+
 ## Optional plots
 
 Ask for a chart and review `allow_plots: true` in the proposal before approving.

@@ -24,7 +24,9 @@ dsa-run = "dsa.run_cli:main"
 [project.optional-dependencies]
 chat = [
     "chainlit==2.12.0; python_version < '3.14'",
+    "fastapi>=0.141.1,<1",
     "huggingface-hub>=1,<2",
+    "uvicorn>=0.52.4,<1",
 ]
 huggingface = [
     "huggingface-hub>=1,<2",
@@ -37,6 +39,7 @@ logfire = [
 
 [dependency-groups]
 dev = [
+    "httpx>=0.28.1,<1",
     "pyarrow-stubs==20.0.0.20260819",
     "pyright>=1.1.408,<2",
     "pytest>=9,<10",

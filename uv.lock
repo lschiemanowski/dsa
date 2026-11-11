@@ -531,7 +531,9 @@ dependencies = [
 [package.optional-dependencies]
 chat = [
     { name = "chainlit", marker = "python_full_version < '3.14'" },
+    { name = "fastapi" },
     { name = "huggingface-hub" },
+    { name = "uvicorn" },
 ]
 huggingface = [
     { name = "huggingface-hub" },
@@ -544,6 +546,7 @@ logfire = [
 
 [package.dev-dependencies]
 dev = [
+    { name = "httpx" },
     { name = "pyarrow-stubs" },
     { name = "pyright" },
     { name = "pytest" },
@@ -555,6 +558,7 @@ dev = [
 requires-dist = [
     { name = "chainlit", marker = "python_full_version < '3.14' and extra == 'chat'", specifier = "==2.12.0" },
     { name = "duckdb", specifier = "==1.5.5" },
+    { name = "fastapi", marker = "extra == 'chat'", specifier = ">=0.141.1,<1" },
     { name = "huggingface-hub", marker = "extra == 'chat'", specifier = ">=1,<2" },
     { name = "huggingface-hub", marker = "extra == 'huggingface'", specifier = ">=1,<2" },
     { name = "jsonschema", specifier = ">=4.25,<5" },
@@ -568,11 +572,13 @@ requires-dist = [
     { name = "pydantic-evals", extras = ["logfire"], marker = "extra == 'logfire'", specifier = ">=1.107.5,<2" },
     { name = "referencing", specifier = ">=0.37,<1" },
     { name = "tomli-w", specifier = ">=1.2,<2" },
+    { name = "uvicorn", marker = "extra == 'chat'", specifier = ">=0.52.4,<1" },
 ]
 provides-extras = ["chat", "huggingface", "logfire"]
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "httpx", specifier = ">=0.28.1,<1" },
     { name = "pyarrow-stubs", specifier = "==20.0.0.20260819" },
     { name = "pyright", specifier = ">=1.1.408,<2" },
     { name = "pytest", specifier = ">=9,<10" },
@@ -2985,7 +2991,7 @@ version = "1.6.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "anyio" },
-    { name = "typing-extensions", marker = "python_full_version != '3.13.*'" },
+    { name = "typing-extensions", marker = "python_full_version < '3.13'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/b5/b4/205b0d5241d934e8add0c38aa924c4f9fb7330834ff11e5444db964ec3f9/starlette-1.6.0.tar.gz", hash = "sha256:d4e3ac5e546444960c710297a3c9fc3f7ebae1b7e963f3d36173b49da535be9b", size = 2716969, upload-time = "2026-08-08T18:27:57.512Z" }
 wheels = [
