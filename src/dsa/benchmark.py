@@ -9,12 +9,12 @@ import re
 import signal
 import stat
 import sys
-from collections.abc import Awaitable, Callable, Mapping
-from contextlib import contextmanager, suppress
+from collections.abc import Awaitable, Callable, Coroutine
+from contextlib import suppress
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
-from typing import Annotated, Literal, cast
+from typing import Annotated, Any, Literal, cast
 from uuid import uuid4
 
 from pydantic import Field, field_validator, model_validator
@@ -27,34 +27,22 @@ from dsa.docker import (
     default_docker_configuration,
 )
 from dsa.evaluation import (
-    MlflowEvaluationError,
-    MlflowEvaluationPrediction,
-    MlflowEvaluationResult,
-    run_mlflow_evaluation,
+    EvaluationError,
+    EvaluationPrediction,
+    EvaluationResult,
+    run_evaluation,
 )
-from dsa.mlflow_config import (
-    SAFE_DATASET_NAME_PATTERN,
-    MlflowConfigurationError,
-    dataset_name_matches_backend,
-    load_mlflow_configuration,
-)
+from dsa.evaluation_telemetry import record_experiment
 from dsa.pack import (
     HuggingFacePackReference,
     LoadedEvaluationPack,
     load_huggingface_evaluation_pack,
 )
+from dsa.reporting import LogfireReporting
 
 SafeName = Annotated[
     str,
     Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"),
-]
-SafeDatasetName = Annotated[
-    str,
-    Field(pattern=SAFE_DATASET_NAME_PATTERN, max_length=386),
-]
-SafeRemoteId = Annotated[
-    str,
-    Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$"),
 ]
 GitRevision = Annotated[str, Field(pattern=r"^[0-9a-f]{40}$")]
 ImmutableImage = Annotated[
@@ -153,34 +141,12 @@ class BenchmarkStudy(ContractModel):
         return sha256(self.canonical_json.encode()).hexdigest()
 
 
-class BenchmarkDatasetBinding(ContractModel):
-    """One host-selected MLflow dataset name for a study pack."""
-
-    pack_id: SafeName
-    dataset_name: SafeDatasetName
-
-
 class BenchmarkRuntime(ContractModel):
     """Non-secret host bindings deliberately outside study identity."""
 
-    format: Literal["dsa-benchmark-runtime/v1"]
+    format: Literal["dsa-benchmark-runtime/v2"]
     workspace_root: Path
-    datasets: tuple[BenchmarkDatasetBinding, ...] = Field(min_length=1, max_length=64)
-
-    @field_validator("datasets")
-    @classmethod
-    def unique_ordered_datasets(
-        cls,
-        value: tuple[BenchmarkDatasetBinding, ...],
-    ) -> tuple[BenchmarkDatasetBinding, ...]:
-        ordered = tuple(sorted(value, key=lambda item: item.pack_id))
-        identities = tuple(item.pack_id for item in ordered)
-        if len(identities) != len(set(identities)):
-            raise ValueError("runtime dataset identities must be unique")
-        dataset_names = tuple(item.dataset_name for item in ordered)
-        if len(dataset_names) != len(set(dataset_names)):
-            raise ValueError("runtime dataset names must be unique across packs")
-        return ordered
+    report_to_logfire: bool = False
 
     @property
     def canonical_json(self) -> str:
@@ -200,12 +166,12 @@ class BenchmarkCell(ContractModel):
 class BenchmarkCellInvocation(ContractModel):
     """One complete secret-free payload accepted by an isolated worker."""
 
-    format: Literal["dsa-benchmark-cell-invocation/v1"] = (
-        "dsa-benchmark-cell-invocation/v1"
+    format: Literal["dsa-benchmark-cell-invocation/v2"] = (
+        "dsa-benchmark-cell-invocation/v2"
     )
     cell: BenchmarkCell
     pack_reference: HuggingFacePackReference
-    dataset_name: SafeDatasetName
+    report_to_logfire: bool = False
     model_configuration: ModelConfiguration
     policy: RunPolicy
     docker_image: ImmutableImage
@@ -253,9 +219,9 @@ class BenchmarkCellInvocation(ContractModel):
 
 
 class BenchmarkCellReceipt(ContractModel):
-    """Canonical local correlation for one completed MLflow evaluation cell."""
+    """Canonical local evidence for one completed evaluation cell."""
 
-    format: Literal["dsa-benchmark-cell/v1"] = "dsa-benchmark-cell/v1"
+    format: Literal["dsa-benchmark-cell/v2"] = "dsa-benchmark-cell/v2"
     study_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     cell_id: str = Field(pattern=r"^cell-[0-9a-f]{64}$")
     pack_id: SafeName
@@ -263,21 +229,18 @@ class BenchmarkCellReceipt(ContractModel):
     repetition: Annotated[int, Field(ge=0)]
     agent_revision: GitRevision
     docker_image: ImmutableImage
-    dataset_name: SafeDatasetName
-    dataset_id: SafeRemoteId
-    dataset_digest: SafeRemoteId
-    evaluation_run_id: SafeRemoteId
-    predictions: tuple[MlflowEvaluationPrediction, ...]
+    pack_manifest_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    predictions: tuple[EvaluationPrediction, ...]
 
     @field_validator("predictions")
     @classmethod
     def prediction_identities_are_unique(
         cls,
-        value: tuple[MlflowEvaluationPrediction, ...],
-    ) -> tuple[MlflowEvaluationPrediction, ...]:
+        value: tuple[EvaluationPrediction, ...],
+    ) -> tuple[EvaluationPrediction, ...]:
         identities = tuple(item.case_id for item in value)
-        if len(identities) != len(set(identities)):
-            raise ValueError("receipt prediction identities must be unique")
+        if len(identities) != len(set(identities)) or len(value) != len({p.run_id for p in value}):
+            raise ValueError("receipt prediction and run identities must be unique")
         return value
 
     @property
@@ -300,6 +263,9 @@ class BenchmarkWorkerCompleted(ContractModel):
     status: Literal["completed"] = "completed"
     cell_id: str = Field(pattern=r"^cell-[0-9a-f]{64}$")
     receipt_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    experiment_reporting: LogfireReporting | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
 
 class BenchmarkWorkerFailed(ContractModel):
@@ -331,6 +297,10 @@ class BenchmarkCellRunResult(ContractModel):
         pattern=r"^[a-z][a-z0-9_]{0,127}$",
     )
 
+    experiment_reporting: LogfireReporting | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+
     @model_validator(mode="after")
     def terminal_fields_match_status(self) -> BenchmarkCellRunResult:
         if self.status in {"completed", "skipped"}:
@@ -338,6 +308,8 @@ class BenchmarkCellRunResult(ContractModel):
                 raise ValueError("completed cells require only a receipt digest")
         elif self.failure_code is None or self.receipt_sha256 is not None:
             raise ValueError("incomplete cells require only a failure code")
+        if self.status != "completed" and self.experiment_reporting is not None:
+            raise ValueError("only completed cells can publish experiment telemetry")
         return self
 
 
@@ -363,7 +335,7 @@ CellInvoker = Callable[
 
 PackLoader = Callable[[HuggingFacePackReference], LoadedEvaluationPack]
 ImageVerifier = Callable[[str], Awaitable[None]]
-EvaluationRunner = Callable[..., MlflowEvaluationResult]
+EvaluationRunner = Callable[..., Coroutine[Any, Any, EvaluationResult]]
 ContainerCleaner = Callable[[BenchmarkCellInvocation], Awaitable[bool]]
 
 _WORKER_ARGUMENT = "--cell-worker"
@@ -398,14 +370,13 @@ def _invocation_from_canonical_prepared(
 ) -> BenchmarkCellInvocation:
     packs = {item.pack_id: item for item in prepared.study.packs}
     models = {item.model_id: item for item in prepared.study.models}
-    datasets = {item.pack_id: item.dataset_name for item in prepared.runtime.datasets}
     loaded = dict(prepared.packs)
     selected_pack = packs[cell.pack_id]
     selected_model = models[cell.model_id]
     return BenchmarkCellInvocation(
         cell=cell,
         pack_reference=selected_pack.reference,
-        dataset_name=datasets[cell.pack_id],
+        report_to_logfire=prepared.runtime.report_to_logfire,
         model_configuration=selected_model.configuration,
         policy=prepared.study.policy,
         docker_image=prepared.study.execution.docker_image,
@@ -627,6 +598,7 @@ async def _run_prepared_cell(
         cell_id=cell.cell_id,
         status="completed",
         receipt_sha256=receipt.sha256,
+        experiment_reporting=worker_result.experiment_reporting,
     )
 
 
@@ -685,7 +657,6 @@ def _receipt_matches_cell(
     prepared: PreparedBenchmark,
     cell: BenchmarkCell,
 ) -> bool:
-    datasets = {item.pack_id: item.dataset_name for item in prepared.runtime.datasets}
     loaded = dict(prepared.packs)
     expected_cases = tuple(item.case_id for item in loaded[cell.pack_id].cases)
     return (
@@ -696,7 +667,7 @@ def _receipt_matches_cell(
         and receipt.repetition == cell.repetition
         and receipt.agent_revision == prepared.study.agent_revision
         and receipt.docker_image == prepared.study.execution.docker_image
-        and receipt.dataset_name == datasets[cell.pack_id]
+        and receipt.pack_manifest_sha256 == loaded[cell.pack_id].reference.manifest_sha256
         and tuple(item.case_id for item in receipt.predictions) == expected_cases
     )
 
@@ -970,7 +941,7 @@ def execute_benchmark_cell(
     invocation: BenchmarkCellInvocation | object,
     *,
     pack_loader: PackLoader = load_huggingface_evaluation_pack,
-    evaluation_runner: EvaluationRunner = run_mlflow_evaluation,
+    evaluation_runner: EvaluationRunner = run_evaluation,
 ) -> BenchmarkWorkerResult:
     """Run one preflighted cell and publish its correlation receipt."""
     try:
@@ -1005,17 +976,16 @@ def execute_benchmark_cell(
             failure_code="cell_setup_failed",
         )
     try:
-        with _mlflow_worker_environment(selected):
-            result = evaluation_runner(
-                pack,
-                dataset_name=selected.dataset_name,
-                runs_directory=selected.attempt_directory / "runs",
-                model_configuration=selected.model_configuration,
-                policy=selected.policy,
-                python_executor=executor,
-                run_tags=tags,
-            )
-    except MlflowEvaluationError as error:
+        result = asyncio.run(evaluation_runner(
+            pack,
+            runs_directory=selected.attempt_directory / "runs",
+            model_configuration=selected.model_configuration,
+            policy=selected.policy,
+            case_workers=selected.case_workers,
+            python_executor=executor,
+            report_to_logfire=selected.report_to_logfire,
+        ))
+    except EvaluationError as error:
         return BenchmarkWorkerAmbiguous(
             cell_id=selected.cell.cell_id,
             failure_code=f"cell_{error.code}",
@@ -1029,8 +999,7 @@ def execute_benchmark_cell(
         expected_cases = tuple(item.case_id for item in pack.cases)
         returned_cases = tuple(item.case_id for item in result.predictions)
         if (
-            result.evaluation_run_id is None
-            or len(result.predictions) != selected.case_count
+            len(result.predictions) != selected.case_count
             or returned_cases != expected_cases
         ):
             raise ValueError("benchmark evaluation result is incomplete")
@@ -1043,23 +1012,30 @@ def execute_benchmark_cell(
                 repetition=selected.cell.repetition,
                 agent_revision=selected.agent_revision,
                 docker_image=selected.docker_image,
-                dataset_name=selected.dataset_name,
-                dataset_id=result.dataset_id,
-                dataset_digest=result.dataset_digest,
-                evaluation_run_id=result.evaluation_run_id,
+                pack_manifest_sha256=pack.reference.manifest_sha256,
                 predictions=result.predictions,
             ),
             selected.receipt_path,
-        )
-        return BenchmarkWorkerCompleted(
-            cell_id=selected.cell.cell_id,
-            receipt_sha256=retained.sha256,
         )
     except Exception:
         return BenchmarkWorkerAmbiguous(
             cell_id=selected.cell.cell_id,
             failure_code="cell_receipt_unavailable",
         )
+    experiment_reporting = None
+    if selected.report_to_logfire:
+        experiment_reporting = record_experiment(
+            pack,
+            result.predictions,
+            pack_id=selected.cell.pack_id,
+            model_id=selected.cell.model_id,
+            metadata=tags,
+        )
+    return BenchmarkWorkerCompleted(
+        cell_id=selected.cell.cell_id,
+        receipt_sha256=retained.sha256,
+        experiment_reporting=experiment_reporting,
+    )
 
 
 def _invocation_cell_id(invocation: object) -> str:
@@ -1088,24 +1064,6 @@ def _validate_worker_workspace(invocation: BenchmarkCellInvocation) -> None:
             raise ValueError("benchmark attempt workspace is unavailable")
     if os.path.lexists(invocation.receipt_path):
         raise ValueError("benchmark cell receipt already exists")
-
-
-@contextmanager
-def _mlflow_worker_environment(invocation: BenchmarkCellInvocation):
-    values = {
-        "MLFLOW_GENAI_EVAL_MAX_WORKERS": str(invocation.case_workers),
-        "MLFLOW_GENAI_EVAL_ASYNC_TIMEOUT": str(invocation.policy.max_run_seconds + 30),
-    }
-    previous = {key: os.environ.get(key) for key in values}
-    os.environ.update(values)
-    try:
-        yield
-    finally:
-        for key, value in previous.items():
-            if value is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = value
 
 
 def benchmark_cell_worker_main() -> int:
@@ -1156,7 +1114,6 @@ async def prepare_benchmark(
     runtime: BenchmarkRuntime | object,
     *,
     current_revision: str,
-    environment: Mapping[str, str] = os.environ,
     pack_loader: PackLoader = load_huggingface_evaluation_pack,
     image_verifier: ImageVerifier | None = None,
     resume: bool = False,
@@ -1166,19 +1123,6 @@ async def prepare_benchmark(
     selected_runtime = _canonical_runtime(runtime)
     if current_revision != selected_study.agent_revision:
         raise ValueError("benchmark agent revision does not match the current revision")
-    try:
-        mlflow_configuration = load_mlflow_configuration(environment)
-    except MlflowConfigurationError:
-        raise ValueError("benchmark requires complete MLflow configuration") from None
-    if any(
-        not dataset_name_matches_backend(item.dataset_name, mlflow_configuration)
-        for item in selected_runtime.datasets
-    ):
-        raise ValueError("benchmark dataset name does not match the MLflow backend")
-    expected = tuple(item.pack_id for item in selected_study.packs)
-    actual = tuple(item.pack_id for item in selected_runtime.datasets)
-    if actual != expected:
-        raise ValueError("runtime dataset bindings must exactly cover study packs")
     if not selected_runtime.workspace_root.is_absolute():
         raise ValueError("benchmark workspace must be absolute")
     if selected_runtime.workspace_root.exists() and not resume:
@@ -1228,8 +1172,6 @@ def _canonical_prepared(value: object) -> PreparedBenchmark:
     if cells != expand_benchmark_study(study):
         raise ValueError("prepared benchmark cells do not match the study")
     expected_pack_ids = tuple(item.pack_id for item in study.packs)
-    if tuple(item.pack_id for item in runtime.datasets) != expected_pack_ids:
-        raise ValueError("prepared benchmark runtime does not match the study")
     loaded: list[tuple[str, LoadedEvaluationPack]] = []
     for pack_id, pack in value.packs:
         selected_pack = LoadedEvaluationPack.model_validate_json(pack.model_dump_json())

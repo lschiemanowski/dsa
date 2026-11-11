@@ -200,47 +200,6 @@ class EvaluationPackCase(ContractModel):
             raise ValueError("expected answer must satisfy the answer schema")
         return self
 
-    def dataset_record(
-        self,
-        manifest: EvaluationPackManifest,
-    ) -> dict[str, JsonValue]:
-        """Project portable inputs, host-only expectations, and descriptive tags."""
-        inputs: dict[str, JsonValue] = {
-            "case_id": self.case_id,
-            "case_version": self.case_version,
-            "database_id": manifest.database.id,
-            "database_sha256": manifest.database.sha256,
-            "question": self.question,
-            "answer_schema": deepcopy(self.answer_schema),
-        }
-        if self.derivation is not None:
-            inputs["derivation"] = cast(
-                JsonValue,
-                self.derivation.model_dump(mode="json"),
-            )
-        return {
-            "inputs": inputs,
-            "expectations": self.scoring_expectations(manifest),
-            "tags": {
-                "family": self.metadata.family,
-                "pack": manifest.pack_id,
-                "pack_version": manifest.version,
-                "source_level": self.metadata.source_level,
-            },
-        }
-
-    def scoring_expectations(
-        self,
-        manifest: EvaluationPackManifest,
-    ) -> dict[str, JsonValue]:
-        """Encode scorer inputs without lossy managed-dataset number coercion."""
-        return {
-            "answer": _canonical_json(self.expected_answer).decode("utf-8"),
-            "scorer": _canonical_json(
-                manifest.scorer.model_dump(mode="json")
-            ).decode("utf-8"),
-        }
-
 
 class HuggingFacePackReference(ContractModel):
     """One immutable pack locator in a Hugging Face dataset repository."""

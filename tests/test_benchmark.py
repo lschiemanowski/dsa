@@ -63,12 +63,8 @@ def study_value(**updates: object) -> dict[str, Any]:
 
 def runtime_value(tmp_path: Path, **updates: object) -> dict[str, Any]:
     value: dict[str, Any] = {
-        "format": "dsa-benchmark-runtime/v1",
+        "format": "dsa-benchmark-runtime/v2",
         "workspace_root": tmp_path / "study",
-        "datasets": (
-            {"pack_id": "pack-b", "dataset_name": "catalog.schema.pack_b"},
-            {"pack_id": "pack-a", "dataset_name": "catalog.schema.pack_a"},
-        ),
     }
     value.update(updates)
     return value
@@ -156,53 +152,10 @@ def test_study_bounds_cell_wide_concurrent_container_cleanup() -> None:
         )
 
 
-def test_runtime_rejects_dataset_values_that_cannot_be_safely_retained(
-    tmp_path: Path,
-) -> None:
-    for dataset_name in (
-        "https://private.example/?token=secret",
-        "catalog..table",
-        "catalog.schema.table.extra",
-        "Catalog.schema.table",
-    ):
-        with pytest.raises(ValidationError):
-            BenchmarkRuntime.model_validate(
-                runtime_value(
-                    tmp_path,
-                    datasets=(
-                        {
-                            "pack_id": "pack-a",
-                            "dataset_name": dataset_name,
-                        },
-                    ),
-                )
-            )
 
 
-def test_runtime_accepts_safe_local_dataset_names(tmp_path: Path) -> None:
-    runtime = BenchmarkRuntime.model_validate(
-        runtime_value(
-            tmp_path,
-            datasets=({"pack_id": "pack-a", "dataset_name": "local_dataset"},),
-        )
-    )
-
-    assert runtime.datasets[0].dataset_name == "local_dataset"
 
 
-def test_runtime_requires_a_distinct_mlflow_dataset_for_each_pack(
-    tmp_path: Path,
-) -> None:
-    with pytest.raises(ValidationError, match="dataset names must be unique"):
-        BenchmarkRuntime.model_validate(
-            runtime_value(
-                tmp_path,
-                datasets=(
-                    {"pack_id": "pack-a", "dataset_name": "catalog.schema.shared"},
-                    {"pack_id": "pack-b", "dataset_name": "catalog.schema.shared"},
-                ),
-            )
-        )
 
 
 def test_cell_expansion_is_the_exact_ordered_cartesian_product() -> None:
@@ -244,153 +197,15 @@ async def test_preflight_rejects_before_pack_or_docker_work(
         raise AssertionError("Docker verification must not start")
 
     runtime = BenchmarkRuntime.model_validate(runtime_value(tmp_path))
-    environment = {
-        "MLFLOW_TRACKING_URI": "databricks",
-        "MLFLOW_EXPERIMENT_ID": "experiment",
-        "DATABRICKS_HOST": "https://example.cloud.databricks.com",
-        "DATABRICKS_TOKEN": "secret",
-    }
 
     with pytest.raises(ValueError, match="agent revision"):
         await prepare_benchmark(
             BenchmarkStudy.model_validate(study_value()),
             runtime,
             current_revision="e" * 40,
-            environment=environment,
             pack_loader=load_pack,
             image_verifier=verify_image,
         )
 
     assert calls == []
     assert not runtime.workspace_root.exists()
-
-
-@pytest.mark.parametrize(
-    "environment",
-    [
-        {},
-        {"MLFLOW_TRACKING_URI": "file:/tmp/mlruns"},
-        {"MLFLOW_TRACKING_URI": "databricks", "MLFLOW_EXPERIMENT_ID": "x"},
-        {
-            "MLFLOW_TRACKING_URI": "http://tracking.example",
-            "MLFLOW_EXPERIMENT_ID": "x",
-        },
-    ],
-)
-async def test_preflight_requires_supported_mlflow_before_external_work(
-    tmp_path: Path,
-    environment: dict[str, str],
-) -> None:
-    async def verify_image(_image: str) -> None:
-        raise AssertionError("Docker verification must not start")
-
-    with pytest.raises(ValueError, match="MLflow"):
-        await prepare_benchmark(
-            BenchmarkStudy.model_validate(study_value()),
-            BenchmarkRuntime.model_validate(runtime_value(tmp_path)),
-            current_revision=REVISION,
-            environment=environment,
-            pack_loader=lambda _reference: (_ for _ in ()).throw(
-                AssertionError("pack loading must not start")
-            ),
-            image_verifier=verify_image,
-        )
-
-
-async def test_preflight_accepts_local_mlflow_and_plain_dataset_name(
-    tmp_path: Path,
-) -> None:
-    calls: list[str] = []
-
-    def load_pack(_reference: object) -> LoadedEvaluationPack:
-        calls.append("pack")
-        raise RuntimeError("pack loading reached")
-
-    runtime = BenchmarkRuntime.model_validate(
-        runtime_value(
-            tmp_path,
-            datasets=(
-                {"pack_id": "pack-a", "dataset_name": "pack_a"},
-                {"pack_id": "pack-b", "dataset_name": "pack_b"},
-            ),
-        )
-    )
-
-    with pytest.raises(RuntimeError, match="pack loading reached"):
-        await prepare_benchmark(
-            BenchmarkStudy.model_validate(study_value()),
-            runtime,
-            current_revision=REVISION,
-            environment={
-                "MLFLOW_TRACKING_URI": "http://127.0.0.1:5000",
-                "MLFLOW_EXPERIMENT_ID": "1",
-            },
-            pack_loader=load_pack,
-            image_verifier=_unexpected_image_verifier,
-        )
-
-    assert calls == ["pack"]
-
-
-async def test_preflight_requires_unity_catalog_name_for_databricks(
-    tmp_path: Path,
-) -> None:
-    runtime = BenchmarkRuntime.model_validate(
-        runtime_value(
-            tmp_path,
-            datasets=(
-                {"pack_id": "pack-a", "dataset_name": "pack_a"},
-                {"pack_id": "pack-b", "dataset_name": "pack_b"},
-            ),
-        )
-    )
-
-    with pytest.raises(ValueError, match="dataset name"):
-        await prepare_benchmark(
-            BenchmarkStudy.model_validate(study_value()),
-            runtime,
-            current_revision=REVISION,
-            environment={
-                "MLFLOW_TRACKING_URI": "databricks",
-                "MLFLOW_EXPERIMENT_ID": "1",
-                "DATABRICKS_HOST": "https://example.cloud.databricks.com",
-                "DATABRICKS_TOKEN": "secret",
-            },
-            pack_loader=lambda _reference: (_ for _ in ()).throw(
-                AssertionError("pack loading must not start")
-            ),
-            image_verifier=_unexpected_image_verifier,
-        )
-
-
-async def test_preflight_requires_exact_runtime_coverage_before_external_work(
-    tmp_path: Path,
-) -> None:
-    environment = {
-        "MLFLOW_TRACKING_URI": "databricks",
-        "MLFLOW_EXPERIMENT_ID": "experiment",
-        "DATABRICKS_HOST": "host",
-        "DATABRICKS_TOKEN": "token",
-    }
-    runtime = BenchmarkRuntime.model_validate(
-        runtime_value(
-            tmp_path,
-            datasets=({"pack_id": "pack-a", "dataset_name": "catalog.schema.pack_a"},),
-        )
-    )
-
-    with pytest.raises(ValueError, match="exactly cover"):
-        await prepare_benchmark(
-            BenchmarkStudy.model_validate(study_value()),
-            runtime,
-            current_revision=REVISION,
-            environment=environment,
-            pack_loader=lambda _reference: (_ for _ in ()).throw(
-                AssertionError("pack loading must not start")
-            ),
-            image_verifier=_unexpected_image_verifier,
-        )
-
-
-async def _unexpected_image_verifier(_image: str) -> None:
-    raise AssertionError("Docker verification must not start")

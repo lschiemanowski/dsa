@@ -122,3 +122,15 @@ The following are observed OpenRouter inference costs in USD for the same 296 qu
 | **All configurations** | | $1.6643 * | $3.8513 * | $2.3420 * |
 
 Cost records cover all retained responses in 1,179/1,184 runs for Luna, 1,182/1,184 for DeepSeek, and 1,119/1,184 for GLM. Luna's five remaining runs have no retained model responses. DeepSeek has two retained responses without costs; GLM has 66. Missing costs are not treated as zero. The amounts are summed from provider-reported costs, including available costs for failed runs, rather than estimated from token prices.
+
+## Optional Logfire telemetry
+
+Install with `uv sync --extra logfire` (include `--extra chat` if using the chat app)
+and supply a project write token via `LOGFIRE_TOKEN`. Enable it with
+`dsa-run --report-to-logfire` or the [private chat setting](apps/private_data_chat/README.md).
+DSA sends timing, usage, outcome and failure codes, with spans for model requests and tool
+execution. It does not send questions, answers, tool arguments or results, raw exceptions,
+or retained files. A trace ID marks local recording; it does not confirm remote ingestion.
+
+See the [evaluation guide](examples/evaluation/README.md#running-benchmarks) for benchmark
+configuration and migration from MLflow.

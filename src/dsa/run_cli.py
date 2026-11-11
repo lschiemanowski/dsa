@@ -53,7 +53,7 @@ def main(
                     request,
                     runs_directory=runs_directory,
                     python_executor=python_executor,
-                    report_to_mlflow=parsed.report_to_mlflow,
+                    report_to_logfire=parsed.report_to_logfire,
                 )
             )
         )
@@ -106,7 +106,7 @@ def _parser(prog: str = "dsa-run") -> Parser:
     parser.add_argument("--request", required=True)
     parser.add_argument("--runs-directory", required=True)
     parser.add_argument("--docker-image", required=True)
-    parser.add_argument("--report-to-mlflow", action="store_true")
+    parser.add_argument("--report-to-logfire", action="store_true")
     return parser
 
 

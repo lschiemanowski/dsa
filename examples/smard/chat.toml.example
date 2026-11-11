@@ -5,7 +5,7 @@ database_path = "REPLACED_BY_PREPARE"
 runs_directory = "REPLACED_BY_PREPARE"
 docker_image = "REPLACED_BY_PREPARE"
 enable_analysis_guidance = true
-report_to_mlflow = false
+report_to_logfire = false
 
 [database_card]
 format = "dsa-huggingface-database-card/v1"

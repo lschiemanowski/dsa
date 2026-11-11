@@ -40,3 +40,28 @@ new independent recomputation. Difficulty labels remain provisional.
 Reference answers and SQL are evaluator-only. Use `load_huggingface_evaluation_pack`
 with a locator to verify content and build model inputs through the ordinary DSA
 evaluation boundary.
+
+## Running benchmarks
+
+`dsa-benchmark plan`, `run`, and `report` use the pinned evaluation packs in a study.
+Install the `huggingface` extra to load those packs. A v2 runtime JSON file contains
+the workspace path and the Logfire opt-in. For example, save this as one line with a
+trailing newline (paths can be relative to the runtime file):
+
+```json
+{"format":"dsa-benchmark-runtime/v2","report_to_logfire":false,"workspace_root":"./benchmark-workspace"}
+```
+
+To show experiments in Logfire, also install the `logfire` extra, set `LOGFIRE_TOKEN`,
+and change `report_to_logfire` to `true` before running the study. Each completed cell
+mirrors its scores after writing the local receipt. The experiment uses case and run
+IDs, scores, and trace IDs, without exporting the questions, expected answers, actual
+answers, or notebooks. Review the JSON run output for `experiment_reporting`; a telemetry
+failure does not invalidate the receipt or change its scores.
+
+For a new study replacing an MLflow study, remove the old runtime `datasets` bindings,
+use a fresh workspace, and pin the new agent revision. Reports now use local cell
+receipts (v2) and terminal records as evidence; they do not query a telemetry service.
+The v4 report counts correct completed answers even if telemetry is unavailable, so
+end-to-end rates can differ from v3. Keep prior reports and receipts as issued. Use
+the original revision if you need to rebuild an older MLflow report.

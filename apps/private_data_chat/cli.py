@@ -14,7 +14,7 @@ from pydantic import ValidationError
 
 from apps.private_data_chat.clarifier import load_mock_context
 from apps.private_data_chat.database_card import load_database_card
-from apps.private_data_chat.settings import load_configuration
+from apps.private_data_chat.settings import LegacyChatReportingError, load_configuration
 from apps.private_data_chat.synthetic_context import validate_context_card
 from dsa.cli import HelpRequested, Parser, emit
 
@@ -33,7 +33,7 @@ _SAFE_CONFIGURATION_FIELDS = frozenset(
         "model",
         "path",
         "repo_id",
-        "report_to_mlflow",
+        "report_to_logfire",
         "revision",
         "runs_directory",
         "settings",
@@ -165,6 +165,9 @@ def _emit_preflight_failure(stage: str, error: Exception) -> None:
         "stage": stage,
         "status": "rejected",
     }
+    if isinstance(error, LegacyChatReportingError):
+        result["code"] = "chat_reporting_setting_renamed"
+        result["message"] = str(error)
     if stage == "configuration" and isinstance(error, ValidationError):
         fields = sorted(
             {

@@ -11,12 +11,11 @@ from collections.abc import Iterable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
 from hashlib import sha256
-from importlib import import_module
 from pathlib import Path
-from typing import Annotated, Any, Literal, Protocol, cast
+from typing import Annotated, Literal
 from uuid import uuid4
 
-from pydantic import Field, ValidationInfo, field_validator, model_validator
+from pydantic import Field, model_validator
 
 from dsa.benchmark import (
     BenchmarkCell,
@@ -25,30 +24,18 @@ from dsa.benchmark import (
     BenchmarkStudy,
     GitRevision,
     PackLoader,
-    SafeDatasetName,
     SafeName,
-    SafeRemoteId,
     expand_benchmark_study,
 )
-from dsa.contract import ContractModel
+from dsa.contract import ContractModel, ModelConfiguration, RunPolicy
 from dsa.cost import (
     ProviderCostSummary,
     combine_provider_costs,
     provider_cost_from_messages,
     safe_openrouter_response_ids,
 )
-from dsa.evaluation import (
-    MlflowEvaluationPrediction,
-    agent_failure,
-    conditional_exact_json,
-    conditional_policy_match,
-    end_to_end_exact_success,
-    end_to_end_policy_success,
-    exact_json_equal,
-    infrastructure_failure,
-)
-from dsa.mlflow_config import MlflowConfigurationError, load_mlflow_destination
-from dsa.pack import LoadedEvaluationPack, load_huggingface_evaluation_pack
+from dsa.evaluation import EvaluationPrediction, exact_json_equal, score_outcome, score_prediction
+from dsa.pack import EvaluationPackCase, LoadedEvaluationPack, load_huggingface_evaluation_pack
 from dsa.plots import MAX_NOTEBOOK_BYTES
 from dsa.record import (
     DerivationVerification,
@@ -57,41 +44,12 @@ from dsa.record import (
     RunSuccess,
     TerminalRecord,
 )
-from dsa.reporting import MlflowReporting
+from dsa.reporting import LogfireReporting
 
 Sha256 = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
 NonNegativeInt = Annotated[int, Field(ge=0)]
 NonNegativeFinite = Annotated[float, Field(ge=0, allow_inf_nan=False)]
 
-_EVALUATION_METRICS = (
-    "agent_failure/mean",
-    "conditional_exact_json/mean",
-    "conditional_policy_match/mean",
-    "end_to_end_exact_success/mean",
-    "end_to_end_policy_success/mean",
-    "infrastructure_failure/mean",
-)
-_ANALYSIS_METRICS = (
-    "dsa.elapsed_seconds",
-    "dsa.provider_cost_generations",
-    "dsa.provider_cost_usd",
-    "dsa.usage.input_tokens",
-    "dsa.usage.output_tokens",
-    "dsa.usage.requests",
-    "dsa.usage.total_tokens",
-)
-_RUN_PARAMS = ("dsa.model_name",)
-_RUN_TAGS = (
-    "dsa.component",
-    "dsa.benchmark.agent_revision",
-    "dsa.benchmark.cell_id",
-    "dsa.benchmark.model_id",
-    "dsa.benchmark.pack_id",
-    "dsa.benchmark.repetition",
-    "dsa.benchmark.study_sha256",
-    "dsa.outcome",
-    "dsa.run_id",
-)
 _REPORT_JSON_BYTES = 256 * 1024 * 1024
 _REPORT_MARKDOWN_BYTES = 64 * 1024 * 1024
 _MAX_REPORT_CASE_EXECUTIONS = 100_000
@@ -144,7 +102,7 @@ class BenchmarkMetrics(ContractModel):
 
 
 class BenchmarkObservedSummary(ContractModel):
-    """Coverage and aggregate for one optional observed MLflow metric."""
+    """Coverage and aggregate for one optional observed terminal metric."""
 
     observed_count: NonNegativeInt
     unavailable_count: NonNegativeInt
@@ -222,7 +180,7 @@ class BenchmarkCaseOutcome(ContractModel):
     """Safe per-case classification without questions, answers, or expectations."""
 
     case_id: SafeName
-    run_id: SafeRemoteId
+    run_id: SafeName
     terminal_sha256: Sha256
     accepted: bool
     failure_stage: FailureStage | None = None
@@ -230,7 +188,7 @@ class BenchmarkCaseOutcome(ContractModel):
         default=None,
         pattern=r"^[a-z][a-z0-9_]{0,127}$",
     )
-    reporting: MlflowReporting
+    reporting: LogfireReporting
     end_to_end_exact_success: bool
     end_to_end_policy_success: bool
     conditional_exact_json: bool | None
@@ -267,36 +225,14 @@ class BenchmarkCaseOutcome(ContractModel):
             and self.conditional_policy_match is not True
         ):
             raise ValueError("exact match must satisfy the pack policy")
-        projection = MlflowEvaluationPrediction(
-            case_id=self.case_id,
-            run_id=self.run_id,
-            terminal_sha256=self.terminal_sha256,
-            accepted=self.accepted,
-            answer=None,
-            failure_stage=self.failure_stage,
-            failure_code=self.failure_code,
-            reporting=self.reporting,
+        scores = score_outcome(
+            self.accepted,
+            self.failure_stage,
+            self.failure_code,
+            self.conditional_exact_json,
+            self.conditional_policy_match,
         )
-        expected_infrastructure = infrastructure_failure(projection)
-        expected_agent = not expected_infrastructure and (
-            not self.accepted or self.conditional_policy_match is False
-        )
-        expected_end_to_end_exact = (
-            self.accepted
-            and self.conditional_exact_json is True
-            and self.reporting.status == "reported"
-        )
-        expected_end_to_end_policy = (
-            self.accepted
-            and self.conditional_policy_match is True
-            and self.reporting.status == "reported"
-        )
-        if (
-            self.infrastructure_failure != expected_infrastructure
-            or self.agent_failure != expected_agent
-            or self.end_to_end_exact_success != expected_end_to_end_exact
-            or self.end_to_end_policy_success != expected_end_to_end_policy
-        ):
+        if any(getattr(self, name) != value for name, value in scores.items()):
             raise ValueError("case scorer outcomes are inconsistent")
         return self
 
@@ -312,15 +248,6 @@ class BenchmarkPackEvidence(ContractModel):
     case_count: Annotated[int, Field(gt=0, le=10_000)]
 
 
-class BenchmarkDatasetEvidence(ContractModel):
-    """Exact runtime and remote dataset identities for one pack."""
-
-    pack_id: SafeName
-    dataset_name: SafeDatasetName
-    dataset_id: SafeRemoteId
-    dataset_digest: SafeRemoteId
-
-
 class BenchmarkCellReport(ContractModel):
     """One cell's immutable receipt correlation and derived result."""
 
@@ -329,7 +256,6 @@ class BenchmarkCellReport(ContractModel):
     model_id: SafeName
     repetition: NonNegativeInt
     receipt_sha256: Sha256
-    evaluation_run_id: SafeRemoteId
     case_count: NonNegativeInt
     cases: tuple[BenchmarkCaseOutcome, ...]
     metrics: BenchmarkMetrics
@@ -373,12 +299,11 @@ class BenchmarkPackModelAggregate(ContractModel):
 class BenchmarkReport(ContractModel):
     """Canonical immutable report for one complete benchmark study."""
 
-    format: Literal["dsa-benchmark-report/v3"] = "dsa-benchmark-report/v3"
+    format: Literal["dsa-benchmark-report/v4"] = "dsa-benchmark-report/v4"
     reporter_revision: GitRevision
     study_sha256: Sha256
     study: BenchmarkStudy
     packs: tuple[BenchmarkPackEvidence, ...]
-    datasets: tuple[BenchmarkDatasetEvidence, ...]
     cells: tuple[BenchmarkCellReport, ...]
     overall: BenchmarkAggregate
     models: tuple[BenchmarkModelAggregate, ...]
@@ -397,8 +322,6 @@ class BenchmarkReport(ContractModel):
             for evidence, study_pack in zip(self.packs, self.study.packs, strict=True)
         ):
             raise ValueError("report pack manifest evidence does not match its study")
-        if tuple(item.pack_id for item in self.datasets) != pack_ids:
-            raise ValueError("report dataset evidence does not match its study")
         expected_cells = expand_benchmark_study(self.study)
         if tuple(item.cell_id for item in self.cells) != tuple(
             item.cell_id for item in expected_cells
@@ -425,27 +348,17 @@ class BenchmarkReport(ContractModel):
             }
             if len(case_orders) != 1:
                 raise ValueError("report pack case order conflicts across cells")
-        evaluation_ids = tuple(item.evaluation_run_id for item in self.cells)
-        if len(evaluation_ids) != len(set(evaluation_ids)):
-            raise ValueError("report evaluation run identities must be unique")
         case_outcomes = tuple(case for cell in self.cells for case in cell.cases)
         run_ids = tuple(item.run_id for item in case_outcomes)
         if len(run_ids) != len(set(run_ids)):
             raise ValueError("report analysis run identities must be unique")
-        tracking_ids = tuple(
-            item.reporting.tracking_run_id
-            for item in case_outcomes
-            if item.reporting.tracking_run_id is not None
-        )
-        if len(tracking_ids) != len(set(tracking_ids)):
-            raise ValueError("report tracking run identities must be unique")
-        trace_ids = tuple(
-            item.reporting.trace_id
-            for item in case_outcomes
-            if item.reporting.trace_id is not None
-        )
+        trace_ids = [
+            outcome.reporting.trace_id
+            for outcome in case_outcomes
+            if outcome.reporting.trace_id is not None
+        ]
         if len(trace_ids) != len(set(trace_ids)):
-            raise ValueError("report trace identities must be unique")
+            raise ValueError("report analysis trace identities must be unique")
         if tuple(item.model_id for item in self.models) != model_ids:
             raise ValueError("report model aggregates do not match its study")
         expected_pairs = tuple(
@@ -489,45 +402,6 @@ class BenchmarkReport(ContractModel):
         return sha256(self.canonical_json.encode()).hexdigest()
 
 
-class BenchmarkMlflowRun(ContractModel):
-    """Narrow safe projection of one exact MLflow run."""
-
-    run_id: SafeRemoteId
-    status: str = Field(pattern=r"^[A-Z][A-Z_]{0,31}$")
-    lifecycle_stage: Literal["active", "deleted"]
-    metrics: dict[str, float] = Field(default_factory=dict)
-    params: dict[str, str] = Field(default_factory=dict)
-    tags: dict[str, str] = Field(default_factory=dict)
-
-    @field_validator("metrics")
-    @classmethod
-    def finite_metrics(cls, value: dict[str, float]) -> dict[str, float]:
-        allowed = set((*_EVALUATION_METRICS, *_ANALYSIS_METRICS))
-        if not set(value).issubset(allowed):
-            raise ValueError("MLflow run contains unsupported metrics")
-        if any(not math.isfinite(item) for item in value.values()):
-            raise ValueError("MLflow run metrics must be finite")
-        return {key: value[key] for key in sorted(value)}
-
-    @field_validator("params", "tags")
-    @classmethod
-    def ordered_strings(
-        cls,
-        value: dict[str, str],
-        info: ValidationInfo,
-    ) -> dict[str, str]:
-        allowed = set(_RUN_PARAMS if info.field_name == "params" else _RUN_TAGS)
-        if not set(value).issubset(allowed):
-            raise ValueError("MLflow run contains unsupported metadata")
-        if any(len(item) > 4096 for item in value.values()):
-            raise ValueError("MLflow run metadata exceeds its retained bound")
-        return {key: value[key] for key in sorted(value)}
-
-
-class BenchmarkEvidenceReader(Protocol):
-    def get_run(self, run_id: str) -> BenchmarkMlflowRun: ...
-
-
 class RetainedBenchmarkReport(ContractModel):
     """Exact local identities of both published report representations."""
 
@@ -543,9 +417,15 @@ class _CaseComputation:
 
 
 @dataclass(frozen=True)
+class _TerminalEvidence:
+    provider_cost: ProviderCostSummary
+    observations: dict[str, float]
+
+
+@dataclass(frozen=True)
 class _VerifiedCellEvidence:
     receipt: BenchmarkCellReceipt
-    provider_costs: dict[str, ProviderCostSummary]
+    terminals: dict[str, _TerminalEvidence]
     provider_response_ids: frozenset[str]
 
 
@@ -555,15 +435,12 @@ def build_benchmark_report(
     *,
     reporter_revision: str,
     pack_loader: PackLoader = load_huggingface_evaluation_pack,
-    evidence_reader: BenchmarkEvidenceReader | None = None,
-    environment: Mapping[str, str] = os.environ,
 ) -> BenchmarkReport:
     """Verify one complete study and derive its immutable report without writes."""
     selected_study = _canonical_study(study)
     selected_runtime = _canonical_runtime(runtime)
     selected_revision = _validate_revision(reporter_revision)
-    _validate_runtime(selected_study, selected_runtime)
-    reader = evidence_reader or _default_evidence_reader(environment)
+    _validate_runtime(selected_runtime)
     packs: list[tuple[str, LoadedEvaluationPack]] = []
     for selected_pack in selected_study.packs:
         loaded = pack_loader(selected_pack.reference)
@@ -590,23 +467,15 @@ def build_benchmark_report(
                 "benchmark report provider response identities must be unique"
             )
         provider_response_ids.update(evidence.provider_response_ids)
-    receipts = tuple(item.receipt for item in cell_evidence)
-    datasets = _dataset_evidence(selected_study, selected_runtime, receipts)
-    model_names = {
-        item.model_id: item.configuration.name for item in selected_study.models
-    }
     all_computations: list[_CaseComputation] = []
     cell_reports: list[BenchmarkCellReport] = []
     for cell, evidence in zip(cells, cell_evidence, strict=True):
         receipt = evidence.receipt
         pack = pack_map[cell.pack_id]
         computations = _verify_and_compute_cell(
-            cell,
             receipt,
             pack,
-            provider_costs=evidence.provider_costs,
-            model_name=model_names[cell.model_id],
-            evidence_reader=reader,
+            evidence.terminals,
         )
         aggregate = _aggregate(computations)
         all_computations.extend(computations)
@@ -617,7 +486,6 @@ def build_benchmark_report(
                 model_id=cell.model_id,
                 repetition=cell.repetition,
                 receipt_sha256=receipt.sha256,
-                evaluation_run_id=receipt.evaluation_run_id,
                 case_count=aggregate.case_count,
                 cases=tuple(item.outcome for item in computations),
                 metrics=aggregate.metrics,
@@ -676,7 +544,6 @@ def build_benchmark_report(
         study_sha256=selected_study.sha256,
         study=selected_study,
         packs=pack_evidence,
-        datasets=datasets,
         cells=tuple(cell_reports),
         overall=_aggregate(all_computations),
         models=model_aggregates,
@@ -697,8 +564,8 @@ def publish_benchmark_report(
     except OSError:
         raise ValueError("benchmark report output directory is unavailable") from None
     basename = f"{selected.study.study_id}-{selected.study_sha256}"
-    json_name = f"{basename}.report-v3.json"
-    markdown_name = f"{basename}.report-v3.md"
+    json_name = f"{basename}.report-v4.json"
+    markdown_name = f"{basename}.report-v4.md"
     json_path = output_directory / json_name
     markdown_path = output_directory / markdown_name
     json_bytes = selected.canonical_json.encode()
@@ -792,8 +659,8 @@ def benchmark_report_markdown(
         "",
         "| Cell | Pack | Model | Repetition | E2E exact | Completion | "
         "Conditional exact | E2E policy | Conditional policy | Agent failure | "
-        "Infrastructure failure | Provider cost | MLflow run |",
-        "|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|",
+        "Infrastructure failure | Provider cost |",
+        "|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
         *(_cell_markdown_row(item) for item in selected.cells),
         "",
         "## Observed runtime",
@@ -838,71 +705,16 @@ def create_benchmark_report(
 
 
 def _verify_and_compute_cell(
-    cell: BenchmarkCell,
     receipt: BenchmarkCellReceipt,
     pack: LoadedEvaluationPack,
-    *,
-    provider_costs: Mapping[str, ProviderCostSummary],
-    model_name: str,
-    evidence_reader: BenchmarkEvidenceReader,
+    terminals: Mapping[str, _TerminalEvidence],
 ) -> tuple[_CaseComputation, ...]:
-    evaluation_run = _read_remote_run(evidence_reader, receipt.evaluation_run_id)
-    _require_completed_run(evaluation_run, "evaluation")
-    expected_tags = {
-        "dsa.benchmark.agent_revision": receipt.agent_revision,
-        "dsa.benchmark.cell_id": receipt.cell_id,
-        "dsa.benchmark.model_id": receipt.model_id,
-        "dsa.benchmark.pack_id": receipt.pack_id,
-        "dsa.benchmark.repetition": str(receipt.repetition),
-        "dsa.benchmark.study_sha256": receipt.study_sha256,
-    }
-    if any(evaluation_run.tags.get(key) != value for key, value in expected_tags.items()):
-        raise ValueError("MLflow evaluation identity does not match its receipt")
     cases = {item.case_id: item for item in pack.cases}
     computations: list[_CaseComputation] = []
     for prediction in receipt.predictions:
-        provider_cost = provider_costs.get(prediction.run_id)
-        if provider_cost is None:
-            raise ValueError("benchmark report terminal evidence is incomplete")
+        terminal = terminals[prediction.run_id]
         case = cases[prediction.case_id]
-        expectations = case.scoring_expectations(pack.manifest)
-        exact = end_to_end_exact_success(prediction, expectations)
-        conditional = conditional_exact_json(prediction, expectations)
-        policy = end_to_end_policy_success(prediction, expectations)
-        conditional_policy = conditional_policy_match(prediction, expectations)
-        agent = agent_failure(prediction, expectations)
-        infrastructure = infrastructure_failure(prediction)
-        observations: dict[str, float] = {}
-        if prediction.reporting.status == "reported":
-            tracking_run_id = prediction.reporting.tracking_run_id
-            if tracking_run_id is None:
-                raise ValueError("reported prediction has no tracking run identity")
-            tracking = _read_remote_run(
-                evidence_reader,
-                tracking_run_id,
-            )
-            _require_completed_run(tracking, "analysis")
-            expected_outcome = "succeeded" if prediction.accepted else "failed"
-            if (
-                tracking.tags.get("dsa.run_id") != prediction.run_id
-                or tracking.tags.get("dsa.outcome") != expected_outcome
-                or tracking.tags.get("dsa.component") != "analysis"
-                or tracking.params.get("dsa.model_name") != model_name
-            ):
-                raise ValueError("MLflow analysis identity does not match its receipt")
-            for key in _ANALYSIS_METRICS:
-                if key not in tracking.metrics:
-                    continue
-                value = tracking.metrics[key]
-                if value < 0:
-                    raise ValueError("MLflow analysis metrics must be nonnegative")
-                if key not in (
-                    "dsa.elapsed_seconds",
-                    "dsa.provider_cost_usd",
-                ) and not value.is_integer():
-                    raise ValueError("MLflow usage metrics must be integral")
-                observations[key] = value
-            _verify_projected_provider_cost(provider_cost, observations)
+        scores = score_prediction(prediction, case.expected_answer, pack.manifest.scorer)
         computations.append(
             _CaseComputation(
                 outcome=BenchmarkCaseOutcome(
@@ -913,48 +725,12 @@ def _verify_and_compute_cell(
                     failure_stage=prediction.failure_stage,
                     failure_code=prediction.failure_code,
                     reporting=prediction.reporting,
-                    end_to_end_exact_success=exact,
-                    end_to_end_policy_success=policy,
-                    conditional_exact_json=conditional,
-                    conditional_policy_match=conditional_policy,
-                    agent_failure=agent,
-                    infrastructure_failure=infrastructure,
-                    provider_cost=provider_cost,
+                    provider_cost=terminal.provider_cost,
+                    **scores,
                 ),
-                observations=observations,
+                observations=terminal.observations,
             )
         )
-    aggregate = _aggregate(computations)
-    expected_metrics = {
-        "agent_failure/mean": aggregate.metrics.agent_failure.rate,
-        "conditional_exact_json/mean": (
-            aggregate.metrics.conditional_exact_accuracy.rate
-        ),
-        "conditional_policy_match/mean": (
-            aggregate.metrics.conditional_policy_accuracy.rate
-        ),
-        "end_to_end_exact_success/mean": (
-            aggregate.metrics.end_to_end_exact_success.rate
-        ),
-        "end_to_end_policy_success/mean": (
-            aggregate.metrics.end_to_end_policy_success.rate
-        ),
-        "infrastructure_failure/mean": (
-            aggregate.metrics.infrastructure_failure.rate
-        ),
-    }
-    for name, expected in expected_metrics.items():
-        actual = evaluation_run.metrics.get(name)
-        if expected is None:
-            if actual is not None:
-                raise ValueError("MLflow evaluation metrics contradict local scoring")
-        elif actual is None or not math.isclose(
-            actual,
-            expected,
-            rel_tol=0.0,
-            abs_tol=1e-12,
-        ):
-            raise ValueError("MLflow evaluation metrics contradict local scoring")
     return tuple(computations)
 
 
@@ -976,26 +752,6 @@ def _aggregate(values: Iterable[_CaseComputation]) -> BenchmarkAggregate:
             item.outcome.provider_cost for item in selected
         ),
     )
-
-
-def _verify_projected_provider_cost(
-    provider_cost: ProviderCostSummary,
-    observations: Mapping[str, float],
-) -> None:
-    projected_amount = observations.get("dsa.provider_cost_usd")
-    projected_generations = observations.get("dsa.provider_cost_generations")
-    if (projected_amount is None) != (projected_generations is None):
-        raise ValueError("MLflow provider cost projection is incomplete")
-    if projected_amount is None:
-        return
-    amount = provider_cost.amount_decimal
-    if provider_cost.status != "observed" or amount is None:
-        raise ValueError("MLflow provider cost contradicts terminal evidence")
-    if (
-        projected_amount != float(amount)
-        or projected_generations != provider_cost.observed_generation_count
-    ):
-        raise ValueError("MLflow provider cost contradicts terminal evidence")
 
 
 def _metrics_from_outcomes(
@@ -1203,10 +959,13 @@ def _read_complete_cell_evidence(
                 actual_names.add(entry.name)
         if actual_names != expected_names:
             raise ValueError("benchmark report requires complete cell receipts")
-        dataset_names = {item.pack_id: item.dataset_name for item in runtime.datasets}
+        models = {item.model_id: item.configuration for item in study.models}
         evidence: list[_VerifiedCellEvidence] = []
         for cell in cells:
-            verified = _read_receipt_at(root_descriptor, cell.cell_id)
+            pack = packs[cell.pack_id]
+            verified = _read_receipt_at(
+                root_descriptor, cell.cell_id, pack, models[cell.model_id], study.policy
+            )
             receipt = verified.receipt
             expected_cases = tuple(item.case_id for item in packs[cell.pack_id].cases)
             if (
@@ -1217,7 +976,7 @@ def _read_complete_cell_evidence(
                 or receipt.repetition != cell.repetition
                 or receipt.agent_revision != study.agent_revision
                 or receipt.docker_image != study.execution.docker_image
-                or receipt.dataset_name != dataset_names[cell.pack_id]
+                or receipt.pack_manifest_sha256 != pack.reference.manifest_sha256
                 or tuple(item.case_id for item in receipt.predictions) != expected_cases
             ):
                 raise ValueError("benchmark report cell receipt does not match the study")
@@ -1232,7 +991,13 @@ def _read_complete_cell_evidence(
             os.close(root_descriptor)
 
 
-def _read_receipt_at(root_descriptor: int, cell_id: str) -> _VerifiedCellEvidence:
+def _read_receipt_at(
+    root_descriptor: int,
+    cell_id: str,
+    pack: LoadedEvaluationPack,
+    model: ModelConfiguration,
+    policy: RunPolicy,
+) -> _VerifiedCellEvidence:
     cell_descriptor: int | None = None
     receipt_descriptor: int | None = None
     try:
@@ -1261,13 +1026,12 @@ def _read_receipt_at(root_descriptor: int, cell_id: str) -> _VerifiedCellEvidenc
         receipt = BenchmarkCellReceipt.model_validate_json(content)
         if content != receipt.canonical_json.encode():
             raise ValueError("benchmark report requires canonical cell receipts")
-        provider_costs, response_ids = _verify_terminal_records_at(
-            cell_descriptor,
-            receipt,
+        terminals, response_ids = _verify_terminal_records_at(
+            cell_descriptor, receipt, pack, model, policy
         )
         return _VerifiedCellEvidence(
             receipt=receipt,
-            provider_costs=provider_costs,
+            terminals=terminals,
             provider_response_ids=response_ids,
         )
     except ValueError:
@@ -1284,7 +1048,10 @@ def _read_receipt_at(root_descriptor: int, cell_id: str) -> _VerifiedCellEvidenc
 def _verify_terminal_records_at(
     cell_descriptor: int,
     receipt: BenchmarkCellReceipt,
-) -> tuple[dict[str, ProviderCostSummary], frozenset[str]]:
+    pack: LoadedEvaluationPack,
+    model: ModelConfiguration,
+    policy: RunPolicy,
+) -> tuple[dict[str, _TerminalEvidence], frozenset[str]]:
     attempts_descriptor: int | None = None
     attempt_descriptor: int | None = None
     runs_descriptor: int | None = None
@@ -1339,12 +1106,15 @@ def _verify_terminal_records_at(
                 actual_run_ids.add(entry.name)
         if actual_run_ids != expected_run_ids:
             raise ValueError("benchmark report requires exact terminal records")
-        provider_costs: dict[str, ProviderCostSummary] = {}
+        terminals: dict[str, _TerminalEvidence] = {}
+        cases = {case.case_id: case for case in pack.cases}
         response_ids: set[str] = set()
         for prediction in receipt.predictions:
-            provider_cost, case_response_ids = _verify_terminal_record_at(
-                runs_descriptor,
-                prediction,
+            case = cases.get(prediction.case_id)
+            if case is None:
+                raise ValueError("benchmark report cell receipt does not match the study")
+            terminal, case_response_ids = _verify_terminal_record_at(
+                runs_descriptor, prediction, case, pack.manifest.database.sha256, model, policy
             )
             selected_ids = set(case_response_ids)
             if response_ids.intersection(selected_ids):
@@ -1352,8 +1122,8 @@ def _verify_terminal_records_at(
                     "benchmark report provider response identities must be unique"
                 )
             response_ids.update(selected_ids)
-            provider_costs[prediction.run_id] = provider_cost
-        return provider_costs, frozenset(response_ids)
+            terminals[prediction.run_id] = terminal
+        return terminals, frozenset(response_ids)
     except ValueError:
         raise
     except Exception:
@@ -1369,8 +1139,12 @@ def _verify_terminal_records_at(
 
 def _verify_terminal_record_at(
     runs_descriptor: int,
-    prediction: MlflowEvaluationPrediction,
-) -> tuple[ProviderCostSummary, tuple[str, ...]]:
+    prediction: EvaluationPrediction,
+    case: EvaluationPackCase,
+    database_sha256: str,
+    model: ModelConfiguration,
+    policy: RunPolicy,
+) -> tuple[_TerminalEvidence, tuple[str, ...]]:
     run_descriptor: int | None = None
     terminal_descriptor: int | None = None
     try:
@@ -1404,6 +1178,19 @@ def _verify_terminal_record_at(
             raise ValueError("benchmark report requires canonical terminal records")
         if terminal.run_id != prediction.run_id:
             raise ValueError("benchmark report terminal run identity does not match its receipt")
+        if (
+            terminal.request.question != case.question
+            or terminal.request.answer_schema != case.answer_schema
+            or terminal.request.derivation != case.derivation
+            or terminal.request.model != model
+            or terminal.request.policy != policy
+            or (
+                terminal.database is not None
+                and terminal.database.source_sha256 != database_sha256
+            )
+            or (prediction.accepted and terminal.database is None)
+        ):
+            raise ValueError("benchmark report terminal request does not match the study case")
         if prediction.accepted:
             if not isinstance(terminal.outcome, RunSuccess) or not exact_json_equal(
                 terminal.outcome.answer,
@@ -1425,8 +1212,15 @@ def _verify_terminal_record_at(
             or terminal.outcome.failure.code != prediction.failure_code
         ):
             raise ValueError("benchmark report terminal outcome does not match its receipt")
+        observations = {
+            "dsa.elapsed_seconds": (terminal.finished_at - terminal.started_at).total_seconds()
+        }
+        for key in ("requests", "input_tokens", "output_tokens", "total_tokens"):
+            value = terminal.usage.get(key)
+            if type(value) is int and value >= 0:
+                observations[f"dsa.usage.{key}"] = float(value)
         return (
-            provider_cost_from_messages(terminal.messages),
+            _TerminalEvidence(provider_cost_from_messages(terminal.messages), observations),
             safe_openrouter_response_ids(terminal.messages),
         )
     except ValueError:
@@ -1471,40 +1265,10 @@ def _verify_derivation_notebook_at(
             os.close(notebook_descriptor)
 
 
-def _dataset_evidence(
-    study: BenchmarkStudy,
-    runtime: BenchmarkRuntime,
-    receipts: tuple[BenchmarkCellReceipt, ...],
-) -> tuple[BenchmarkDatasetEvidence, ...]:
-    bindings = {item.pack_id: item.dataset_name for item in runtime.datasets}
-    result: list[BenchmarkDatasetEvidence] = []
-    for pack in study.packs:
-        selected = tuple(item for item in receipts if item.pack_id == pack.pack_id)
-        identities = {(item.dataset_id, item.dataset_digest) for item in selected}
-        if len(identities) != 1:
-            raise ValueError("benchmark report dataset identities conflict across cells")
-        dataset_id, dataset_digest = next(iter(identities))
-        result.append(
-            BenchmarkDatasetEvidence(
-                pack_id=pack.pack_id,
-                dataset_name=bindings[pack.pack_id],
-                dataset_id=dataset_id,
-                dataset_digest=dataset_digest,
-            )
-        )
-    return tuple(result)
-
-
-def _validate_runtime(study: BenchmarkStudy, runtime: BenchmarkRuntime) -> None:
+def _validate_runtime(runtime: BenchmarkRuntime) -> None:
     if not runtime.workspace_root.is_absolute():
         raise BenchmarkReportConfigurationError(
             "benchmark report workspace must be absolute"
-        )
-    if tuple(item.pack_id for item in runtime.datasets) != tuple(
-        item.pack_id for item in study.packs
-    ):
-        raise BenchmarkReportConfigurationError(
-            "report runtime must exactly cover study packs"
         )
 
 
@@ -1563,84 +1327,6 @@ def _canonical_report(value: BenchmarkReport | object) -> BenchmarkReport:
     return BenchmarkReport.model_validate(value)
 
 
-def _default_evidence_reader(
-    environment: Mapping[str, str],
-) -> BenchmarkEvidenceReader:
-    try:
-        destination = load_mlflow_destination(environment)
-    except MlflowConfigurationError:
-        raise BenchmarkReportConfigurationError(
-            "benchmark report requires a valid MLflow destination"
-        ) from None
-    try:
-        tracking = import_module("mlflow.tracking")
-        client_type = tracking.MlflowClient
-        client = client_type(tracking_uri=destination.tracking_uri)
-    except Exception:
-        raise BenchmarkReportConfigurationError(
-            "benchmark report MLflow client is unavailable"
-        ) from None
-    return MlflowBenchmarkEvidenceReader(client)
-
-
-class MlflowBenchmarkEvidenceReader:
-    """Read only the bounded MLflow fields needed by benchmark publication."""
-
-    def __init__(self, client: Any) -> None:
-        self.client = client
-
-    def get_run(self, run_id: str) -> BenchmarkMlflowRun:
-        try:
-            raw = self.client.get_run(run_id)
-            raw_run_id = raw.info.run_id
-            if raw_run_id != run_id:
-                raise ValueError("MLflow returned a foreign run")
-            raw_metrics = raw.data.metrics
-            raw_params = raw.data.params
-            raw_tags = raw.data.tags
-            metrics = {
-                name: float(raw_metrics[name])
-                for name in (*_EVALUATION_METRICS, *_ANALYSIS_METRICS)
-                if name in raw_metrics
-            }
-            params = {
-                name: str(raw_params[name]) for name in _RUN_PARAMS if name in raw_params
-            }
-            tags = {name: str(raw_tags[name]) for name in _RUN_TAGS if name in raw_tags}
-            return BenchmarkMlflowRun(
-                run_id=run_id,
-                status=str(raw.info.status),
-                lifecycle_stage=cast(
-                    Literal["active", "deleted"],
-                    str(raw.info.lifecycle_stage),
-                ),
-                metrics=metrics,
-                params=params,
-                tags=tags,
-            )
-        except Exception:
-            raise ValueError("required MLflow run is unavailable") from None
-
-
-def _read_remote_run(
-    reader: BenchmarkEvidenceReader,
-    run_id: str,
-) -> BenchmarkMlflowRun:
-    try:
-        value = reader.get_run(run_id)
-        selected = BenchmarkMlflowRun.model_validate_json(value.model_dump_json())
-    except Exception:
-        raise ValueError("required MLflow run is unavailable") from None
-    if selected.run_id != run_id:
-        raise ValueError("MLflow returned a foreign run identity")
-    return selected
-
-
-def _require_completed_run(run: BenchmarkMlflowRun, kind: str) -> None:
-    if run.status != "FINISHED" or run.lifecycle_stage != "active":
-        raise ValueError(f"MLflow {kind} run is not completed active evidence")
-
-
 def _metric_table_header() -> str:
     return (
         "| Scope | Cases | E2E exact | Completion | Conditional exact | E2E policy | "
@@ -1675,8 +1361,7 @@ def _cell_markdown_row(cell: BenchmarkCellReport) -> str:
         f"{_format_rate(metrics.conditional_policy_accuracy)} | "
         f"{_format_rate(metrics.agent_failure)} | "
         f"{_format_rate(metrics.infrastructure_failure)} | "
-        f"{_format_provider_cost(cell.provider_cost, cell.case_count)} | "
-        f"`{cell.evaluation_run_id}` |"
+        f"{_format_provider_cost(cell.provider_cost, cell.case_count)} |"
     )
 
 

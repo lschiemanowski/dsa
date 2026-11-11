@@ -142,8 +142,15 @@ template.
 
 Provider credentials continue to come from the process environment. Neither model-settings
 section nor its environment-variable equivalent may contain credentials or a provider endpoint;
-the same safe `ModelConfiguration` contract used by DSA validates both. Enable MLflow reporting
-only when an MLflow backend is already configured.
+the same safe `ModelConfiguration` contract used by DSA validates both.
+
+Logfire is off by default. To enable it for the trusted analysis, install the `logfire` extra,
+set `LOGFIRE_TOKEN` in the host environment, and set `report_to_logfire = true` in the TOML
+or `DSA_CHAT_REPORT_TO_LOGFIRE=true` when using environment-only configuration.
+Logfire receives operational metadata such as timings, usage, and failure codes. Prompts,
+answers, tool arguments and results, and retained files stay out of telemetry.
+Existing MLflow settings set to false can stay in place. Remove any enabled MLflow setting
+and enable Logfire explicitly if you want telemetry.
 
 Analysis guidance is disabled by default. Set `enable_analysis_guidance = true` in the TOML file,
 or `DSA_CHAT_ENABLE_ANALYSIS_GUIDANCE=true` when using environment-only configuration, to let the

@@ -1,31 +1,27 @@
-"""One small native MLflow evaluation path for canonical DSA runs."""
+"""Bounded local evaluation of canonical DSA runs."""
 
 from __future__ import annotations
 
+import asyncio
 import json
 import math
 import os
-from collections.abc import Callable, Generator
-from contextlib import AbstractContextManager, contextmanager, nullcontext
+from collections.abc import Callable
 from copy import deepcopy
 from hashlib import sha256
-from importlib import import_module
 from pathlib import Path
-from threading import Lock
-from typing import Any, Protocol, cast
+from typing import TypedDict, cast
 
 from pydantic import Field, JsonValue, TypeAdapter, model_validator
 from pydantic_ai.models import Model
 
 from dsa.contract import (
     ContractModel,
-    DerivationRequest,
     ModelConfiguration,
     RunPolicy,
     RunRequest,
 )
 from dsa.environment import PythonExecutor
-from dsa.mlflow_config import mlflow_configuration_failure
 from dsa.pack import (
     EvaluationPackCase,
     ExactJsonScorer,
@@ -34,11 +30,11 @@ from dsa.pack import (
     PackScorer,
 )
 from dsa.record import FailureStage, RunSuccess
-from dsa.reporting import MlflowReporting
+from dsa.reporting import LogfireReporting
 from dsa.runner import RunCompletion, run_analysis
 
 
-class MlflowEvaluationPrediction(ContractModel):
+class EvaluationPrediction(ContractModel):
     """Bounded scorer input projected from one completed DSA run."""
 
     case_id: str = Field(pattern=r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
@@ -53,10 +49,10 @@ class MlflowEvaluationPrediction(ContractModel):
     )
     failure_stage: FailureStage | None = None
     failure_code: str | None = None
-    reporting: MlflowReporting
+    reporting: LogfireReporting
 
     @model_validator(mode="after")
-    def validate_outcome_projection(self) -> MlflowEvaluationPrediction:
+    def validate_outcome_projection(self) -> EvaluationPrediction:
         if self.accepted:
             if self.failure_stage is not None or self.failure_code is not None:
                 raise ValueError("accepted predictions must not contain failure state")
@@ -70,199 +66,80 @@ class MlflowEvaluationPrediction(ContractModel):
         return self
 
 
-class MlflowEvaluationResult(ContractModel):
-    """Stable identities returned by one native MLflow evaluation."""
+class EvaluationResult(ContractModel):
+    """One complete set of predictions in pack order."""
 
-    dataset_id: str
-    dataset_digest: str
-    evaluation_run_id: str | None = None
-    metrics: dict[str, float] = Field(default_factory=dict)
-    predictions: tuple[MlflowEvaluationPrediction, ...] = ()
+    predictions: tuple[EvaluationPrediction, ...]
 
 
-class MlflowEvaluationError(RuntimeError):
-    """Stable infrastructure failure at the native evaluation boundary."""
+class EvaluationError(RuntimeError):
+    """Stable infrastructure failure at the local evaluation boundary."""
 
     def __init__(self, code: str) -> None:
-        super().__init__(f"MLflow evaluation failed ({code})")
+        super().__init__(f"Evaluation failed ({code})")
         self.code = code
 
 
-class _NativeDataset(Protocol):
-    dataset_id: str
-    digest: str
-
-    def merge_records(self, records: list[dict[str, JsonValue]]) -> _NativeDataset: ...
-
-
-class _EvaluationApi(Protocol):
-    def create_dataset(self, *, name: str, experiment_id: str) -> _NativeDataset: ...
-
-    def get_dataset(self, *, name: str) -> _NativeDataset: ...
-
-    def scorer(self, function: Callable[..., object], *, name: str) -> object: ...
-
-    def invalid_feedback(self, name: str, rationale: str) -> object: ...
-
-    def evaluation_context(
-        self,
-        tags: dict[str, str],
-    ) -> AbstractContextManager[object]: ...
-
-    def evaluate(
-        self,
-        *,
-        data: _NativeDataset,
-        predict_fn: Callable[..., object],
-        scorers: list[object],
-    ) -> object: ...
-
-
 ModelFactory = Callable[[EvaluationPackCase], Model | str | None]
-_PACK_SCORER_ADAPTER: TypeAdapter[PackScorer] = TypeAdapter(
+_LEGACY_SCORER_ADAPTER: TypeAdapter[PackScorer] = TypeAdapter(
     ExactJsonScorer | JsonNumericToleranceScorer
 )
 
 
-def run_mlflow_evaluation(
+async def run_evaluation(
     pack: LoadedEvaluationPack | object,
     *,
-    dataset_name: str,
     runs_directory: Path,
     model_configuration: ModelConfiguration | object,
     policy: RunPolicy | object,
+    case_workers: int = 1,
     model_factory: ModelFactory | None = None,
     python_executor: PythonExecutor | None = None,
-    api: _EvaluationApi | None = None,
-    run_tags: dict[str, str] | None = None,
-) -> MlflowEvaluationResult:
-    """Create a native dataset from a verified pack and run ordinary DSA analyses."""
+    report_to_logfire: bool = False,
+) -> EvaluationResult:
+    """Run each verified pack case once with bounded concurrency."""
+    if type(case_workers) is not int or not 1 <= case_workers <= 64:
+        raise ValueError("case_workers must be an integer between 1 and 64")
+    if type(report_to_logfire) is not bool:
+        raise TypeError("report_to_logfire must be a boolean")
     canonical_pack = _canonical_pack(pack)
-    canonical_cases = canonical_pack.cases
-    if len({case.case_id for case in canonical_cases}) != len(canonical_cases):
-        raise ValueError("evaluation case IDs must be unique")
-    if len(canonical_cases) != canonical_pack.manifest.cases.case_count:
-        raise ValueError("evaluation pack case count does not match its manifest")
-    if not dataset_name.strip():
-        raise ValueError("dataset_name must not be blank")
     canonical_model = _canonical_model_configuration(model_configuration)
     canonical_policy = _canonical_policy(policy)
-    canonical_tags = _canonical_run_tags(run_tags)
     _verify_pack_database(canonical_pack)
-    configuration_failure = _evaluation_configuration_failure()
-    if configuration_failure is not None:
-        raise MlflowEvaluationError(configuration_failure)
-    experiment_id = os.environ["MLFLOW_EXPERIMENT_ID"]
+    semaphore = asyncio.Semaphore(case_workers)
 
-    try:
-        selected_api = api or _MlflowEvaluationApi()
-        dataset = selected_api.create_dataset(
-            name=dataset_name,
-            experiment_id=experiment_id,
-        )
-        dataset = dataset.merge_records(
-            [case.dataset_record(canonical_pack.manifest) for case in canonical_cases]
-        )
-        dataset = selected_api.get_dataset(name=dataset_name)
-    except ModuleNotFoundError:
-        raise MlflowEvaluationError("mlflow_dependency_missing") from None
-    except Exception:
-        raise MlflowEvaluationError("mlflow_dataset_failed") from None
-    indexed = {case.case_id: case for case in canonical_cases}
-    reserved: set[str] = set()
-    captured: dict[str, MlflowEvaluationPrediction] = {}
-    capture_lock = Lock()
-
-    async def predict_fn(
-        case_id: str,
-        case_version: str,
-        database_id: str,
-        database_sha256: str,
-        question: str,
-        answer_schema: dict[str, JsonValue],
-        derivation: dict[str, JsonValue] | None = None,
-    ) -> dict[str, JsonValue]:
-        case = indexed.get(case_id)
-        if case is None:
-            raise ValueError("evaluation input contains an unknown case ID")
-        if (
-            case_version != case.case_version
-            or database_id != canonical_pack.manifest.database.id
-            or database_sha256 != canonical_pack.manifest.database.sha256
-            or question != case.question
-            or answer_schema != case.answer_schema
-            or derivation != _derivation_input(case.derivation)
-        ):
-            raise ValueError("evaluation input does not match its verified pack case")
-        with capture_lock:
-            if case_id in reserved:
-                raise ValueError("evaluation invoked a case more than once")
-            reserved.add(case_id)
-        canonical_request = RunRequest(
-            database_path=canonical_pack.database_path,
-            question=case.question,
-            answer_schema=case.answer_schema,
-            derivation=case.derivation,
-            model=canonical_model,
-            policy=canonical_policy,
-        )
-        selected_model = model_factory(case) if model_factory is not None else None
-        completion = await run_analysis(
-            canonical_request,
-            runs_directory=runs_directory,
-            model=selected_model,
-            python_executor=python_executor,
-            report_to_mlflow=True,
-        )
-        prediction = evaluation_prediction(case_id, completion)
-        with capture_lock:
-            captured[case_id] = prediction
-        return prediction.model_dump(mode="json")
-
-    scorers = _native_scorers(selected_api)
-    try:
-        evaluation_context = (
-            selected_api.evaluation_context(canonical_tags)
-            if canonical_tags
-            else nullcontext()
-        )
-        with evaluation_context, _skip_mlflow_prediction_preflight():
-            raw_result = selected_api.evaluate(
-                data=dataset,
-                predict_fn=predict_fn,
-                scorers=scorers,
+    async def evaluate_case(case: EvaluationPackCase) -> EvaluationPrediction:
+        async with semaphore:
+            request = RunRequest(
+                database_path=canonical_pack.database_path,
+                question=case.question,
+                answer_schema=case.answer_schema,
+                derivation=case.derivation,
+                model=canonical_model,
+                policy=canonical_policy,
             )
-    except Exception:
-        raise MlflowEvaluationError("mlflow_evaluation_failed") from None
-    metrics = {
-        str(key): float(cast(int | float, value))
-        for key, value in cast(dict[str, object], getattr(raw_result, "metrics", {})).items()
-        if type(value) in (int, float) and math.isfinite(cast(float, value))
-    }
-    evaluation_run_id = getattr(raw_result, "run_id", None)
-    with capture_lock:
-        if set(captured) != set(indexed):
-            raise MlflowEvaluationError("mlflow_prediction_set_mismatch")
-        predictions = tuple(captured[case.case_id] for case in canonical_cases)
-    return MlflowEvaluationResult(
-        dataset_id=dataset.dataset_id,
-        dataset_digest=dataset.digest,
-        evaluation_run_id=(
-            evaluation_run_id if isinstance(evaluation_run_id, str) else None
-        ),
-        metrics=metrics,
-        predictions=predictions,
-    )
+            completion = await run_analysis(
+                request,
+                runs_directory=runs_directory,
+                model=model_factory(case) if model_factory is not None else None,
+                python_executor=python_executor,
+                report_to_logfire=report_to_logfire,
+            )
+            return evaluation_prediction(case.case_id, completion)
+
+    async with asyncio.TaskGroup() as group:
+        tasks = [group.create_task(evaluate_case(case)) for case in canonical_pack.cases]
+    return EvaluationResult(predictions=tuple(task.result() for task in tasks))
 
 
 def evaluation_prediction(
     case_id: str,
     completion: RunCompletion,
-) -> MlflowEvaluationPrediction:
+) -> EvaluationPrediction:
     """Project canonical completion state into bounded evaluation output."""
     if isinstance(completion.outcome, RunSuccess):
         verification = completion.outcome.derivation_verification
-        return MlflowEvaluationPrediction(
+        return EvaluationPrediction(
             case_id=case_id,
             run_id=completion.record.run_id,
             terminal_sha256=completion.retained_record.sha256,
@@ -273,7 +150,7 @@ def evaluation_prediction(
             ),
             reporting=completion.reporting,
         )
-    return MlflowEvaluationPrediction(
+    return EvaluationPrediction(
         case_id=case_id,
         run_id=completion.record.run_id,
         terminal_sha256=completion.retained_record.sha256,
@@ -284,90 +161,60 @@ def evaluation_prediction(
     )
 
 
-def _derivation_input(
-    value: DerivationRequest | None,
-) -> dict[str, JsonValue] | None:
-    if value is None:
-        return None
-    return cast(dict[str, JsonValue], value.model_dump(mode="json"))
+class PredictionScores(TypedDict):
+    end_to_end_exact_success: bool
+    end_to_end_policy_success: bool
+    conditional_exact_json: bool | None
+    conditional_policy_match: bool | None
+    agent_failure: bool
+    infrastructure_failure: bool
 
 
-def end_to_end_exact_success(
-    outputs: MlflowEvaluationPrediction | dict[str, JsonValue],
-    expectations: dict[str, JsonValue],
-) -> bool:
-    prediction = _prediction(outputs)
-    expected, _scorer = _decode_scoring_expectations(expectations)
-    return (
-        prediction.accepted
-        and exact_json_equal(prediction.answer, expected)
-        and prediction.reporting.status == "reported"
-    )
-
-
-def conditional_exact_json(
-    outputs: MlflowEvaluationPrediction | dict[str, JsonValue],
-    expectations: dict[str, JsonValue],
-) -> bool | None:
-    prediction = _prediction(outputs)
-    if not prediction.accepted:
-        return None
-    expected, _scorer = _decode_scoring_expectations(expectations)
-    return exact_json_equal(prediction.answer, expected)
-
-
-def end_to_end_policy_success(
-    outputs: MlflowEvaluationPrediction | dict[str, JsonValue],
-    expectations: dict[str, JsonValue],
-) -> bool:
-    """Score accepted, reported answers under the pack comparison policy."""
-    prediction = _prediction(outputs)
-    return (
-        prediction.accepted
-        and json_answers_equal(prediction.answer, expectations)
-        and prediction.reporting.status == "reported"
-    )
-
-
-def conditional_policy_match(
-    outputs: MlflowEvaluationPrediction | dict[str, JsonValue],
-    expectations: dict[str, JsonValue],
-) -> bool | None:
-    """Score accepted answers under the pack policy without failures in the denominator."""
-    prediction = _prediction(outputs)
-    if not prediction.accepted:
-        return None
-    return json_answers_equal(prediction.answer, expectations)
-
-
-def agent_failure(
-    outputs: MlflowEvaluationPrediction | dict[str, JsonValue],
-    expectations: dict[str, JsonValue],
-) -> bool:
-    prediction = _prediction(outputs)
-    if infrastructure_failure(prediction):
-        return False
-    if not prediction.accepted:
-        return True
-    return not json_answers_equal(prediction.answer, expectations)
-
-
-def infrastructure_failure(
-    outputs: MlflowEvaluationPrediction | dict[str, JsonValue],
-) -> bool:
-    prediction = _prediction(outputs)
-    if prediction.reporting.status != "reported":
-        return True
+def score_prediction(
+    prediction: EvaluationPrediction, expected: JsonValue, scorer: PackScorer
+) -> PredictionScores:
+    """Score a validated prediction against a verified pack case."""
+    exact: bool | None = None
+    policy: bool | None = None
     if prediction.accepted:
-        return False
-    if prediction.failure_stage in {"analysis_environment", "cancelled"}:
+        exact = exact_json_equal(prediction.answer, expected)
+        policy = exact or (
+            isinstance(scorer, JsonNumericToleranceScorer)
+            and _tolerant_json_equal(prediction.answer, expected, scorer)
+        )
+    return score_outcome(
+        prediction.accepted, prediction.failure_stage, prediction.failure_code, exact, policy
+    )
+
+
+def score_outcome(
+    accepted: bool,
+    failure_stage: FailureStage | None,
+    failure_code: str | None,
+    exact: bool | None,
+    policy: bool | None,
+) -> PredictionScores:
+    """Derive classifications from the outcome and conditional scores."""
+    infrastructure = not accepted and _infrastructure_failure(failure_stage, failure_code)
+    return {
+        "end_to_end_exact_success": exact is True,
+        "end_to_end_policy_success": policy is True,
+        "conditional_exact_json": exact,
+        "conditional_policy_match": policy,
+        "agent_failure": not infrastructure and policy is not True,
+        "infrastructure_failure": infrastructure,
+    }
+
+
+def _infrastructure_failure(stage: FailureStage | None, code: str | None) -> bool:
+    if stage in {"analysis_environment", "cancelled"}:
         return True
-    if prediction.failure_stage == "model" and prediction.failure_code in {
+    if stage == "model" and code in {
         "model_api_error",
         "model_http_error",
     }:
         return True
-    return prediction.failure_stage == "orchestration" and prediction.failure_code in {
+    return stage == "orchestration" and code in {
         "internal_error",
         "run_timeout",
         "tool_result_limit_exceeded",
@@ -384,33 +231,26 @@ def json_answers_equal(
     actual: JsonValue,
     expectations: dict[str, JsonValue],
 ) -> bool:
-    """Compare one answer under the canonical policy retained in the dataset."""
-    expected, scorer = _decode_scoring_expectations(expectations)
-    if isinstance(scorer, JsonNumericToleranceScorer):
-        return _tolerant_json_equal(actual, expected, scorer)
-    return exact_json_equal(actual, expected)
-
-
-def _decode_scoring_expectations(
-    value: dict[str, JsonValue],
-) -> tuple[JsonValue, PackScorer]:
-    if set(value) != {"answer", "scorer"}:
+    """Score an answer using the serialized expectations in older benchmark jobs."""
+    if set(expectations) != {"answer", "scorer"}:
         raise ValueError("evaluation expectations have an invalid shape")
-    answer_text = value["answer"]
-    scorer_text = value["scorer"]
+    answer_text = expectations["answer"]
+    scorer_text = expectations["scorer"]
     if not isinstance(answer_text, str) or not isinstance(scorer_text, str):
         raise ValueError("evaluation expectations must be canonical JSON strings")
     try:
         answer = cast(JsonValue, json.loads(answer_text))
         scorer_value = json.loads(scorer_text)
-        scorer = _PACK_SCORER_ADAPTER.validate_python(scorer_value)
+        scorer = _LEGACY_SCORER_ADAPTER.validate_python(scorer_value)
     except Exception:
         raise ValueError("evaluation expectations are invalid") from None
     if answer_text != _canonical_json(answer) or scorer_text != _canonical_json(
         cast(JsonValue, scorer.model_dump(mode="json"))
     ):
         raise ValueError("evaluation expectations must be canonical")
-    return answer, scorer
+    if isinstance(scorer, JsonNumericToleranceScorer):
+        return _tolerant_json_equal(actual, answer, scorer)
+    return exact_json_equal(actual, answer)
 
 
 def _tolerant_json_equal(
@@ -474,67 +314,16 @@ def _verify_pack_database(pack: LoadedEvaluationPack) -> None:
     try:
         with pack.database_path.open("rb") as source:
             if os.fstat(source.fileno()).st_size != expected.size_bytes:
-                raise MlflowEvaluationError("evaluation_database_mismatch")
+                raise EvaluationError("evaluation_database_mismatch")
             digest = sha256()
             for chunk in iter(lambda: source.read(1024 * 1024), b""):
                 digest.update(chunk)
-    except MlflowEvaluationError:
+    except EvaluationError:
         raise
     except OSError:
-        raise MlflowEvaluationError("evaluation_database_unavailable") from None
+        raise EvaluationError("evaluation_database_unavailable") from None
     if digest.hexdigest() != expected.sha256:
-        raise MlflowEvaluationError("evaluation_database_mismatch")
-
-
-def _evaluation_configuration_failure() -> str | None:
-    return mlflow_configuration_failure(os.environ)
-
-
-def _canonical_run_tags(value: dict[str, str] | None) -> dict[str, str]:
-    if value is None:
-        return {}
-    tags: dict[str, str] = {}
-    safe_value_characters = frozenset(
-        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-"
-    )
-    for key in sorted(value):
-        selected = value[key]
-        if (
-            not key.startswith("dsa.benchmark.")
-            or len(key) > 128
-            or not selected
-            or len(selected) > 256
-            or any(character not in safe_value_characters for character in selected)
-        ):
-            raise ValueError("evaluation run tags must be safe benchmark identities")
-        tags[key] = selected
-    return tags
-
-
-@contextmanager
-def _skip_mlflow_prediction_preflight() -> Generator[None]:
-    """Prevent MLflow from executing a side-effecting prediction as validation."""
-    key = "MLFLOW_GENAI_EVAL_SKIP_TRACE_VALIDATION"
-    original = os.environ.get(key)
-    os.environ[key] = "true"
-    try:
-        yield
-    finally:
-        if original is None:
-            os.environ.pop(key, None)
-        else:
-            os.environ[key] = original
-
-
-def _prediction(
-    value: MlflowEvaluationPrediction | dict[str, JsonValue],
-) -> MlflowEvaluationPrediction:
-    data = (
-        value.model_dump(mode="python")
-        if isinstance(value, MlflowEvaluationPrediction)
-        else value
-    )
-    return MlflowEvaluationPrediction.model_validate(data)
+        raise EvaluationError("evaluation_database_mismatch")
 
 
 def _canonical_json(value: JsonValue) -> str:
@@ -545,118 +334,3 @@ def _canonical_json(value: JsonValue) -> str:
         sort_keys=True,
         separators=(",", ":"),
     )
-
-
-def _native_scorers(api: _EvaluationApi) -> list[object]:
-    def score_end_to_end(
-        outputs: dict[str, JsonValue], expectations: dict[str, JsonValue]
-    ) -> bool:
-        return end_to_end_exact_success(outputs, expectations)
-
-    def score_conditional(
-        outputs: dict[str, JsonValue], expectations: dict[str, JsonValue]
-    ) -> object:
-        value = conditional_exact_json(outputs, expectations)
-        if value is None:
-            return api.invalid_feedback(
-                "conditional_exact_json",
-                "The analysis did not produce an accepted answer",
-            )
-        return value
-
-    def score_agent_failure(
-        outputs: dict[str, JsonValue], expectations: dict[str, JsonValue]
-    ) -> bool:
-        return agent_failure(outputs, expectations)
-
-    def score_end_to_end_policy(
-        outputs: dict[str, JsonValue], expectations: dict[str, JsonValue]
-    ) -> bool:
-        return end_to_end_policy_success(outputs, expectations)
-
-    def score_conditional_policy(
-        outputs: dict[str, JsonValue], expectations: dict[str, JsonValue]
-    ) -> object:
-        value = conditional_policy_match(outputs, expectations)
-        if value is None:
-            return api.invalid_feedback(
-                "conditional_policy_match",
-                "The analysis did not produce an accepted answer",
-            )
-        return value
-
-    def score_infrastructure_failure(outputs: dict[str, JsonValue]) -> bool:
-        return infrastructure_failure(outputs)
-
-    return [
-        api.scorer(score_end_to_end, name="end_to_end_exact_success"),
-        api.scorer(score_conditional, name="conditional_exact_json"),
-        api.scorer(score_end_to_end_policy, name="end_to_end_policy_success"),
-        api.scorer(score_conditional_policy, name="conditional_policy_match"),
-        api.scorer(score_agent_failure, name="agent_failure"),
-        api.scorer(score_infrastructure_failure, name="infrastructure_failure"),
-    ]
-
-
-class _MlflowEvaluationApi:
-    def __init__(self) -> None:
-        self.mlflow: Any = import_module("mlflow")
-        self.datasets: Any = import_module("mlflow.genai.datasets")
-        self.genai: Any = import_module("mlflow.genai")
-        self.scorers: Any = import_module("mlflow.genai.scorers")
-        entities: Any = import_module("mlflow.entities")
-        self.feedback_type: Any = entities.Feedback
-
-    def create_dataset(self, *, name: str, experiment_id: str) -> _NativeDataset:
-        try:
-            existing = self.datasets.get_dataset(name=name)
-        except Exception as error:
-            if not _dataset_is_missing(error):
-                raise
-        else:
-            return cast(_NativeDataset, existing)
-        try:
-            created = self.datasets.create_dataset(
-                name=name,
-                experiment_id=experiment_id,
-            )
-        except Exception as create_error:
-            try:
-                created = self.datasets.get_dataset(name=name)
-            except Exception:
-                raise create_error from None
-        return cast(_NativeDataset, created)
-
-    def get_dataset(self, *, name: str) -> _NativeDataset:
-        return cast(_NativeDataset, self.datasets.get_dataset(name=name))
-
-    def scorer(self, function: Callable[..., object], *, name: str) -> object:
-        return self.scorers.scorer(function, name=name)
-
-    def invalid_feedback(self, name: str, rationale: str) -> object:
-        return self.feedback_type(name=name, value=None, rationale=rationale, valid=False)
-
-    def evaluation_context(
-        self,
-        tags: dict[str, str],
-    ) -> AbstractContextManager[object]:
-        return cast(AbstractContextManager[object], self.mlflow.start_run(tags=tags))
-
-    def evaluate(
-        self,
-        *,
-        data: _NativeDataset,
-        predict_fn: Callable[..., object],
-        scorers: list[object],
-    ) -> object:
-        return self.genai.evaluate(data=data, predict_fn=predict_fn, scorers=scorers)
-
-
-def _dataset_is_missing(error: Exception) -> bool:
-    if getattr(error, "error_code", None) == "RESOURCE_DOES_NOT_EXIST":
-        return True
-    try:
-        not_found = import_module("databricks.sdk.errors").NotFound
-    except (AttributeError, ModuleNotFoundError):
-        return False
-    return isinstance(error, not_found)

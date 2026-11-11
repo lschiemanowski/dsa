@@ -103,7 +103,7 @@ async def test_adapter_builds_privileged_derivation_request_and_maps_success(
     assert run_request.derivation.allow_plots is allow_plots
     assert run_request.question == request().question
     assert kwargs["runs_directory"] == tmp_path / "runs"
-    assert kwargs["report_to_mlflow"] is False
+    assert kwargs["report_to_logfire"] is False
     identity_factory = kwargs["identity_factory"]
     assert callable(identity_factory) and identity_factory() == request().run_id
 

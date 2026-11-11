@@ -72,6 +72,10 @@ class _ConfiguredModel(AppContract):
         return self
 
 
+class LegacyChatReportingError(ValueError):
+    """An obsolete setting requested an export to the old backend."""
+
+
 class _FileConfiguration(AppContract):
     format: Literal["dsa-private-data-chat-config/v1"]
     data_source_id: str = Field(pattern=r"^[a-z][a-z0-9_-]{0,127}$")
@@ -82,7 +86,7 @@ class _FileConfiguration(AppContract):
     runs_directory: str = Field(min_length=1, max_length=4096)
     docker_image: str
     enable_analysis_guidance: bool = False
-    report_to_mlflow: bool = False
+    report_to_logfire: bool = False
     clarifier: _ConfiguredModel
     trusted: _ConfiguredModel
 
@@ -112,6 +116,12 @@ def load_configuration(
 def _load_environment_configuration(
     values: Mapping[str, str],
 ) -> PrivateDataChatConfiguration:
+    legacy_reporting = values.get("DSA_CHAT_REPORT_TO_MLFLOW")
+    if legacy_reporting is not None and _boolean(legacy_reporting, "DSA_CHAT_REPORT_TO_MLFLOW"):
+        raise LegacyChatReportingError(
+            "Remove DSA_CHAT_REPORT_TO_MLFLOW and set DSA_CHAT_REPORT_TO_LOGFIRE=true "
+            "if you want Logfire telemetry."
+        )
     data_source_id = _required(values, "DSA_CHAT_DATA_SOURCE_ID")
     return PrivateDataChatConfiguration(
         data_source_id=data_source_id,
@@ -134,9 +144,9 @@ def _load_environment_configuration(
                 "DSA_CHAT_TRUSTED_MODEL_SETTINGS_JSON",
             ),
             docker_image=_required(values, "DSA_CHAT_DOCKER_IMAGE"),
-            report_to_mlflow=_boolean(
-                values.get("DSA_CHAT_REPORT_TO_MLFLOW", "false"),
-                "DSA_CHAT_REPORT_TO_MLFLOW",
+            report_to_logfire=_boolean(
+                values.get("DSA_CHAT_REPORT_TO_LOGFIRE", "false"),
+                "DSA_CHAT_REPORT_TO_LOGFIRE",
             ),
         ),
     )
@@ -146,6 +156,11 @@ def _load_file_configuration(path: Path) -> PrivateDataChatConfiguration:
     absolute_path = path.absolute()
     content = read_contract(absolute_path)
     raw = tomllib.loads(content.decode("utf-8"))
+    if "report_to_mlflow" in raw and raw.pop("report_to_mlflow") is not False:
+        raise LegacyChatReportingError(
+            "Remove report_to_mlflow and set report_to_logfire = true "
+            "if you want Logfire telemetry."
+        )
     configured = _FileConfiguration.model_validate(raw)
     base = absolute_path.parent
     return PrivateDataChatConfiguration(
@@ -169,7 +184,7 @@ def _load_file_configuration(path: Path) -> PrivateDataChatConfiguration:
             trusted_model_name=configured.trusted.model,
             trusted_model_settings=configured.trusted.settings,
             docker_image=configured.docker_image,
-            report_to_mlflow=configured.report_to_mlflow,
+            report_to_logfire=configured.report_to_logfire,
         ),
     )
 

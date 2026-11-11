@@ -41,7 +41,7 @@ def write_configuration(tmp_path: Path) -> Path:
                 'runs_directory = "runs"',
                 f'docker_image = "{IMAGE}"',
                 "enable_analysis_guidance = true",
-                "report_to_mlflow = false",
+                "report_to_logfire = false",
                 "",
                 "[clarifier]",
                 'model = "openai:untrusted"',
@@ -281,3 +281,29 @@ def test_chat_styles_widen_layout_and_wrap_code_without_mutating_content() -> No
     assert ".message-content pre code" in css
     assert "white-space: pre-wrap !important" in css
     assert "overflow-wrap: anywhere" in css
+
+
+
+@pytest.mark.parametrize("legacy_value", ["false", "true"])
+def test_check_handles_legacy_mlflow_setting(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], legacy_value: str
+) -> None:
+    config_path = write_configuration(tmp_path)
+    config_path.write_text(
+        config_path.read_text().replace(
+            "report_to_logfire = false", f"report_to_mlflow = {legacy_value}"
+        )
+    )
+    result = main(
+        ["--config", str(config_path), "--check"],
+        dependency_available=lambda: True,
+        environ={},
+    )
+    response = json.loads(capsys.readouterr().out)
+    if legacy_value == "false":
+        assert result == 0
+        assert response["status"] == "ready"
+    else:
+        assert result == 2
+        assert response["code"] == "chat_reporting_setting_renamed"
+        assert "report_to_logfire" in response["message"]
