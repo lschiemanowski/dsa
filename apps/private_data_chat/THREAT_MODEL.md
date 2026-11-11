@@ -14,7 +14,7 @@ approving user.
 
 ### Untrusted side
 
-- Chainlit chat content and bounded conversation history;
+- chat content and bounded conversation history;
 - the clarification model and everything it emits;
 - the synthetic mock database context;
 - the exact public database card pinned from the Hugging Face dataset, including model-only
@@ -30,7 +30,7 @@ host can read.
 
 ### Trusted application side
 
-- authenticated user and conversation identity;
+- user or browser-session identity and conversation identity;
 - the proposal store and approval state machine;
 - the mapping from logical data-source IDs to private database paths;
 - trusted-model selection, credentials, DSA policy, executor configuration, and run directories;
@@ -50,8 +50,8 @@ may correct or ignore it, and only the trusted model's ordinary DSA derivation i
 
 ## Approval invariant
 
-The approved digest covers the versioned proposal payload plus the authenticated user,
-conversation, and logical data source. The server stores that canonical content before presenting
+The approved digest covers the versioned proposal payload plus the user or browser-session
+identity, conversation, and logical data source. The server stores that canonical content before presenting
 it for approval. Execution reads the stored copy. It never accepts a fresh proposal body from the
 confirmation event.
 
@@ -79,11 +79,11 @@ honestly rather than fabricating or presenting an unverified notebook.
 
 ## Artifact invariant
 
-External responses contain an opaque artifact ID, SHA-256 digest, byte length, and media type—not
-a local path. The application keeps the retained notebook reference only for its current session,
-reopens it without following symlinks, and verifies the exact length and digest before emitting a
-fixed-name Chainlit file element. There is no general artifact endpoint or possession-based API
-in this demo.
+The application keeps the retained notebook reference in its session. It reopens the notebook
+without following symlinks and verifies the exact length and SHA-256 digest before delivering the
+bytes. The HTTP API publishes a notebook URL only for the completed conversation and checks the
+owning browser session on each download. The notebook is delivered under a fixed filename.
+Artifact responses omit local paths.
 
 ## Failure policy
 
@@ -97,12 +97,13 @@ retained terminal evidence and must not automatically repeat an ambiguous paid e
 
 ## Deliberate demo limits
 
-- HTTP authentication, CSRF protection, rate limits, and deployment hardening;
-- durable multi-process transactions and crash recovery;
-- a separate HTTP service or durable artifact-serving registry;
+- user-account authentication, rate limits, and deployment hardening;
+- durable multi-process transactions, crash recovery, and a durable artifact registry;
 - protection from an operator putting sensitive values into the mock context; and
 - semantic quality or privacy review of the final answer and notebook.
 
-The configured application exposes one data source to everyone allowed to access it. Chainlit
-deployment and access control must therefore restrict it to the intended users. A future
-multi-source application would need real per-user data-source authorization.
+The HTTP API is intended for single-process, same-origin development on loopback. It accepts
+loopback host names and checks the origin of browser writes. A server-issued session cookie
+isolates conversations between browsers but does not authenticate a user account. The configured
+data source is available to everyone allowed to access the app. A multi-user deployment must
+restrict access to intended users.

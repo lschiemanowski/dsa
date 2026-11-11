@@ -6,16 +6,11 @@ from importlib import import_module
 from typing import Any, cast
 
 from apps.private_data_chat.chat import ChatResponse, PrivateDataChatSession, render_proposal
-from apps.private_data_chat.clarifier import PydanticClarifier, load_mock_context
-from apps.private_data_chat.contracts import MockDatabaseContext, ProposalRecord
-from apps.private_data_chat.database_card import (
-    DatabaseCard,
-    load_database_card,
-    render_database_overview,
-)
-from apps.private_data_chat.dsa_adapter import DsaAnalysisExecutor
-from apps.private_data_chat.presentation import escape_markdown_inline, escape_markdown_text
-from apps.private_data_chat.settings import load_configuration
+from apps.private_data_chat.contracts import ProposalRecord
+from apps.private_data_chat.presentation import escape_markdown_text
+from apps.private_data_chat.service import load_chat_service
+from apps.private_data_chat.service import model_display_name as _model_display_name
+from apps.private_data_chat.service import welcome_message as _welcome_message
 
 cl: Any = import_module("chainlit")
 
@@ -27,33 +22,11 @@ _CONFIRM_SECONDS = 300
 async def on_chat_start() -> None:
     """Build one isolated application session from host-owned configuration."""
     try:
-        configuration = load_configuration()
-        context = load_mock_context(
-            configuration.mock_context_path, configuration.synthetic_context
-        )
-        database_card = (
-            load_database_card(configuration.database_card)
-            if configuration.database_card is not None
-            else None
-        )
-        if context.data_source_id != configuration.data_source_id:
-            raise ValueError("mock and configured data source IDs differ")
+        service = load_chat_service()
         conversation_id = _session_identity(cl.user_session.get("id"), "conversation")
         user = cl.user_session.get("user")
         user_id = _session_identity(getattr(user, "identifier", None), conversation_id)
-        session = PrivateDataChatSession(
-            user_id=user_id,
-            conversation_id=conversation_id,
-            context=context,
-            clarifier=PydanticClarifier(
-                configuration.clarifier_model,
-                context,
-                database_card=database_card,
-                enable_analysis_guidance=configuration.enable_analysis_guidance,
-            ),
-            executor=DsaAnalysisExecutor(configuration.dsa),
-            enable_analysis_guidance=configuration.enable_analysis_guidance,
-        )
+        session = service.create_session(user_id, conversation_id)
         cl.user_session.set(_SESSION_KEY, session)
     except Exception:
         cl.user_session.set(_SESSION_KEY, None)
@@ -64,9 +37,9 @@ async def on_chat_start() -> None:
 
     await cl.Message(
         content=_welcome_message(
-            context,
-            database_card,
-            _model_display_name(configuration.clarifier_model.name),
+            service.context,
+            service.database_card,
+            _model_display_name(service.configuration.clarifier_model.name),
         )
     ).send()
 
@@ -164,41 +137,3 @@ def _session_identity(value: object, fallback: str) -> str:
     if isinstance(value, str) and value.strip() and len(value) <= 240:
         return value
     return f"chainlit-{fallback}"[:256]
-
-
-def _welcome_message(
-    context: MockDatabaseContext,
-    database_card: DatabaseCard | None,
-    clarifier_model_name: str,
-) -> str:
-    """Combine the fixed trust flow with bounded dataset-owned public context."""
-    title = escape_markdown_inline(database_card.title) if database_card else "this database"
-    sections = [
-        "## Instructions\n\n"
-        "This chat interface allows you to ask quantitative questions about a DuckDB in plain "
-        f"language. **{clarifier_model_name}** will turn your question into a request for a "
-        "subagent, which is run by a trusted model. A typical session works as follows:\n\n"
-        "1. Ask your question in ordinary language.\n"
-        f"2. **{clarifier_model_name}** will either ask a follow-up question or directly prepare "
-        "the request for the subagent.\n"
-        "3. Review the subagent request. If you are happy with it, run the request.\n"
-        "4. The agent returns the result. If it succeeds, you receive a structured answer and a "
-        "downloadable Jupyter notebook containing the derivation.\n"
-        "5. To prevent data from leaking to the untrusted model, the session ends after the "
-        "result is returned. Start a new session to ask another question.",
-        f"## About {title}",
-    ]
-    if database_card is not None:
-        sections.append(render_database_overview(database_card))
-    else:
-        sections.append(
-            "Ask quantitative questions about the configured database."
-        )
-    sections.append(f"Ask a question about **{title}** to begin.")
-    return "\n\n".join(sections)
-
-
-def _model_display_name(configured_name: str) -> str:
-    """Project a provider-qualified model ID into a compact user-facing label."""
-    unqualified = configured_name.partition(":")[2] or configured_name
-    return unqualified.rsplit("/", maxsplit=1)[-1]
