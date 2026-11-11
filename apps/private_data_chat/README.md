@@ -218,6 +218,37 @@ finish. Up to two analyses can run at a time. If both slots are occupied, approv
 Sessions are held in memory and are lost on server restart. The API accepts localhost and IPv4
 and IPv6 loopback. `dsa chat` continues to launch the Chainlit UI during this stage of the migration.
 
+## Preview the assistant-ui frontend
+
+Start the FastAPI server from the repository root using the command above. In a second terminal
+with Node.js 22.12 or newer, run:
+
+```bash
+cd ui
+npm ci
+npm run dev
+```
+
+Open the loopback URL printed by Vite. Vite proxies `/api` to the Python server on port 8001.
+Set `DSA_CHAT_API_ORIGIN` before starting Vite if the API is listening on another loopback port.
+
+The frontend keeps the current conversation ID in tab session storage so a reload can recover
+the transcript and a running analysis. The proposal and result cards offer their exact JSON in
+disclosures. **Open notebook** fetches the verified derivation and shows its saved cells and
+outputs alongside the chat, or in a full-width pane on narrow screens.
+
+Run `npm run build` to type-check and build the UI. The browser smoke test starts Vite and the
+real HTTP API with a deterministic clarifier and executor. From `ui/`, after installing the
+Python `chat` extra and npm dependencies, run:
+
+```bash
+npx playwright install chromium
+npm run test:browser
+```
+
+Set `DSA_TEST_BUILD=1` to exercise the production bundle with the same smoke test, or
+`DSA_TEST_CHROMIUM` to use a compatible Chromium executable already installed locally.
+
 ## Optional plots
 
 Ask for a chart and review `allow_plots: true` in the proposal before approving.
