@@ -145,22 +145,43 @@ class PrivateDataBroker:
         async with self._lock:
             record = await self._required_record(proposal_id)
             self._authorize(record, user_id, conversation_id)
-            now = _aware_time(self._clock())
-            record = await self._expire_if_needed(record, now)
-            if record.status is ProposalStatus.EXPIRED:
-                raise BrokerError("proposal_expired")
-            if proposal_sha256 != record.proposal_sha256:
-                raise BrokerError("proposal_digest_mismatch")
-            if record.status is ProposalStatus.PROPOSED:
-                record = ProposalRecord.model_validate(
-                    {
-                        **record.model_dump(mode="python"),
-                        "status": ProposalStatus.APPROVED,
-                        "approved_at": now,
-                    }
-                )
-                await self._store.replace(record)
+            approved = await self._approve_record(record, proposal_sha256)
+            if approved is not record:
+                await self._store.replace(approved)
+            return approved
+
+    async def approve_and_start(
+        self,
+        *,
+        proposal_id: str,
+        proposal_sha256: str,
+        user_id: str,
+        conversation_id: str,
+    ) -> asyncio.Task[AnalysisResult]:
+        """Approve and claim a run before releasing the proposal lock."""
+        async with self._lock:
+            record = await self._required_record(proposal_id)
+            self._authorize(record, user_id, conversation_id)
+            approved = await self._approve_record(record, proposal_sha256)
+            request = await self._start(approved)
+            return asyncio.create_task(self._execute(request))
+
+    async def _approve_record(self, record: ProposalRecord, digest: str) -> ProposalRecord:
+        now = _aware_time(self._clock())
+        record = await self._expire_if_needed(record, now)
+        if record.status is ProposalStatus.EXPIRED:
+            raise BrokerError("proposal_expired")
+        if digest != record.proposal_sha256:
+            raise BrokerError("proposal_digest_mismatch")
+        if record.status is not ProposalStatus.PROPOSED:
             return record
+        return ProposalRecord.model_validate(
+            {
+                **record.model_dump(mode="python"),
+                "status": ProposalStatus.APPROVED,
+                "approved_at": now,
+            }
+        )
 
     async def execute(
         self,
@@ -177,39 +198,47 @@ class PrivateDataBroker:
                 raise BrokerError("proposal_expired")
             if record.result is not None:
                 return record.result
-            if record.status is ProposalStatus.PROPOSED:
-                raise BrokerError("proposal_not_approved")
-            if record.status is ProposalStatus.RUNNING:
-                raise BrokerError("proposal_execution_in_progress")
-            if record.status is not ProposalStatus.APPROVED:
-                raise BrokerError("proposal_state_invalid")
-            run_id = f"analysis-{self._token_factory()}"
-            request = AnalysisRequest(
-                run_id=run_id,
-                proposal_id=record.proposal_id,
-                proposal_sha256=record.proposal_sha256,
-                data_source_id=record.binding.data_source_id,
-                question=record.payload.question,
-                answer_schema=record.payload.answer_schema,
-                analysis_guidance=record.payload.analysis_guidance,
-                allow_plots=record.payload.allow_plots,
-            )
-            running = ProposalRecord.model_validate(
-                {
-                    **record.model_dump(mode="python"),
-                    "status": ProposalStatus.RUNNING,
-                    "run_id": run_id,
-                }
-            )
-            await self._store.replace(running)
+            request = await self._start(record)
+        return await self._execute(request)
 
+    async def _start(self, record: ProposalRecord) -> AnalysisRequest:
+        if record.status is ProposalStatus.PROPOSED:
+            raise BrokerError("proposal_not_approved")
+        if record.status is ProposalStatus.RUNNING:
+            raise BrokerError("proposal_execution_in_progress")
+        if record.status is not ProposalStatus.APPROVED:
+            raise BrokerError("proposal_state_invalid")
+        run_id = f"analysis-{self._token_factory()}"
+        request = AnalysisRequest(
+            run_id=run_id,
+            proposal_id=record.proposal_id,
+            proposal_sha256=record.proposal_sha256,
+            data_source_id=record.binding.data_source_id,
+            question=record.payload.question,
+            answer_schema=record.payload.answer_schema,
+            analysis_guidance=record.payload.analysis_guidance,
+            allow_plots=record.payload.allow_plots,
+        )
+        running = ProposalRecord.model_validate(
+            {
+                **record.model_dump(mode="python"),
+                "status": ProposalStatus.RUNNING,
+                "run_id": run_id,
+            }
+        )
+        await self._store.replace(running)
+        return request
+
+    async def _execute(self, request: AnalysisRequest) -> AnalysisResult:
         try:
             executor_request = request.model_copy(deep=True)
             raw_result = await self._executor.execute(executor_request)
             result = AnalysisResult.model_validate(
                 raw_result.model_dump(mode="python", round_trip=True)
             ).model_copy(deep=True)
-            identity_mismatch = result.run_id != run_id or result.proposal_id != proposal_id
+            identity_mismatch = (
+                result.run_id != request.run_id or result.proposal_id != request.proposal_id
+            )
             answer_mismatch = result.status == "succeeded" and not _answer_matches(
                 request.answer_schema,
                 result.answer,

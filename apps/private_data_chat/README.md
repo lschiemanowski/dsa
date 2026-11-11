@@ -208,8 +208,15 @@ identify the owning browser session. Keep the same cookie and conversation ID ac
 Proposal messages contain a structured `payload` and server-serialized `request_json`. A successful
 result includes the structured `answer` and `response_json`. The serialized forms preserve the exact
 values for inspection. Review uses the stored proposal ID and digest, and repeated approvals
-return the existing run state. Sessions are held in memory and are lost on server restart.
-`dsa chat` continues to launch the Chainlit UI during this stage of the migration.
+return the existing run state. An approval accepted before expiry claims its run before the
+executor starts.
+
+The HTTP API keeps up to eight conversations per browser and 64 per process. Conversations are
+removed after one hour of inactivity. Clarification and analysis in progress are kept until they
+finish. Up to two analyses can run at a time. If both slots are occupied, approval returns HTTP
+429 with `analysis_capacity_reached` and the proposal can be approved again while it is valid.
+Sessions are held in memory and are lost on server restart. The API accepts localhost and IPv4
+and IPv6 loopback. `dsa chat` continues to launch the Chainlit UI during this stage of the migration.
 
 ## Optional plots
 

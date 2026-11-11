@@ -8,9 +8,7 @@ from typing import Any, cast
 from apps.private_data_chat.chat import ChatResponse, PrivateDataChatSession, render_proposal
 from apps.private_data_chat.contracts import ProposalRecord
 from apps.private_data_chat.presentation import escape_markdown_text
-from apps.private_data_chat.service import load_chat_service
-from apps.private_data_chat.service import model_display_name as _model_display_name
-from apps.private_data_chat.service import welcome_message as _welcome_message
+from apps.private_data_chat.service import load_chat_service, model_display_name, welcome_message
 
 cl: Any = import_module("chainlit")
 
@@ -36,10 +34,9 @@ async def on_chat_start() -> None:
         return
 
     await cl.Message(
-        content=_welcome_message(
-            service.context,
+        content=welcome_message(
             service.database_card,
-            _model_display_name(service.configuration.clarifier_model.name),
+            model_display_name(service.configuration.clarifier_model.name),
         )
     ).send()
 

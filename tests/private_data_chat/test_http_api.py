@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from functools import partial
 from pathlib import Path
+from time import monotonic
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -22,10 +24,13 @@ pytest.importorskip("fastapi")
 
 from fastapi import FastAPI
 
+from apps.private_data_chat import http_api
 from apps.private_data_chat.http_api import ConversationView, create_app
 
 
-def make_app(clarifier: StubClarifier, executor: StubExecutor) -> FastAPI:
+def make_app(
+    clarifier: StubClarifier, executor: StubExecutor, *, clock: Callable[[], float] = monotonic
+) -> FastAPI:
     def create_session(owner: str, conversation: str) -> PrivateDataChatSession:
         return PrivateDataChatSession(
             user_id=owner,
@@ -35,7 +40,7 @@ def make_app(clarifier: StubClarifier, executor: StubExecutor) -> FastAPI:
             executor=executor,
         )
 
-    return create_app(session_factory=create_session)
+    return create_app(session_factory=create_session, clock=clock)
 
 
 def client(app: FastAPI) -> AsyncClient:
@@ -64,7 +69,9 @@ async def test_clarify_revise_approve_and_download() -> None:
         assert pending.json()["status"] == "awaiting_decision"
         assert json.loads(proposal["request_json"]) == proposal["payload"]
         assert "binding" not in proposal
-        assert (await browser.post(f"{path}/messages", json={"text": "Wait."})).status_code == 409
+        blocked_message = await browser.post(f"{path}/messages", json={"text": "Wait."})
+        assert blocked_message.status_code == 409
+        assert blocked_message.json()["detail"] == "proposal_pending"
 
         decision = f"{path}/proposals/{proposal['id']}/decision"
         approval = {"decision": "approve", "digest": proposal["digest"]}
@@ -187,6 +194,90 @@ async def test_completed_run_without_notebook(fail: bool) -> None:
             assert completed.result.answer is not None
         assert completed.result.notebook is None
         assert (await browser.get(f"{path}/notebook")).status_code == 404
+
+
+async def test_ipv6_loopback_uses_the_same_origin_policy() -> None:
+    app = make_app(StubClarifier(), StubExecutor())
+    origin = "http://[::1]:8001"
+    async with AsyncClient(transport=ASGITransport(app=app), base_url=origin) as browser:
+        allowed = await browser.post("/api/conversations", headers={"origin": origin})
+        assert allowed.status_code == 201
+        rejected = await browser.post(
+            "/api/conversations", headers={"origin": "http://localhost:8001"}
+        )
+        assert rejected.status_code == 403
+        for host in ("[::1].example.test", "[::1"):
+            invalid_host = await browser.post("/api/conversations", headers={"host": host})
+            assert invalid_host.status_code == 400
+
+
+async def test_conversation_limits_and_idle_eviction(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(http_api, "_MAX_CONVERSATIONS_PER_BROWSER", 1)
+    monkeypatch.setattr(http_api, "_MAX_CONVERSATIONS", 2)
+    now = 0.0
+    app = make_app(StubClarifier(), StubExecutor(), clock=lambda: now)
+    async with client(app) as first, client(app) as second, client(app) as third:
+        conversation = await first.post("/api/conversations")
+        assert conversation.status_code == 201
+        path = f"/api/conversations/{conversation.json()['id']}"
+        browser_limit = await first.post("/api/conversations")
+        assert browser_limit.status_code == 429
+        assert browser_limit.json()["detail"] == "browser_conversation_limit"
+        assert (await second.post("/api/conversations")).status_code == 201
+        process_limit = await third.post("/api/conversations")
+        assert process_limit.status_code == 429
+        assert process_limit.json()["detail"] == "conversation_capacity_reached"
+
+        now += 3600
+        assert (await first.get(path)).status_code == 404
+        assert (await first.post("/api/conversations")).status_code == 201
+        assert (await third.post("/api/conversations")).status_code == 201
+
+
+async def test_running_limit_allows_retry_and_preserves_active_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(http_api, "_MAX_RUNNING_ANALYSES", 1)
+    gate = asyncio.Event()
+    executor = StubExecutor(gate=gate)
+    now = 0.0
+    app = make_app(StubClarifier(proposed_turn(), proposed_turn()), executor, clock=lambda: now)
+    async with client(app) as browser:
+        first_path, first_decision, first_body = await pending_proposal(browser)
+        try:
+            assert (await browser.post(first_decision, json=first_body)).status_code == 202
+
+            now += 3600
+            assert (await browser.get(first_path)).json()["status"] == "running"
+            second_path, second_decision, second_body = await pending_proposal(browser)
+            limited = await browser.post(second_decision, json=second_body)
+            assert limited.status_code == 429
+            assert limited.json()["detail"] == "analysis_capacity_reached"
+            assert (await browser.get(second_path)).json()["status"] == "awaiting_decision"
+            assert (await browser.post(first_decision, json=first_body)).status_code == 202
+        finally:
+            gate.set()
+
+        assert (await completed_run(browser, first_path)).status == "succeeded"
+        assert (await browser.post(second_decision, json=second_body)).status_code == 202
+        assert (await completed_run(browser, second_path)).status == "succeeded"
+        assert len(executor.requests) == 2
+
+        now += 3600
+        assert (await browser.get(first_path)).status_code == 404
+        assert (await browser.get(second_path)).status_code == 404
+
+
+async def pending_proposal(browser: AsyncClient) -> tuple[str, str, dict[str, str]]:
+    created = await browser.post("/api/conversations")
+    path = f"/api/conversations/{created.json()['id']}"
+    reply = await browser.post(f"{path}/messages", json={"text": "Use 2011."})
+    proposal = reply.json()["messages"][-1]["proposal"]
+    return (
+        path,
+        f"{path}/proposals/{proposal['id']}/decision",
+        {"decision": "approve", "digest": proposal["digest"]},
+    )
 
 
 async def test_configured_factory_builds_session(

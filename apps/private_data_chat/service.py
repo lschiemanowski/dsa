@@ -52,7 +52,6 @@ def load_chat_service() -> ChatService:
 
 
 def welcome_message(
-    context: MockDatabaseContext,
     database_card: DatabaseCard | None,
     clarifier_model_name: str,
 ) -> str:

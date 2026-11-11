@@ -56,8 +56,9 @@ it for approval. Execution reads the stored copy. It never accepts a fresh propo
 confirmation event.
 
 Proposal IDs are opaque, expire, and are scoped to the originating user and conversation. Approval
-is idempotent. Execution is at most once. A production multi-process deployment must enforce these
-transitions with a database transaction or compare-and-swap, not an in-process lock.
+is idempotent. The HTTP workflow checks expiry and claims execution under the same broker lock.
+Execution is at most once. A production multi-process deployment must enforce these transitions
+with a database transaction or compare-and-swap, not an in-process lock.
 
 ## Configuration invariant
 

@@ -116,7 +116,7 @@ class PrivateDataChatSession:
         self._messages: list[ChatMessage] = []
         self._pending: ProposalRecord | None = None
         self._approved: ProposalRecord | None = None
-        self._run: asyncio.Task[AnalysisResult | None] | None = None
+        self._run: asyncio.Task[AnalysisResult] | None = None
 
     async def submit_message(self, message: str) -> ChatMessage:
         """Clarify one message or publish a proposal for a separate decision."""
@@ -124,7 +124,9 @@ class PrivateDataChatSession:
             if self._run is not None:
                 raise BrokerError("conversation_closed")
             await self._refresh_pending()
-            if self._clarifying or self._pending is not None:
+            if self._pending is not None:
+                raise BrokerError("proposal_pending")
+            if self._clarifying:
                 raise BrokerError("conversation_busy")
             history = append_history(self._history, "user", message)
             self._messages.append(ChatMessage("user", message))
@@ -176,7 +178,12 @@ class PrivateDataChatSession:
         return self._reply(turn.message, proposal)
 
     async def decide_proposal(
-        self, proposal_id: str, digest: str, decision: ProposalDecision
+        self,
+        proposal_id: str,
+        digest: str,
+        decision: ProposalDecision,
+        *,
+        run_slots: asyncio.BoundedSemaphore | None = None,
     ) -> bool:
         """Record a decision and return whether it scheduled a new run."""
         if decision not in ("approve", "revise"):
@@ -192,48 +199,70 @@ class PrivateDataChatSession:
                     return False
                 raise BrokerError("conversation_closed")
 
-            if await self._refresh_pending():
-                raise BrokerError("proposal_expired")
             if decision == "revise":
+                if await self._refresh_pending():
+                    raise BrokerError("proposal_expired")
                 self._pending = None
                 self._reply(_NOT_RUN)
                 return False
 
+            if run_slots is not None:
+                if run_slots.locked():
+                    if await self._refresh_pending():
+                        raise BrokerError("proposal_expired")
+                    raise BrokerError("analysis_capacity_reached")
+                await run_slots.acquire()
             try:
-                await self._broker.approve(
+                run = await self._broker.approve_and_start(
                     proposal_id=proposal_id,
                     proposal_sha256=digest,
                     user_id=self._user_id,
                     conversation_id=self._conversation_id,
                 )
-            except BrokerError as error:
-                if error.code == "proposal_expired":
+            except BaseException as error:
+                if run_slots is not None:
+                    run_slots.release()
+                if isinstance(error, BrokerError) and error.code == "proposal_expired":
                     await self._refresh_pending()
                 raise
+
+            if run_slots is not None:
+                slots = run_slots
+                run.add_done_callback(lambda _: slots.release())
             self._approved = proposal
             self._pending = None
-            self._run = asyncio.create_task(self._execute(proposal_id))
+            self._run = run
             return True
+
+    @property
+    def is_busy(self) -> bool:
+        return self._clarifying or (self._run is not None and not self._run.done())
 
     async def snapshot(self) -> ChatSnapshot:
         """Read the current conversation state, including any completed run."""
         async with self._state_lock:
             await self._refresh_pending()
             run = self._run
-            result = run.result() if run and run.done() and not run.cancelled() else None
+            result = None
             failure = None
             status: ChatStatus = "open"
             if run is not None:
                 if not run.done():
                     status = "running"
-                elif result is not None:
-                    status = result.status
-                    failure = result.failure_code
-                else:
+                elif run.cancelled():
                     status = "failed"
-                    failure = "analysis_cancelled" if run.cancelled() else (
-                        "analysis_orchestration_failed"
-                    )
+                    failure = "analysis_cancelled"
+                else:
+                    try:
+                        result = run.result()
+                        status = result.status
+                        failure = result.failure_code
+                    except BrokerError as error:
+                        status = "failed"
+                        failure = error.code
+                    except Exception:
+                        status = "failed"
+                        failure = "analysis_orchestration_failed"
             elif self._pending is not None:
                 status = "awaiting_decision"
             elif self._clarifying:
@@ -249,16 +278,6 @@ class PrivateDataChatSession:
             self._run.cancel()
             with suppress(asyncio.CancelledError):
                 await self._run
-
-    async def _execute(self, proposal_id: str) -> AnalysisResult | None:
-        try:
-            return await self._broker.execute(
-                proposal_id=proposal_id,
-                user_id=self._user_id,
-                conversation_id=self._conversation_id,
-            )
-        except Exception:
-            return None
 
     async def _refresh_pending(self) -> bool:
         if self._pending is None:
@@ -286,7 +305,7 @@ class PrivateDataChatSession:
         except BrokerError as error:
             if error.code == "conversation_closed":
                 return ChatResponse(_closed_message(), terminal=True)
-            if error.code == "conversation_busy":
+            if error.code in {"conversation_busy", "proposal_pending"}:
                 return ChatResponse(_BUSY)
             raise
 
@@ -313,8 +332,11 @@ class PrivateDataChatSession:
                 return ChatResponse(_NOT_RUN)
             raise
         assert self._run is not None
-        result = await self._run
-        if result is None:
+        try:
+            result = await self._run
+        except BrokerError as error:
+            return ChatResponse(_terminal_failure(error.code), terminal=True)
+        except Exception:
             return ChatResponse(_terminal_failure("analysis_orchestration_failed"), terminal=True)
         return self._terminal_response(result)
 

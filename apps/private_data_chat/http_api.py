@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import secrets
+import time
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Literal
 
@@ -15,7 +18,6 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, JsonValue
 from starlette.concurrency import run_in_threadpool
-from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from apps.private_data_chat.broker import BrokerError
 from apps.private_data_chat.chat import ChatStatus, PrivateDataChatSession, ProposalDecision
@@ -26,6 +28,12 @@ SessionFactory = Callable[[str, str], PrivateDataChatSession]
 _COOKIE = "dsa_chat_session"
 _CONVERSATIONS = "/api/conversations"
 _NOTEBOOK_FILENAME = "dsa-derivation.ipynb"
+_LOOPBACK_HOST = re.compile(r"(?:localhost|127\.0\.0\.1|\[::1\])(?::[0-9]{1,5})?", re.IGNORECASE)
+_MAX_CONVERSATIONS_PER_BROWSER = 8
+_MAX_CONVERSATIONS = 64
+_MAX_RUNNING_ANALYSES = 2
+_CONVERSATION_IDLE_SECONDS = 60 * 60
+_SWEEP_SECONDS = 60
 
 
 class MessageInput(AppContract):
@@ -75,50 +83,78 @@ class ConversationView(BaseModel):
     failure_code: str | None = None
 
 
+@dataclass
+class _Conversation:
+    session: PrivateDataChatSession
+    last_seen: float
+    messages: list[MessageView] = field(default_factory=list[MessageView])
+
+
 def create_app(
     *,
     session_factory: SessionFactory | None = None,
     welcome: str = "",
+    clock: Callable[[], float] = time.monotonic,
 ) -> FastAPI:
     """Create the local single-process API, with injectable sessions for tests."""
     if session_factory is None:
         service = load_chat_service()
         session_factory = service.create_session
         welcome = welcome_message(
-            service.context,
             service.database_card,
             model_display_name(service.configuration.clarifier_model.name),
         )
     new_session = session_factory
-    browser_sessions: dict[str, dict[str, PrivateDataChatSession]] = {}
+    browser_sessions: dict[str, dict[str, _Conversation]] = {}
+    run_slots = asyncio.BoundedSemaphore(_MAX_RUNNING_ANALYSES)
+
+    def purge_idle_conversations() -> None:
+        now = clock()
+        for owner, conversations in list(browser_sessions.items()):
+            for conversation_id, entry in list(conversations.items()):
+                if entry.session.is_busy:
+                    entry.last_seen = now
+                elif now - entry.last_seen >= _CONVERSATION_IDLE_SECONDS:
+                    del conversations[conversation_id]
+            if not conversations:
+                del browser_sessions[owner]
+
+    async def reap_idle_conversations() -> None:
+        while True:
+            await asyncio.sleep(_SWEEP_SECONDS)
+            purge_idle_conversations()
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncGenerator[None]:
+        reaper = asyncio.create_task(reap_idle_conversations())
         try:
             yield
         finally:
+            reaper.cancel()
+            await asyncio.gather(reaper, return_exceptions=True)
             await asyncio.gather(
                 *(
-                    session.cancel_run()
+                    entry.session.cancel_run()
                     for conversations in browser_sessions.values()
-                    for session in conversations.values()
+                    for entry in conversations.values()
                 )
             )
             browser_sessions.clear()
 
     app = FastAPI(title="DSA Private Data Chat", lifespan=lifespan)
-    app.add_middleware(TrustedHostMiddleware, allowed_hosts=["127.0.0.1", "localhost"])
 
     async def protect_browser_requests(
         request: Request, call_next: Callable[[Request], Awaitable[Response]]
     ) -> Response:
+        host = request.headers.get("host", "")
         origin = request.headers.get("origin")
-        expected_origin = f"{request.url.scheme}://{request.url.netloc}"
-        if request.method == "POST" and (
-            (origin is not None and origin != expected_origin)
+        if not _LOOPBACK_HOST.fullmatch(host):
+            response: Response = JSONResponse({"detail": "invalid_host"}, status_code=400)
+        elif request.method == "POST" and (
+            (origin is not None and origin != f"{request.url.scheme}://{host.lower()}")
             or request.headers.get("sec-fetch-site") == "cross-site"
         ):
-            response: Response = JSONResponse({"detail": "invalid_origin"}, status_code=403)
+            response = JSONResponse({"detail": "invalid_origin"}, status_code=403)
         else:
             response = await call_next(request)
         response.headers["Cache-Control"] = "no-store"
@@ -128,23 +164,27 @@ def create_app(
     async def invalid_request(_request: Request, _error: Exception) -> JSONResponse:
         return JSONResponse({"detail": "invalid_request"}, status_code=422)
 
-    def owned_session(request: Request, conversation_id: str) -> PrivateDataChatSession:
+    def owned_conversation(request: Request, conversation_id: str) -> _Conversation:
+        purge_idle_conversations()
         owner = request.cookies.get(_COOKIE, "")
-        session = browser_sessions.get(owner, {}).get(conversation_id)
-        if session is None:
+        entry = browser_sessions.get(owner, {}).get(conversation_id)
+        if entry is None:
             raise HTTPException(404, "conversation_not_found")
-        return session
+        entry.last_seen = clock()
+        return entry
 
-    async def view(conversation_id: str, session: PrivateDataChatSession) -> ConversationView:
-        snapshot = await session.snapshot()
-        messages = [
-            MessageView(
-                role=message.role,
-                text=message.text,
-                proposal=_proposal_view(message.proposal) if message.proposal is not None else None,
+    async def view(conversation_id: str, entry: _Conversation) -> ConversationView:
+        snapshot = await entry.session.snapshot()
+        for message in snapshot.messages[len(entry.messages) :]:
+            entry.messages.append(
+                MessageView(
+                    role=message.role,
+                    text=message.text,
+                    proposal=(
+                        _proposal_view(message.proposal) if message.proposal is not None else None
+                    ),
+                )
             )
-            for message in snapshot.messages
-        ]
         pending = snapshot.pending_proposal
         result = snapshot.result
         outcome = None
@@ -170,17 +210,23 @@ def create_app(
             id=conversation_id,
             welcome=welcome,
             status=snapshot.status,
-            messages=messages,
+            messages=entry.messages,
             pending_proposal_id=pending.proposal_id if pending is not None else None,
             result=outcome,
             failure_code=snapshot.failure_code,
         )
 
     async def create_conversation(request: Request, response: Response) -> ConversationView:
+        purge_idle_conversations()
         owner = request.cookies.get(_COOKIE, "")
-        if owner not in browser_sessions:
+        conversations = browser_sessions.get(owner)
+        if conversations is not None and len(conversations) >= _MAX_CONVERSATIONS_PER_BROWSER:
+            raise HTTPException(429, "browser_conversation_limit")
+        if sum(map(len, browser_sessions.values())) >= _MAX_CONVERSATIONS:
+            raise HTTPException(429, "conversation_capacity_reached")
+        if conversations is None:
             owner = secrets.token_urlsafe(32)
-            browser_sessions[owner] = {}
+            conversations = {}
             response.set_cookie(
                 _COOKIE,
                 owner,
@@ -190,22 +236,23 @@ def create_app(
                 secure=request.url.scheme == "https",
             )
         conversation_id = secrets.token_urlsafe(24)
-        session = new_session(owner, conversation_id)
-        browser_sessions[owner][conversation_id] = session
-        return await view(conversation_id, session)
+        entry = _Conversation(new_session(owner, conversation_id), clock())
+        conversations[conversation_id] = entry
+        browser_sessions[owner] = conversations
+        return await view(conversation_id, entry)
 
     async def get_conversation(conversation_id: str, request: Request) -> ConversationView:
-        return await view(conversation_id, owned_session(request, conversation_id))
+        return await view(conversation_id, owned_conversation(request, conversation_id))
 
     async def submit_message(
         conversation_id: str, body: MessageInput, request: Request
     ) -> ConversationView:
-        session = owned_session(request, conversation_id)
+        entry = owned_conversation(request, conversation_id)
         try:
-            await session.submit_message(body.text)
+            await entry.session.submit_message(body.text)
         except BrokerError as error:
             raise HTTPException(409, error.code) from error
-        return await view(conversation_id, session)
+        return await view(conversation_id, entry)
 
     async def decide_proposal(
         conversation_id: str,
@@ -214,24 +261,27 @@ def create_app(
         request: Request,
         response: Response,
     ) -> ConversationView:
-        session = owned_session(request, conversation_id)
+        entry = owned_conversation(request, conversation_id)
         try:
-            started = await session.decide_proposal(proposal_id, body.digest, body.decision)
+            started = await entry.session.decide_proposal(
+                proposal_id, body.digest, body.decision, run_slots=run_slots
+            )
         except BrokerError as error:
-            raise HTTPException(409, error.code) from error
-        state = await view(conversation_id, session)
+            status = 429 if error.code == "analysis_capacity_reached" else 409
+            raise HTTPException(status, error.code) from error
+        state = await view(conversation_id, entry)
         if started or state.status == "running":
             response.status_code = 202
         return state
 
     async def get_notebook(conversation_id: str, request: Request) -> Response:
-        session = owned_session(request, conversation_id)
-        snapshot = await session.snapshot()
+        entry = owned_conversation(request, conversation_id)
+        snapshot = await entry.session.snapshot()
         identity = snapshot.result.notebook if snapshot.result is not None else None
         if identity is None:
             raise HTTPException(404, "notebook_unavailable")
         try:
-            content = await run_in_threadpool(session.read_notebook, identity)
+            content = await run_in_threadpool(entry.session.read_notebook, identity)
         except Exception as error:
             raise HTTPException(404, "notebook_unavailable") from error
         return Response(
