@@ -35,7 +35,7 @@ from pydantic_ai import (
     UnexpectedModelBehavior,
     UsageLimitExceeded,
 )
-from pydantic_ai.capabilities import PrepareOutputTools
+from pydantic_ai.capabilities import AbstractCapability, PrepareOutputTools
 from pydantic_ai.messages import ModelMessagesTypeAdapter
 from pydantic_ai.models import Model
 from pydantic_ai.settings import ModelSettings
@@ -71,7 +71,7 @@ from dsa.record import (
     validate_retained_derivation_notebook,
     write_terminal_record,
 )
-from dsa.reporting import MlflowReporting, run_with_mlflow_reporting
+from dsa.reporting import AnalysisTelemetry, LogfireReporting, run_with_logfire_reporting
 
 _INSTRUCTIONS = """You are executing one completely specified data science task.
 Use the database tools to inspect schema and run bounded read-only SQL.
@@ -123,7 +123,7 @@ class RunCompletion(ContractModel):
         default=None,
         exclude_if=lambda value: value is None,
     )
-    reporting: MlflowReporting = MlflowReporting()
+    reporting: LogfireReporting = LogfireReporting()
 
     @model_validator(mode="after")
     def retained_notebook_matches_terminal(self) -> RunCompletion:
@@ -138,7 +138,7 @@ class RunCompletion(ContractModel):
     def outcome(self) -> RunOutcome:
         return self.record.outcome
 
-    def with_reporting(self, reporting: MlflowReporting) -> RunCompletion:
+    def with_reporting(self, reporting: LogfireReporting) -> RunCompletion:
         """Return an operator projection without changing canonical run state."""
         return self.model_copy(update={"reporting": reporting})
 
@@ -152,13 +152,13 @@ async def run_analysis(
     identity_factory: Callable[[], str] | None = None,
     clock: Callable[[], datetime] | None = None,
     keep_workdir: bool = False,
-    report_to_mlflow: bool = False,
+    report_to_logfire: bool = False,
 ) -> RunCompletion:
     """Validate, execute and retain exactly one analysis run."""
     if type(keep_workdir) is not bool:
         raise TypeError("keep_workdir must be a boolean")
-    if type(report_to_mlflow) is not bool:
-        raise TypeError("report_to_mlflow must be a boolean")
+    if type(report_to_logfire) is not bool:
+        raise TypeError("report_to_logfire must be a boolean")
     request_data = (
         request.model_dump(mode="python", round_trip=True)
         if isinstance(request, RunRequest)
@@ -171,7 +171,7 @@ async def run_analysis(
     _validate_run_id(run_id)
     started_at = _aware_time(now())
 
-    async def operation() -> RunCompletion:
+    async def operation(telemetry: AnalysisTelemetry | None) -> RunCompletion:
         return await _run_canonical_analysis(
             canonical_request,
             run_id=run_id,
@@ -181,12 +181,12 @@ async def run_analysis(
             python_executor=python_executor,
             now=now,
             keep_workdir=keep_workdir,
+            telemetry=telemetry,
         )
 
-    return await run_with_mlflow_reporting(
-        enabled=report_to_mlflow,
+    return await run_with_logfire_reporting(
+        enabled=report_to_logfire,
         run_id=run_id,
-        request=canonical_request,
         operation=operation,
     )
 
@@ -201,6 +201,7 @@ async def _run_canonical_analysis(
     python_executor: PythonExecutor | None,
     now: Callable[[], datetime],
     keep_workdir: bool,
+    telemetry: AnalysisTelemetry | None,
 ) -> RunCompletion:
     """Execute a validated request under its already-owned run identity."""
 
@@ -665,6 +666,11 @@ async def _run_canonical_analysis(
                 for definition in definitions
             ]
 
+        capabilities: list[AbstractCapability[None]] = []
+        if derivation_requested:
+            capabilities.append(PrepareOutputTools(prepare_output_tools))
+        if telemetry is not None:
+            capabilities.append(telemetry)
         agent = Agent(
             selected_model,
             output_type=[
@@ -705,10 +711,9 @@ async def _run_canonical_analysis(
             retries={"output": canonical_request.policy.max_validation_attempts - 1},
             end_strategy="early",
             tools=tools,
-            capabilities=(
-                [PrepareOutputTools(prepare_output_tools)] if derivation_requested else None
-            ),
+            capabilities=capabilities,
         )
+        agent.instrument = False
         agent.output_validator(validate_answer)
         limits = UsageLimits(
             request_limit=canonical_request.policy.max_model_requests,

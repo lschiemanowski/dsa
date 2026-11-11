@@ -41,7 +41,7 @@ def write_configuration(tmp_path: Path) -> Path:
                 'runs_directory = "runs"',
                 f'docker_image = "{IMAGE}"',
                 "enable_analysis_guidance = true",
-                "report_to_mlflow = false",
+                "report_to_logfire = false",
                 "",
                 "[clarifier]",
                 'model = "openai:untrusted"',

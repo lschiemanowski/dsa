@@ -3,7 +3,6 @@
 from dsa.benchmark import (
     BenchmarkCell,
     BenchmarkCellReceipt,
-    BenchmarkDatasetBinding,
     BenchmarkExecution,
     BenchmarkModel,
     BenchmarkPack,
@@ -45,10 +44,10 @@ from dsa.environment import (
     PythonExecutor,
 )
 from dsa.evaluation import (
-    MlflowEvaluationError,
-    MlflowEvaluationPrediction,
-    MlflowEvaluationResult,
-    run_mlflow_evaluation,
+    EvaluationError,
+    EvaluationPrediction,
+    EvaluationResult,
+    run_evaluation,
 )
 from dsa.pack import (
     EvaluationPackCase,
@@ -70,14 +69,13 @@ from dsa.record import (
     TerminalRecord,
     write_terminal_record,
 )
-from dsa.reporting import MlflowReporting
+from dsa.reporting import LogfireReporting
 from dsa.runner import RunCompletion, run_analysis
 
 __all__ = [
     "ArtifactRecord",
     "BenchmarkCell",
     "BenchmarkCellReceipt",
-    "BenchmarkDatasetBinding",
     "BenchmarkExecution",
     "BenchmarkModel",
     "BenchmarkPack",
@@ -94,16 +92,16 @@ __all__ = [
     "DerivationVerification",
     "DockerExecutorConfiguration",
     "DockerPythonExecutor",
+    "EvaluationError",
     "EvaluationPackCase",
     "EvaluationPackError",
     "EvaluationPackManifest",
+    "EvaluationPrediction",
+    "EvaluationResult",
     "Failure",
     "HuggingFacePackReference",
     "LoadedEvaluationPack",
-    "MlflowEvaluationError",
-    "MlflowEvaluationPrediction",
-    "MlflowEvaluationResult",
-    "MlflowReporting",
+    "LogfireReporting",
     "ModelConfiguration",
     "PreparedBenchmark",
     "PythonExecutionError",
@@ -128,7 +126,7 @@ __all__ = [
     "publish_benchmark_report",
     "read_benchmark_cell_receipt",
     "run_analysis",
-    "run_mlflow_evaluation",
+    "run_evaluation",
     "run_prepared_benchmark",
     "write_terminal_record",
 ]

@@ -16,7 +16,7 @@ from dsa import (
     DatabaseRecord,
     DerivationVerification,
     Failure,
-    MlflowReporting,
+    LogfireReporting,
     PythonExecutionRequest,
     PythonExecutionResult,
     PythonExecutor,
@@ -74,7 +74,7 @@ def completion(
     runs_directory: Path,
     *,
     outcome: RunSuccess | RunFailure,
-    reporting: MlflowReporting | None = None,
+    reporting: LogfireReporting | None = None,
     retained_notebook: RetainedDerivationNotebook | None = None,
     database: DatabaseRecord | None = None,
 ) -> RunCompletion:
@@ -97,7 +97,7 @@ def completion(
         record=record,
         retained_record=retained,
         retained_notebook=retained_notebook,
-        reporting=reporting or MlflowReporting(),
+        reporting=reporting or LogfireReporting(),
     )
 
 
@@ -130,17 +130,16 @@ def test_success_runs_one_resolved_request_with_the_hardened_executor(
         *,
         runs_directory: Path,
         python_executor: PythonExecutor,
-        report_to_mlflow: bool,
+        report_to_logfire: bool,
     ) -> RunCompletion:
-        calls.append((request, runs_directory, python_executor, report_to_mlflow))
+        calls.append((request, runs_directory, python_executor, report_to_logfire))
         return completion(
             request,
             runs_directory,
             outcome=RunSuccess(answer={"count": 3}),
-            reporting=MlflowReporting(
-                status="reported",
-                tracking_run_id="tracking-1",
-                trace_id="trace-1",
+            reporting=LogfireReporting(
+                status="recorded",
+                trace_id="0123456789abcdef0123456789abcdef",
             ),
         )
 
@@ -152,7 +151,7 @@ def test_success_runs_one_resolved_request_with_the_hardened_executor(
             str(runs_directory),
             "--docker-image",
             IMAGE,
-            "--report-to-mlflow",
+            "--report-to-logfire",
         ],
         runner=run,
         executor_factory=executor_factory,
@@ -170,9 +169,8 @@ def test_success_runs_one_resolved_request_with_the_hardened_executor(
         "answer": {"count": 3},
         "answer_inline": True,
         "reporting": {
-            "status": "reported",
-            "trace_id": "trace-1",
-            "tracking_run_id": "tracking-1",
+            "status": "recorded",
+            "trace_id": "0123456789abcdef0123456789abcdef",
         },
         "run_id": "run-001",
         "status": "succeeded",
@@ -444,9 +442,9 @@ def test_cancellation_emits_retained_terminal_identity_before_returning_130(
                     message="The caller cancelled the analysis run",
                 )
             ),
-            reporting=MlflowReporting(
+            reporting=LogfireReporting(
                 status="failed",
-                failure_code="mlflow_cancelled",
+                failure_code="logfire_cancelled",
             ),
         )
         error = asyncio.CancelledError()
@@ -464,7 +462,7 @@ def test_cancellation_emits_retained_terminal_identity_before_returning_130(
             str(runs_directory),
             "--docker-image",
             IMAGE,
-            "--report-to-mlflow",
+            "--report-to-logfire",
         ],
         runner=cancel,
         executor_factory=lambda _image: StubExecutor(),
@@ -474,7 +472,7 @@ def test_cancellation_emits_retained_terminal_identity_before_returning_130(
     assert json.loads(capsys.readouterr().out) == {
         "failure": {"code": "cancelled_by_caller", "stage": "cancelled"},
         "reporting": {
-            "failure_code": "mlflow_cancelled",
+            "failure_code": "logfire_cancelled",
             "status": "failed",
         },
         "run_id": "run-001",

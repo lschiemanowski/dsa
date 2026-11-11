@@ -30,15 +30,15 @@ from dsa.benchmark import (
 )
 from dsa.docker import DockerCommandResult, DockerPythonExecutor
 from dsa.evaluation import (
-    MlflowEvaluationError,
-    MlflowEvaluationPrediction,
-    MlflowEvaluationResult,
+    EvaluationError,
+    EvaluationPrediction,
+    EvaluationResult,
 )
 from dsa.pack import LoadedEvaluationPack
-from dsa.reporting import MlflowReporting
+from dsa.reporting import LogfireReporting
 
 from .test_benchmark import IMAGE, runtime_value, study_value
-from .test_mlflow_evaluation import evaluation_pack
+from .test_evaluation import evaluation_pack
 
 
 def prepared_benchmark(
@@ -69,14 +69,7 @@ def prepared_benchmark(
         repetitions=1,
     )
     study = BenchmarkStudy.model_validate(value)
-    runtime = BenchmarkRuntime.model_validate(
-        runtime_value(
-            tmp_path,
-            datasets=(
-                {"pack_id": study.packs[0].pack_id, "dataset_name": "catalog.schema.pack"},
-            ),
-        )
-    )
+    runtime = BenchmarkRuntime.model_validate(runtime_value(tmp_path))
     return PreparedBenchmark(
         study=study,
         runtime=runtime,
@@ -94,22 +87,15 @@ def receipt(invocation: BenchmarkCellInvocation) -> BenchmarkCellReceipt:
         repetition=invocation.cell.repetition,
         agent_revision=invocation.agent_revision,
         docker_image=invocation.docker_image,
-        dataset_name=invocation.dataset_name,
-        dataset_id="dataset-id",
-        dataset_digest="dataset-digest",
-        evaluation_run_id="evaluation-run",
+        pack_manifest_sha256=invocation.pack_reference.manifest_sha256,
         predictions=(
-            MlflowEvaluationPrediction(
+            EvaluationPrediction(
                 case_id="tiny-count",
                 run_id="run-id",
                 terminal_sha256="f" * 64,
                 accepted=True,
                 answer={"count": 3},
-                reporting=MlflowReporting(
-                    status="reported",
-                    tracking_run_id="tracking-run",
-                    trace_id="trace-id",
-                ),
+                reporting=LogfireReporting(),
             ),
         ),
     )
@@ -136,7 +122,7 @@ def test_receipt_is_canonical_atomic_and_no_overwrite(tmp_path: Path) -> None:
     assert read_benchmark_cell_receipt(invocation.receipt_path) == selected
     assert retain_benchmark_cell_receipt(selected, invocation.receipt_path) == retained
 
-    changed = selected.model_copy(update={"dataset_id": "different"})
+    changed = selected.model_copy(update={"pack_manifest_sha256": "0" * 64})
     with pytest.raises(ValueError, match="conflict"):
         retain_benchmark_cell_receipt(changed, invocation.receipt_path)
 
@@ -250,7 +236,7 @@ async def test_resume_retries_a_classified_worker_failure_in_a_new_attempt(
     )
 
 
-async def test_resume_never_retries_an_ambiguous_remote_evaluation(
+async def test_resume_never_retries_an_ambiguous_evaluation(
     tmp_path: Path,
 ) -> None:
     prepared = prepared_benchmark(tmp_path)
@@ -311,42 +297,27 @@ async def test_runner_preserves_cancellation_and_attempt_state(tmp_path: Path) -
     assert not (prepared.runtime.workspace_root / prepared.cells[0].cell_id / "cell.json").exists()
 
 
-def test_worker_composes_existing_evaluation_and_records_effective_context(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+def test_worker_composes_local_evaluation_and_keeps_receipt_if_telemetry_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    from dsa import benchmark
+
     prepared = prepared_benchmark(tmp_path, case_workers=3)
     invocation = BenchmarkCellInvocation.from_prepared(prepared, prepared.cells[0], 1)
+    invocation = invocation.model_copy(update={"report_to_logfire": True})
     invocation.attempt_directory.mkdir(parents=True)
     captured: dict[str, object] = {}
-    original_workers = "17"
-    monkeypatch.setenv("MLFLOW_GENAI_EVAL_MAX_WORKERS", original_workers)
 
-    def evaluate(pack: object, **kwargs: object) -> MlflowEvaluationResult:
+    async def evaluate(pack: object, **kwargs: object) -> EvaluationResult:
         captured["pack"] = pack
         captured.update(kwargs)
-        assert __import__("os").environ["MLFLOW_GENAI_EVAL_MAX_WORKERS"] == "3"
-        assert __import__("os").environ["MLFLOW_GENAI_EVAL_ASYNC_TIMEOUT"] == "930"
-        return MlflowEvaluationResult(
-            dataset_id="dataset-id",
-            dataset_digest="dataset-digest",
-            evaluation_run_id="evaluation-run",
-            predictions=(
-                MlflowEvaluationPrediction(
-                    case_id="tiny-count",
-                    run_id="run-id",
-                    terminal_sha256="f" * 64,
-                    accepted=True,
-                    answer={"count": 3},
-                    reporting=MlflowReporting(
-                        status="reported",
-                        tracking_run_id="tracking-run",
-                        trace_id="trace-id",
-                    ),
-                ),
-            ),
-        )
+        return EvaluationResult(predictions=receipt(invocation).predictions)
 
+    def fail_telemetry(*_args: object, **_kwargs: object) -> LogfireReporting:
+        assert invocation.receipt_path.is_file()
+        return LogfireReporting(status="failed", failure_code="logfire_experiment_failed")
+
+    monkeypatch.setattr(benchmark, "record_experiment", fail_telemetry)
     result = execute_benchmark_cell(
         invocation,
         pack_loader=lambda _reference: prepared.packs[0][1],
@@ -354,25 +325,17 @@ def test_worker_composes_existing_evaluation_and_records_effective_context(
     )
 
     assert isinstance(result, BenchmarkWorkerCompleted)
-    assert __import__("os").environ["MLFLOW_GENAI_EVAL_MAX_WORKERS"] == original_workers
-    assert "MLFLOW_GENAI_EVAL_ASYNC_TIMEOUT" not in __import__("os").environ
-    assert captured["dataset_name"] == invocation.dataset_name
+    assert result.experiment_reporting == LogfireReporting(
+        status="failed", failure_code="logfire_experiment_failed"
+    )
+    assert captured["case_workers"] == 3
+    assert captured["report_to_logfire"] is True
     assert captured["model_configuration"] == invocation.model_configuration
     assert captured["policy"] == invocation.policy
     executor = cast(DockerPythonExecutor, captured["python_executor"])
-    assert executor.container_labels == (
-        ("dsa.benchmark.cleanup", invocation.cleanup_token),
-    )
-    assert captured["run_tags"] == {
-        "dsa.benchmark.agent_revision": invocation.agent_revision,
-        "dsa.benchmark.cell_id": invocation.cell.cell_id,
-        "dsa.benchmark.model_id": invocation.cell.model_id,
-        "dsa.benchmark.pack_id": invocation.cell.pack_id,
-        "dsa.benchmark.repetition": "0",
-        "dsa.benchmark.study_sha256": invocation.cell.study_sha256,
-    }
+    assert executor.container_labels == (("dsa.benchmark.cleanup", invocation.cleanup_token),)
     retained = read_benchmark_cell_receipt(invocation.receipt_path)
-    assert retained.evaluation_run_id == "evaluation-run"
+    assert retained.pack_manifest_sha256 == invocation.pack_reference.manifest_sha256
     assert retained.predictions[0].terminal_sha256 == "f" * 64
 
 
@@ -387,15 +350,15 @@ async def test_real_subprocess_uses_the_framed_failure_protocol(tmp_path: Path) 
     assert result.failure_code == "cell_setup_failed"
 
 
-def test_worker_classifies_uncertain_mlflow_outcomes_as_ambiguous(
+def test_worker_classifies_uncertain_evaluation_outcomes_as_ambiguous(
     tmp_path: Path,
 ) -> None:
     prepared = prepared_benchmark(tmp_path)
     invocation = BenchmarkCellInvocation.from_prepared(prepared, prepared.cells[0], 1)
     invocation.attempt_directory.mkdir(parents=True)
 
-    def uncertain(*_args: object, **_kwargs: object) -> MlflowEvaluationResult:
-        raise RuntimeError("remote response was lost")
+    async def uncertain(*_args: object, **_kwargs: object) -> EvaluationResult:
+        raise RuntimeError("worker could not retain the analysis")
 
     result = execute_benchmark_cell(
         invocation,
@@ -408,13 +371,13 @@ def test_worker_classifies_uncertain_mlflow_outcomes_as_ambiguous(
     assert not invocation.receipt_path.exists()
 
 
-def test_worker_retains_a_stable_mlflow_failure_phase(tmp_path: Path) -> None:
+def test_worker_retains_a_stable_evaluation_failure_phase(tmp_path: Path) -> None:
     prepared = prepared_benchmark(tmp_path)
     invocation = BenchmarkCellInvocation.from_prepared(prepared, prepared.cells[0], 1)
     invocation.attempt_directory.mkdir(parents=True)
 
-    def failed(*_args: object, **_kwargs: object) -> MlflowEvaluationResult:
-        raise MlflowEvaluationError("mlflow_dataset_failed")
+    async def failed(*_args: object, **_kwargs: object) -> EvaluationResult:
+        raise EvaluationError("evaluation_database_mismatch")
 
     result = execute_benchmark_cell(
         invocation,
@@ -423,7 +386,7 @@ def test_worker_retains_a_stable_mlflow_failure_phase(tmp_path: Path) -> None:
     )
 
     assert isinstance(result, BenchmarkWorkerAmbiguous)
-    assert result.failure_code == "cell_mlflow_dataset_failed"
+    assert result.failure_code == "cell_evaluation_database_mismatch"
     assert not invocation.receipt_path.exists()
 
 

@@ -45,7 +45,7 @@ class DsaRuntimeConfiguration(AppContract):
     trusted_model_name: str = Field(min_length=1, max_length=512)
     trusted_model_settings: dict[str, JsonValue] = Field(default_factory=dict)
     docker_image: str = Field(max_length=512)
-    report_to_mlflow: bool = False
+    report_to_logfire: bool = False
     policy: RunPolicy = RunPolicy()
 
     @field_validator("docker_image")
@@ -119,7 +119,7 @@ class DsaAnalysisExecutor:
                 runs_directory=self.configuration.runs_directory,
                 python_executor=executor,
                 identity_factory=lambda: request.run_id,
-                report_to_mlflow=self.configuration.report_to_mlflow,
+                report_to_logfire=self.configuration.report_to_logfire,
             )
             terminal = _artifact(completion.retained_record, "terminal", "application/json")
             outcome = completion.outcome

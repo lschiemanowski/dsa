@@ -33,7 +33,7 @@ _SAFE_CONFIGURATION_FIELDS = frozenset(
         "model",
         "path",
         "repo_id",
-        "report_to_mlflow",
+        "report_to_logfire",
         "revision",
         "runs_directory",
         "settings",

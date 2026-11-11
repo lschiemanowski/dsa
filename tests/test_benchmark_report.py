@@ -6,11 +6,9 @@ import json
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
-from dsa import benchmark_report as benchmark_report_module
 from dsa.benchmark import (
     BenchmarkCellInvocation,
     BenchmarkCellReceipt,
@@ -19,10 +17,8 @@ from dsa.benchmark import (
 )
 from dsa.benchmark_report import (
     BenchmarkCaseOutcome,
-    BenchmarkMlflowRun,
     BenchmarkReport,
     BenchmarkReportConfigurationError,
-    MlflowBenchmarkEvidenceReader,
     benchmark_report_markdown,
     build_benchmark_report,
     create_benchmark_report,
@@ -30,7 +26,7 @@ from dsa.benchmark_report import (
 )
 from dsa.contract import DerivationRequest, RunRequest
 from dsa.cost import unavailable_provider_cost
-from dsa.evaluation import MlflowEvaluationPrediction
+from dsa.evaluation import EvaluationPrediction
 from dsa.pack import EvaluationCaseMetadata, EvaluationPackCase, LoadedEvaluationPack
 from dsa.record import (
     DatabaseRecord,
@@ -41,54 +37,20 @@ from dsa.record import (
     TerminalRecord,
     write_terminal_record,
 )
-from dsa.reporting import MlflowReporting
+from dsa.reporting import LogfireReporting
 
 from .test_benchmark_execution import prepared_benchmark, receipt
 from .test_derivation import sample_derivation
 from .test_episode import valid_request
-from .test_mlflow_evaluation import evaluation_pack
+from .test_evaluation import evaluation_pack
 
 REPORTER_REVISION = "e" * 40
 
 
-class EvidenceReader:
-    def __init__(self, runs: dict[str, BenchmarkMlflowRun]) -> None:
-        self.runs = runs
-        self.requested: list[str] = []
-
-    def get_run(self, run_id: str) -> BenchmarkMlflowRun:
-        self.requested.append(run_id)
-        try:
-            return self.runs[run_id]
-        except KeyError:
-            raise ValueError("missing run") from None
 
 
-def evaluation_tags(invocation: BenchmarkCellInvocation) -> dict[str, str]:
-    return {
-        "dsa.benchmark.agent_revision": invocation.agent_revision,
-        "dsa.benchmark.cell_id": invocation.cell.cell_id,
-        "dsa.benchmark.model_id": invocation.cell.model_id,
-        "dsa.benchmark.pack_id": invocation.cell.pack_id,
-        "dsa.benchmark.repetition": str(invocation.cell.repetition),
-        "dsa.benchmark.study_sha256": invocation.cell.study_sha256,
-    }
 
 
-def successful_evaluation_metrics(
-    *,
-    exact: bool,
-    policy: bool | None = None,
-) -> dict[str, float]:
-    selected_policy = exact if policy is None else policy
-    return {
-        "agent_failure/mean": 0.0 if selected_policy else 1.0,
-        "conditional_exact_json/mean": 1.0 if exact else 0.0,
-        "conditional_policy_match/mean": 1.0 if selected_policy else 0.0,
-        "end_to_end_exact_success/mean": 1.0 if exact else 0.0,
-        "end_to_end_policy_success/mean": 1.0 if selected_policy else 0.0,
-        "infrastructure_failure/mean": 0.0,
-    }
 
 
 def retain_receipt_with_terminals(
@@ -97,9 +59,11 @@ def retain_receipt_with_terminals(
     selected_receipt: BenchmarkCellReceipt,
     *,
     terminal_run_id: str | None = None,
+    terminal_question: str | None = None,
     terminal_sha256: str | None = None,
     provider_costs: tuple[float | None, ...] = (0.001, 0.002),
     provider_response_ids: tuple[str, ...] | None = None,
+    total_tokens: int = 125,
 ) -> BenchmarkCellReceipt:
     selected = BenchmarkCellReceipt.model_validate_json(selected_receipt.model_dump_json())
     cases = {
@@ -108,7 +72,7 @@ def retain_receipt_with_terminals(
         if pack_id == selected.pack_id
         for case in pack.cases
     }
-    predictions: list[MlflowEvaluationPrediction] = []
+    predictions: list[EvaluationPrediction] = []
     started_at = datetime(2026, 1, 1, tzinfo=UTC)
     for prediction in selected.predictions:
         case = cases[prediction.case_id]
@@ -179,14 +143,20 @@ def retain_receipt_with_terminals(
             schema_version="2" if case.derivation is not None else "1",
             run_id=terminal_run_id or prediction.run_id,
             started_at=started_at,
-            finished_at=started_at + timedelta(seconds=1),
+            finished_at=started_at + timedelta(seconds=2.5),
+            usage={
+                "input_tokens": 100,
+                "output_tokens": 25,
+                "requests": 2,
+                "total_tokens": total_tokens,
+            },
             request=RunRequest(
                 database_path=next(
                     pack.database_path
                     for pack_id, pack in prepared.packs
                     if pack_id == selected.pack_id
                 ),
-                question=case.question,
+                question=terminal_question or case.question,
                 answer_schema=case.answer_schema,
                 derivation=case.derivation,
                 model=invocation.model_configuration,
@@ -212,8 +182,6 @@ def retain_receipt_with_terminals(
                     source_sha256=source_sha256,
                     final_sha256=source_sha256,
                 )
-                if case.derivation is not None
-                else None
             ),
             outcome=outcome,
         )
@@ -241,52 +209,24 @@ def complete_report_evidence(
     accepted_answer: object = None,
     provider_costs: tuple[float | None, ...] = (0.001, 0.002),
     pack: LoadedEvaluationPack | None = None,
-) -> tuple[PreparedBenchmark, EvidenceReader]:
+    reporting: LogfireReporting | None = None,
+) -> PreparedBenchmark:
     prepared = prepared_benchmark(tmp_path, pack=pack)
     invocation = BenchmarkCellInvocation.from_prepared(prepared, prepared.cells[0], 1)
     selected_receipt = receipt(invocation)
+    prediction = selected_receipt.predictions[0].model_copy(
+        update={"reporting": reporting or LogfireReporting()}
+    )
     if accepted_answer is not None:
-        prediction = selected_receipt.predictions[0].model_copy(
-            update={"answer": accepted_answer}
-        )
-        selected_receipt = selected_receipt.model_copy(
-            update={"predictions": (prediction,)}
-        )
+        prediction = prediction.model_copy(update={"answer": accepted_answer})
+    selected_receipt = selected_receipt.model_copy(update={"predictions": (prediction,)})
     selected_receipt = retain_receipt_with_terminals(
         prepared,
         invocation,
         selected_receipt,
         provider_costs=provider_costs,
     )
-    exact = accepted_answer in (None, {"count": 3})
-    runs = {
-        selected_receipt.evaluation_run_id: BenchmarkMlflowRun(
-            run_id=selected_receipt.evaluation_run_id,
-            status="FINISHED",
-            lifecycle_stage="active",
-            metrics=successful_evaluation_metrics(exact=exact),
-            tags=evaluation_tags(invocation),
-        ),
-        "tracking-run": BenchmarkMlflowRun(
-            run_id="tracking-run",
-            status="FINISHED",
-            lifecycle_stage="active",
-            metrics={
-                "dsa.elapsed_seconds": 2.5,
-                "dsa.usage.input_tokens": 100,
-                "dsa.usage.output_tokens": 25,
-                "dsa.usage.requests": 2,
-                "dsa.usage.total_tokens": 125,
-            },
-            params={"dsa.model_name": prepared.study.models[0].configuration.name},
-            tags={
-                "dsa.component": "analysis",
-                "dsa.outcome": "succeeded",
-                "dsa.run_id": "run-id",
-            },
-        ),
-    }
-    return prepared, EvidenceReader(runs)
+    return prepared
 
 
 def build_report(
@@ -294,23 +234,31 @@ def build_report(
     *,
     accepted_answer: object = None,
     provider_costs: tuple[float | None, ...] = (0.001, 0.002),
+    reporting: LogfireReporting | None = None,
 ) -> BenchmarkReport:
-    prepared, reader = complete_report_evidence(
+    prepared = complete_report_evidence(
         tmp_path,
         accepted_answer=accepted_answer,
         provider_costs=provider_costs,
+        reporting=reporting,
     )
     return build_benchmark_report(
         prepared.study,
         prepared.runtime,
         reporter_revision=REPORTER_REVISION,
         pack_loader=lambda _reference: prepared.packs[0][1],
-        evidence_reader=reader,
+
     )
 
 
-def test_report_recomputes_exact_counts_and_observed_usage(tmp_path: Path) -> None:
-    report = build_report(tmp_path)
+@pytest.mark.parametrize(
+    "reporting",
+    [LogfireReporting(), LogfireReporting(status="failed", failure_code="logfire_token_missing")],
+)
+def test_report_recomputes_exact_counts_and_observed_usage(
+    tmp_path: Path, reporting: LogfireReporting
+) -> None:
+    report = build_report(tmp_path, reporting=reporting)
 
     assert report.study_sha256 == report.study.sha256
     assert report.reporter_revision == REPORTER_REVISION
@@ -356,14 +304,14 @@ def test_report_hashes_exact_local_derivation_notebook(tmp_path: Path) -> None:
         metadata=EvaluationCaseMetadata(family="counting", source_level="small"),
     )
     pack = evaluation_pack(tmp_path, case)
-    prepared, reader = complete_report_evidence(tmp_path, pack=pack)
+    prepared = complete_report_evidence(tmp_path, pack=pack)
 
     report = build_benchmark_report(
         prepared.study,
         prepared.runtime,
         reporter_revision=REPORTER_REVISION,
         pack_loader=lambda _reference: pack,
-        evidence_reader=reader,
+
     )
 
     assert report.overall.metrics.end_to_end_exact_success.numerator == 1
@@ -376,7 +324,7 @@ def test_report_hashes_exact_local_derivation_notebook(tmp_path: Path) -> None:
             prepared.runtime,
             reporter_revision=REPORTER_REVISION,
             pack_loader=lambda _reference: pack,
-            evidence_reader=reader,
+
         )
 
 
@@ -418,88 +366,8 @@ def test_report_preserves_a_positive_tiny_cost_in_markdown(tmp_path: Path) -> No
     assert "$0/case" not in markdown
 
 
-def test_report_cross_checks_mlflow_provider_cost_when_present(tmp_path: Path) -> None:
-    prepared, reader = complete_report_evidence(tmp_path)
-    tracking = reader.runs["tracking-run"]
-    reader.runs["tracking-run"] = tracking.model_copy(
-        update={
-            "metrics": {
-                **tracking.metrics,
-                "dsa.provider_cost_usd": 0.003,
-                "dsa.provider_cost_generations": 2.0,
-            }
-        }
-    )
-
-    report = build_benchmark_report(
-        prepared.study,
-        prepared.runtime,
-        reporter_revision=REPORTER_REVISION,
-        pack_loader=lambda _reference: prepared.packs[0][1],
-        evidence_reader=reader,
-    )
-    assert report.overall.provider_cost.observed_amount == "0.003"
-
-    reader.runs["tracking-run"] = reader.runs["tracking-run"].model_copy(
-        update={
-            "metrics": {
-                **reader.runs["tracking-run"].metrics,
-                "dsa.provider_cost_usd": 0.004,
-            }
-        }
-    )
-    with pytest.raises(ValueError, match="cost contradicts terminal evidence"):
-        build_benchmark_report(
-            prepared.study,
-            prepared.runtime,
-            reporter_revision=REPORTER_REVISION,
-            pack_loader=lambda _reference: prepared.packs[0][1],
-            evidence_reader=reader,
-        )
 
 
-def test_report_rejects_zero_projection_for_a_positive_tiny_cost(
-    tmp_path: Path,
-) -> None:
-    prepared, reader = complete_report_evidence(
-        tmp_path,
-        provider_costs=(1e-13,),
-    )
-    tracking = reader.runs["tracking-run"]
-    reader.runs["tracking-run"] = tracking.model_copy(
-        update={
-            "metrics": {
-                **tracking.metrics,
-                "dsa.provider_cost_usd": 1e-13,
-                "dsa.provider_cost_generations": 1.0,
-            }
-        }
-    )
-    report = build_benchmark_report(
-        prepared.study,
-        prepared.runtime,
-        reporter_revision=REPORTER_REVISION,
-        pack_loader=lambda _reference: prepared.packs[0][1],
-        evidence_reader=reader,
-    )
-    assert report.overall.provider_cost.observed_amount == "0.0000000000001"
-
-    reader.runs["tracking-run"] = reader.runs["tracking-run"].model_copy(
-        update={
-            "metrics": {
-                **reader.runs["tracking-run"].metrics,
-                "dsa.provider_cost_usd": 0.0,
-            }
-        }
-    )
-    with pytest.raises(ValueError, match="cost contradicts terminal evidence"):
-        build_benchmark_report(
-            prepared.study,
-            prepared.runtime,
-            reporter_revision=REPORTER_REVISION,
-            pack_loader=lambda _reference: prepared.packs[0][1],
-            evidence_reader=reader,
-        )
 
 
 def test_report_rejects_response_id_reuse_when_one_cost_is_unavailable(
@@ -527,7 +395,7 @@ def test_report_rejects_response_id_reuse_when_one_cost_is_unavailable(
             prepared.runtime,
             reporter_revision=REPORTER_REVISION,
             pack_loader=lambda _reference: prepared.packs[0][1],
-            evidence_reader=EvidenceReader({}),
+
         )
 
 
@@ -571,35 +439,13 @@ def test_report_keeps_tolerance_policy_matches_distinct_from_exactness(
         }
     )
     selected = retain_receipt_with_terminals(prepared, invocation, selected)
-    reader = EvidenceReader(
-        {
-            selected.evaluation_run_id: BenchmarkMlflowRun(
-                run_id=selected.evaluation_run_id,
-                status="FINISHED",
-                lifecycle_stage="active",
-                metrics=successful_evaluation_metrics(exact=False, policy=True),
-                tags=evaluation_tags(invocation),
-            ),
-            "tracking-run": BenchmarkMlflowRun(
-                run_id="tracking-run",
-                status="FINISHED",
-                lifecycle_stage="active",
-                params={"dsa.model_name": invocation.model_configuration.name},
-                tags={
-                    "dsa.component": "analysis",
-                    "dsa.outcome": "succeeded",
-                    "dsa.run_id": "run-id",
-                },
-            ),
-        }
-    )
 
     report = build_benchmark_report(
         prepared.study,
         prepared.runtime,
         reporter_revision=REPORTER_REVISION,
         pack_loader=lambda _reference: pack,
-        evidence_reader=reader,
+
     )
 
     assert report.overall.metrics.end_to_end_exact_success.numerator == 0
@@ -614,7 +460,6 @@ def test_report_rejects_incomplete_or_foreign_evidence_before_publication(
     tmp_path: Path,
 ) -> None:
     prepared = prepared_benchmark(tmp_path)
-    reader = EvidenceReader({})
 
     with pytest.raises(ValueError, match="complete cell receipts"):
         build_benchmark_report(
@@ -622,52 +467,13 @@ def test_report_rejects_incomplete_or_foreign_evidence_before_publication(
             prepared.runtime,
             reporter_revision=REPORTER_REVISION,
             pack_loader=lambda _reference: prepared.packs[0][1],
-            evidence_reader=reader,
-        )
 
-    assert reader.requested == []
-
-
-def test_report_rejects_mlflow_metric_or_identity_mismatch(tmp_path: Path) -> None:
-    prepared, reader = complete_report_evidence(tmp_path)
-    reader.runs["evaluation-run"] = reader.runs["evaluation-run"].model_copy(
-        update={"metrics": {"end_to_end_exact_success/mean": 0.0}}
-    )
-
-    with pytest.raises(ValueError, match="MLflow evaluation metrics"):
-        build_benchmark_report(
-            prepared.study,
-            prepared.runtime,
-            reporter_revision=REPORTER_REVISION,
-            pack_loader=lambda _reference: prepared.packs[0][1],
-            evidence_reader=reader,
         )
 
 
-@pytest.mark.parametrize(
-    ("run_id", "update"),
-    (
-        ("evaluation-run", {"status": "RUNNING"}),
-        ("evaluation-run", {"lifecycle_stage": "deleted"}),
-        ("tracking-run", {"status": "FAILED"}),
-    ),
-)
-def test_report_requires_completed_active_mlflow_runs(
-    tmp_path: Path,
-    run_id: str,
-    update: dict[str, str],
-) -> None:
-    prepared, reader = complete_report_evidence(tmp_path)
-    reader.runs[run_id] = reader.runs[run_id].model_copy(update=update)
 
-    with pytest.raises(ValueError, match="completed active evidence"):
-        build_benchmark_report(
-            prepared.study,
-            prepared.runtime,
-            reporter_revision=REPORTER_REVISION,
-            pack_loader=lambda _reference: prepared.packs[0][1],
-            evidence_reader=reader,
-        )
+
+
 
 
 def test_report_rejects_an_unverified_terminal_digest(tmp_path: Path) -> None:
@@ -679,7 +485,6 @@ def test_report_rejects_an_unverified_terminal_digest(tmp_path: Path) -> None:
         receipt(invocation),
         terminal_sha256="0" * 64,
     )
-    reader = EvidenceReader({})
 
     with pytest.raises(ValueError, match="terminal digest"):
         build_benchmark_report(
@@ -687,11 +492,11 @@ def test_report_rejects_an_unverified_terminal_digest(tmp_path: Path) -> None:
             prepared.runtime,
             reporter_revision=REPORTER_REVISION,
             pack_loader=lambda _reference: prepared.packs[0][1],
-            evidence_reader=reader,
+
         )
 
     assert selected.predictions[0].terminal_sha256 == "0" * 64
-    assert reader.requested == []
+
 
 
 def test_report_rejects_a_foreign_terminal_run_identity(tmp_path: Path) -> None:
@@ -703,7 +508,6 @@ def test_report_rejects_a_foreign_terminal_run_identity(tmp_path: Path) -> None:
         receipt(invocation),
         terminal_run_id="foreign-run",
     )
-    reader = EvidenceReader({})
 
     with pytest.raises(ValueError, match="terminal run identity"):
         build_benchmark_report(
@@ -711,14 +515,13 @@ def test_report_rejects_a_foreign_terminal_run_identity(tmp_path: Path) -> None:
             prepared.runtime,
             reporter_revision=REPORTER_REVISION,
             pack_loader=lambda _reference: prepared.packs[0][1],
-            evidence_reader=reader,
+
         )
 
-    assert reader.requested == []
 
 
 def test_report_revalidates_mutated_typed_inputs(tmp_path: Path) -> None:
-    prepared, reader = complete_report_evidence(tmp_path)
+    prepared = complete_report_evidence(tmp_path)
     prepared.study.models[0].configuration.settings["api_key"] = "SECRET"
 
     with pytest.raises(ValueError, match="credentials or endpoints"):
@@ -727,7 +530,7 @@ def test_report_revalidates_mutated_typed_inputs(tmp_path: Path) -> None:
             prepared.runtime,
             reporter_revision=REPORTER_REVISION,
             pack_loader=lambda _reference: prepared.packs[0][1],
-            evidence_reader=reader,
+
         )
 
 
@@ -759,8 +562,8 @@ def test_publication_is_deterministic_idempotent_and_no_overwrite(
     assert f"Report JSON SHA-256: `{report.sha256}`" in markdown
     assert "1/1 (1.000000)" in markdown
     assert "Provider inference cost (OpenRouter usage, USD): $0.003" in markdown
-    assert first.json_path.name.endswith(".report-v3.json")
-    assert first.markdown_path.name.endswith(".report-v3.md")
+    assert first.json_path.name.endswith(".report-v4.json")
+    assert first.markdown_path.name.endswith(".report-v4.md")
     assert str(tmp_path) not in markdown
 
     first.markdown_path.write_text("different\n")
@@ -810,10 +613,9 @@ def test_report_case_rejects_exact_success_without_a_policy_match() -> None:
             run_id="run-1",
             terminal_sha256="a" * 64,
             accepted=True,
-            reporting=MlflowReporting(
-                status="reported",
-                tracking_run_id="tracking-1",
-                trace_id="trace-1",
+            reporting=LogfireReporting(
+                status="recorded",
+                trace_id="a" * 32,
             ),
             end_to_end_exact_success=True,
             end_to_end_policy_success=False,
@@ -827,50 +629,18 @@ def test_report_case_rejects_exact_success_without_a_policy_match() -> None:
 
 def test_report_aggregates_multiple_cells_from_case_counts(tmp_path: Path) -> None:
     prepared = prepared_benchmark(tmp_path, cells=2)
-    runs: dict[str, BenchmarkMlflowRun] = {}
     for index, cell in enumerate(prepared.cells):
         invocation = BenchmarkCellInvocation.from_prepared(prepared, cell, 1)
         base = receipt(invocation)
-        exact = index == 0
-        tracking_id = f"tracking-{index}"
-        run_id = f"run-{index}"
         prediction = base.predictions[0].model_copy(
             update={
-                "answer": {"count": 3 if exact else 4},
-                "reporting": base.predictions[0].reporting.model_copy(
-                    update={
-                        "trace_id": f"trace-{index}",
-                        "tracking_run_id": tracking_id,
-                    }
-                ),
-                "run_id": run_id,
+                "answer": {"count": 3 if index == 0 else 4},
+                "run_id": f"run-{index}",
             }
         )
-        selected = base.model_copy(
-            update={
-                "evaluation_run_id": f"evaluation-{index}",
-                "predictions": (prediction,),
-            }
-        )
-        selected = retain_receipt_with_terminals(prepared, invocation, selected)
-        runs[selected.evaluation_run_id] = BenchmarkMlflowRun(
-            run_id=selected.evaluation_run_id,
-            status="FINISHED",
-            lifecycle_stage="active",
-            metrics=successful_evaluation_metrics(exact=exact),
-            tags=evaluation_tags(invocation),
-        )
-        runs[tracking_id] = BenchmarkMlflowRun(
-            run_id=tracking_id,
-            status="FINISHED",
-            lifecycle_stage="active",
-            metrics={"dsa.usage.total_tokens": float(100 + index)},
-            params={"dsa.model_name": invocation.model_configuration.name},
-            tags={
-                "dsa.component": "analysis",
-                "dsa.outcome": "succeeded",
-                "dsa.run_id": run_id,
-            },
+        selected = base.model_copy(update={"predictions": (prediction,)})
+        retain_receipt_with_terminals(
+            prepared, invocation, selected, total_tokens=100 + index
         )
 
     report = build_benchmark_report(
@@ -878,7 +648,7 @@ def test_report_aggregates_multiple_cells_from_case_counts(tmp_path: Path) -> No
         prepared.runtime,
         reporter_revision=REPORTER_REVISION,
         pack_loader=lambda _reference: prepared.packs[0][1],
-        evidence_reader=EvidenceReader(runs),
+
     )
 
     assert report.overall.case_count == 2
@@ -898,7 +668,7 @@ def test_report_aggregates_multiple_cells_from_case_counts(tmp_path: Path) -> No
 
 
 def test_report_rejects_a_symlinked_cell_directory(tmp_path: Path) -> None:
-    prepared, reader = complete_report_evidence(tmp_path)
+    prepared = complete_report_evidence(tmp_path)
     cell_directory = prepared.runtime.workspace_root / prepared.cells[0].cell_id
     outside = tmp_path / "outside-cell"
     cell_directory.rename(outside)
@@ -910,10 +680,9 @@ def test_report_rejects_a_symlinked_cell_directory(tmp_path: Path) -> None:
             prepared.runtime,
             reporter_revision=REPORTER_REVISION,
             pack_loader=lambda _reference: prepared.packs[0][1],
-            evidence_reader=reader,
+
         )
 
-    assert reader.requested == []
 
 
 def test_report_reverifies_pack_database_bytes(tmp_path: Path) -> None:
@@ -926,14 +695,14 @@ def test_report_reverifies_pack_database_bytes(tmp_path: Path) -> None:
             prepared.runtime,
             reporter_revision=REPORTER_REVISION,
             pack_loader=lambda _reference: prepared.packs[0][1],
-            evidence_reader=EvidenceReader({}),
+
         )
 
 
 def test_production_report_output_cannot_modify_the_benchmark_workspace(
     tmp_path: Path,
 ) -> None:
-    prepared, _reader = complete_report_evidence(tmp_path)
+    prepared = complete_report_evidence(tmp_path)
 
     with pytest.raises(BenchmarkReportConfigurationError, match="outside"):
         create_benchmark_report(
@@ -944,22 +713,22 @@ def test_production_report_output_cannot_modify_the_benchmark_workspace(
         )
 
 
-def test_failed_reporting_has_no_conditional_mlflow_exception(
+def test_failed_analysis_still_counts_when_telemetry_fails(
     tmp_path: Path,
 ) -> None:
     prepared = prepared_benchmark(tmp_path)
     invocation = BenchmarkCellInvocation.from_prepared(prepared, prepared.cells[0], 1)
     base = receipt(invocation)
-    prediction = MlflowEvaluationPrediction(
+    prediction = EvaluationPrediction(
         case_id=base.predictions[0].case_id,
         run_id="failed-run",
         terminal_sha256="1" * 64,
         accepted=False,
         failure_stage="model",
         failure_code="model_http_error",
-        reporting=MlflowReporting(
+        reporting=LogfireReporting(
             status="failed",
-            failure_code="mlflow_export_failed",
+            failure_code="logfire_recording_failed",
         ),
     )
     failed_receipt = base.model_copy(update={"predictions": (prediction,)})
@@ -968,120 +737,36 @@ def test_failed_reporting_has_no_conditional_mlflow_exception(
         invocation,
         failed_receipt,
     )
-    reader = EvidenceReader(
-        {
-            "evaluation-run": BenchmarkMlflowRun(
-                run_id="evaluation-run",
-                status="FINISHED",
-                lifecycle_stage="active",
-                metrics={
-                    "agent_failure/mean": 0.0,
-                    "end_to_end_exact_success/mean": 0.0,
-                    "end_to_end_policy_success/mean": 0.0,
-                    "infrastructure_failure/mean": 1.0,
-                },
-                tags=evaluation_tags(invocation),
-            )
-        }
-    )
 
     report = build_benchmark_report(
         prepared.study,
         prepared.runtime,
         reporter_revision=REPORTER_REVISION,
         pack_loader=lambda _reference: prepared.packs[0][1],
-        evidence_reader=reader,
+
     )
 
     assert report.overall.metrics.conditional_exact_accuracy.denominator == 0
     assert report.overall.metrics.conditional_exact_accuracy.rate is None
     assert report.overall.metrics.infrastructure_failure.numerator == 1
-    assert reader.requested == ["evaluation-run"]
-    assert json.loads(report.canonical_json)["format"] == "dsa-benchmark-report/v3"
+
+    assert json.loads(report.canonical_json)["format"] == "dsa-benchmark-report/v4"
 
 
-def test_mlflow_reader_retains_only_the_bounded_safe_projection() -> None:
-    raw = SimpleNamespace(
-        info=SimpleNamespace(
-            run_id="evaluation-run",
-            status="FINISHED",
-            lifecycle_stage="active",
-        ),
-        data=SimpleNamespace(
-            metrics={
-                "end_to_end_exact_success/mean": 1.0,
-                "secret.metric": 42.0,
-            },
-            params={
-                "dsa.model_name": "test",
-                "private_endpoint": "https://private.example",
-            },
-            tags={
-                "dsa.benchmark.cell_id": "cell-" + "a" * 64,
-                "credential": "SECRET",
-            },
-        ),
-    )
 
-    class Client:
-        def get_run(self, run_id: str) -> object:
-            assert run_id == "evaluation-run"
-            return raw
-
-    selected = MlflowBenchmarkEvidenceReader(Client()).get_run("evaluation-run")
-
-    assert selected.metrics == {"end_to_end_exact_success/mean": 1.0}
-    assert selected.status == "FINISHED"
-    assert selected.lifecycle_stage == "active"
-    assert selected.params == {"dsa.model_name": "test"}
-    assert selected.tags == {"dsa.benchmark.cell_id": "cell-" + "a" * 64}
-    assert "SECRET" not in selected.model_dump_json()
-
-
-@pytest.mark.parametrize(
-    "environment, expected_tracking_uri",
-    [
-        (
-            {"MLFLOW_TRACKING_URI": "http://127.0.0.1:5000"},
-            "http://127.0.0.1:5000",
-        ),
-        (
-            {
-                "MLFLOW_TRACKING_URI": "databricks",
-                "DATABRICKS_HOST": "https://workspace.example",
-                "DATABRICKS_TOKEN": "token",
-            },
-            "databricks",
-        ),
-    ],
-)
-def test_default_evidence_reader_does_not_require_an_experiment_id(
-    monkeypatch: pytest.MonkeyPatch,
-    environment: dict[str, str],
-    expected_tracking_uri: str,
+def test_report_rejects_terminal_for_another_question_even_with_matching_digest(
+    tmp_path: Path,
 ) -> None:
-    captured: list[str] = []
-
-    class Client:
-        pass
-
-    def client_type(*, tracking_uri: str) -> Client:
-        captured.append(tracking_uri)
-        return Client()
-
-    def import_tracking(name: str) -> object:
-        if name != "mlflow.tracking":
-            raise AssertionError("unexpected import")
-        return SimpleNamespace(MlflowClient=client_type)
-
-    monkeypatch.setattr(
-        benchmark_report_module,
-        "import_module",
-        import_tracking,
+    prepared = prepared_benchmark(tmp_path)
+    invocation = BenchmarkCellInvocation.from_prepared(prepared, prepared.cells[0], 1)
+    retain_receipt_with_terminals(
+        prepared, invocation, receipt(invocation), terminal_question="A different question"
     )
-    reader_factory = benchmark_report_module.__dict__["_default_evidence_reader"]
 
-    reader = reader_factory(environment)
-
-    assert isinstance(reader, MlflowBenchmarkEvidenceReader)
-    assert captured == [expected_tracking_uri]
+    with pytest.raises(ValueError, match="terminal request does not match"):
+        build_benchmark_report(
+            prepared.study,
+            prepared.runtime,
+            reporter_revision=REPORTER_REVISION,
+            pack_loader=lambda _reference: prepared.packs[0][1],
+        )

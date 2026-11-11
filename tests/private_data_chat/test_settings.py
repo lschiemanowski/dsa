@@ -21,7 +21,7 @@ def environment(tmp_path: Path) -> dict[str, str]:
         "DSA_CHAT_TRUSTED_MODEL_NAME": "openai:trusted",
         "DSA_CHAT_TRUSTED_MODEL_SETTINGS_JSON": '{"temperature":0}',
         "DSA_CHAT_DOCKER_IMAGE": IMAGE,
-        "DSA_CHAT_REPORT_TO_MLFLOW": "true",
+        "DSA_CHAT_REPORT_TO_LOGFIRE": "true",
     }
 
 
@@ -33,7 +33,7 @@ def test_configuration_keeps_clarifier_and_trusted_runtime_separate(tmp_path: Pa
     assert configuration.clarifier_model.settings == {"temperature": 0.2}
     assert configuration.dsa.trusted_model_name == "openai:trusted"
     assert configuration.dsa.database_path == tmp_path / "private.duckdb"
-    assert configuration.dsa.report_to_mlflow is True
+    assert configuration.dsa.report_to_logfire is True
 
 
 def test_analysis_guidance_is_an_opt_in_host_setting(tmp_path: Path) -> None:
@@ -55,7 +55,7 @@ def test_toml_configuration_resolves_paths_relative_to_itself(tmp_path: Path) ->
                 'runs_directory = "state/runs"',
                 f'docker_image = "{IMAGE}"',
                 "enable_analysis_guidance = true",
-                "report_to_mlflow = false",
+                "report_to_logfire = false",
                 "",
                 "[clarifier]",
                 'model = "openai:untrusted"',
@@ -217,7 +217,7 @@ def test_configuration_rejects_missing_invalid_or_relative_values(tmp_path: Path
         load_configuration(relative)
 
     invalid_bool = environment(tmp_path)
-    invalid_bool["DSA_CHAT_REPORT_TO_MLFLOW"] = "sometimes"
+    invalid_bool["DSA_CHAT_REPORT_TO_LOGFIRE"] = "sometimes"
     with pytest.raises(ValueError, match="true or false"):
         load_configuration(invalid_bool)
 
