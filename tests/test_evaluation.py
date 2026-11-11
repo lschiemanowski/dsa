@@ -217,30 +217,15 @@ def test_exact_json_and_failure_scorers_cover_the_all_case_denominator() -> None
 
 
 def test_numeric_tolerance_is_explicit_recursive_and_never_weakens_integers() -> None:
-    scorer = {
-        "name": "json-numeric-tolerance",
-        "version": "1",
-        "relative_tolerance": 1e-9,
-        "absolute_tolerance": 1e-12,
-    }
-    expectations: dict[str, JsonValue] = {
-        "answer": '{"count":3,"ratio":0.1,"values":[1.0,true]}',
-        "scorer": json.dumps(scorer, sort_keys=True, separators=(",", ":")),
-    }
-
-    assert json_answers_equal(
-        {"count": 3, "ratio": 0.10000000001, "values": [1, True]},
-        expectations,
-    ) is True
-    tolerated = prediction(
-        answer={"count": 3, "ratio": 0.10000000001, "values": [1, True]}
+    scorer = JsonNumericToleranceScorer(
+        name="json-numeric-tolerance",
+        version="1",
+        relative_tolerance=1e-9,
+        absolute_tolerance=1e-12,
     )
-    scores = score_prediction(
-        tolerated,
-        {"count": 3, "ratio": 0.1, "values": [1.0, True]},
-        JsonNumericToleranceScorer.model_validate(scorer),
-    )
-    assert scores == {
+    expected: dict[str, JsonValue] = {"count": 3, "ratio": 0.1, "values": [1.0, True]}
+    tolerated = prediction(answer={"count": 3, "ratio": 0.10000000001, "values": [1, True]})
+    assert score_prediction(tolerated, expected, scorer) == {
         "end_to_end_exact_success": False,
         "end_to_end_policy_success": True,
         "conditional_exact_json": False,
@@ -248,22 +233,26 @@ def test_numeric_tolerance_is_explicit_recursive_and_never_weakens_integers() ->
         "agent_failure": False,
         "infrastructure_failure": False,
     }
-    assert json_answers_equal(
+
+    for answer in (
         {"count": 3.0, "ratio": 0.1, "values": [1, True]},
-        expectations,
-    ) is False
-    assert json_answers_equal(
         {"count": 3, "ratio": 0.1001, "values": [1, True]},
-        expectations,
-    ) is False
-    assert json_answers_equal(
         {"count": 3, "ratio": 0.1, "values": [1, 1]},
-        expectations,
-    ) is False
-    assert json_answers_equal(
         {"count": 3, "ratio": 10**1000, "values": [1, True]},
-        expectations,
-    ) is False
+    ):
+        scores = score_prediction(prediction(answer=answer), expected, scorer)
+        assert scores["conditional_policy_match"] is False
+
+
+def test_legacy_benchmark_jobs_can_still_score_serialized_expectations() -> None:
+    expectations: dict[str, JsonValue] = {
+        "answer": '{"count":3,"ratio":0.1}',
+        "scorer": (
+            '{"absolute_tolerance":1e-12,"name":"json-numeric-tolerance",'
+            '"relative_tolerance":1e-09,"version":"1"}'
+        ),
+    }
+    assert json_answers_equal({"count": 3, "ratio": 0.10000000001}, expectations)
 
 
 async def test_local_evaluation_runs_verified_cases_once_in_pack_order(

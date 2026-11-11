@@ -81,7 +81,7 @@ class EvaluationError(RuntimeError):
 
 
 ModelFactory = Callable[[EvaluationPackCase], Model | str | None]
-_PACK_SCORER_ADAPTER: TypeAdapter[PackScorer] = TypeAdapter(
+_LEGACY_SCORER_ADAPTER: TypeAdapter[PackScorer] = TypeAdapter(
     ExactJsonScorer | JsonNumericToleranceScorer
 )
 
@@ -231,33 +231,26 @@ def json_answers_equal(
     actual: JsonValue,
     expectations: dict[str, JsonValue],
 ) -> bool:
-    """Compare one answer under the canonical policy retained in the pack."""
-    expected, scorer = _decode_scoring_expectations(expectations)
-    if isinstance(scorer, JsonNumericToleranceScorer):
-        return _tolerant_json_equal(actual, expected, scorer)
-    return exact_json_equal(actual, expected)
-
-
-def _decode_scoring_expectations(
-    value: dict[str, JsonValue],
-) -> tuple[JsonValue, PackScorer]:
-    if set(value) != {"answer", "scorer"}:
+    """Score an answer using the serialized expectations in older benchmark jobs."""
+    if set(expectations) != {"answer", "scorer"}:
         raise ValueError("evaluation expectations have an invalid shape")
-    answer_text = value["answer"]
-    scorer_text = value["scorer"]
+    answer_text = expectations["answer"]
+    scorer_text = expectations["scorer"]
     if not isinstance(answer_text, str) or not isinstance(scorer_text, str):
         raise ValueError("evaluation expectations must be canonical JSON strings")
     try:
         answer = cast(JsonValue, json.loads(answer_text))
         scorer_value = json.loads(scorer_text)
-        scorer = _PACK_SCORER_ADAPTER.validate_python(scorer_value)
+        scorer = _LEGACY_SCORER_ADAPTER.validate_python(scorer_value)
     except Exception:
         raise ValueError("evaluation expectations are invalid") from None
     if answer_text != _canonical_json(answer) or scorer_text != _canonical_json(
         cast(JsonValue, scorer.model_dump(mode="json"))
     ):
         raise ValueError("evaluation expectations must be canonical")
-    return answer, scorer
+    if isinstance(scorer, JsonNumericToleranceScorer):
+        return _tolerant_json_equal(actual, answer, scorer)
+    return exact_json_equal(actual, answer)
 
 
 def _tolerant_json_equal(

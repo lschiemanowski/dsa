@@ -200,18 +200,6 @@ class EvaluationPackCase(ContractModel):
             raise ValueError("expected answer must satisfy the answer schema")
         return self
 
-    def scoring_expectations(
-        self,
-        manifest: EvaluationPackManifest,
-    ) -> dict[str, JsonValue]:
-        """Encode scorer inputs without lossy number coercion."""
-        return {
-            "answer": _canonical_json(self.expected_answer).decode("utf-8"),
-            "scorer": _canonical_json(
-                manifest.scorer.model_dump(mode="json")
-            ).decode("utf-8"),
-        }
-
 
 class HuggingFacePackReference(ContractModel):
     """One immutable pack locator in a Hugging Face dataset repository."""
