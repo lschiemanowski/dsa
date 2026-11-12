@@ -218,11 +218,18 @@ tempCodeRunnerFile.py
 # Retained local state from historical benchmarks
 /.mlflow/
 
-# Chainlit creates local configuration, translations, and uploaded-file state on first import
+# Local files left by older chat installations
 /.chainlit/
 /.files/
 /apps/private_data_chat/.chainlit/translations/
 /apps/private_data_chat/.files/
+
+# Frontend dependencies, build output, and browser test artifacts
+/ui/node_modules/
+/ui/playwright-report/
+/ui/test-results/
+/apps/private_data_chat/web/
+
 /.private-data-chat.env
 /.private-data-chat/
 

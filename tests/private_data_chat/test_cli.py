@@ -1,9 +1,8 @@
-"""Tests for the optional Chainlit launcher boundary."""
+"""Tests for the FastAPI launcher boundary."""
 
 from __future__ import annotations
 
 import json
-import tomllib
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
@@ -58,13 +57,15 @@ def write_configuration(tmp_path: Path) -> Path:
 
 
 def test_launches_packaged_application_with_an_explicit_config(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     config_path = write_configuration(tmp_path)
-    calls: list[tuple[list[str], dict[str, str]]] = []
+    (tmp_path / "index.html").write_text("<!doctype html>")
+    monkeypatch.setattr(cli_module, "CHAT_WEB_ROOT", tmp_path)
+    calls: list[tuple[list[str], dict[str, str], str | None]] = []
 
-    def launch(arguments: Sequence[str], environ: Mapping[str, str]) -> int:
-        calls.append((list(arguments), dict(environ)))
+    def launch(arguments: Sequence[str], environ: Mapping[str, str], url: str | None) -> int:
+        calls.append((list(arguments), dict(environ), url))
         return 23
 
     status = main(
@@ -77,6 +78,7 @@ def test_launches_packaged_application_with_an_explicit_config(
             "8123",
             "--headless",
             "--watch",
+            "--debug",
         ],
         launcher=launch,
         dependency_available=lambda: True,
@@ -85,41 +87,35 @@ def test_launches_packaged_application_with_an_explicit_config(
 
     assert status == 23
     assert len(calls) == 1
-    arguments, environment = calls[0]
-    assert arguments[0] == "run"
-    assert arguments[1].endswith("/apps/private_data_chat/chainlit_app.py")
-    assert arguments[2:] == [
+    arguments, environment, url = calls[0]
+    assert arguments == [
+        "apps.private_data_chat.http_api:create_chat_app",
+        "--factory",
         "--host",
         "0.0.0.0",
         "--port",
         "8123",
-        "--headless",
-        "--watch",
+        "--reload",
+        "--reload-dir",
+        str(Path(cli_module.__file__).resolve().parent),
+        "--log-level",
+        "debug",
     ]
     assert environment["DSA_CHAT_CONFIG_PATH"] == str(config_path.resolve())
-    application_root = Path(environment["CHAINLIT_APP_ROOT"])
-    assert application_root == (Path(__file__).parents[2] / "apps/private_data_chat")
-    ui_configuration = tomllib.loads(
-        (application_root / ".chainlit/config.toml").read_text()
-    )
-    assert ui_configuration["UI"]["default_theme"] == "dark"
-    assert ui_configuration["UI"]["logo_file_url"] == "/public/dsa-mark.svg"
-    assert ui_configuration["UI"]["default_avatar_file_url"] == "/public/dsa-mark.svg"
-    public = application_root / "public"
-    assert (public / "favicon.svg").read_bytes() == (public / "dsa-mark.svg").read_bytes()
-    assert 'stroke="#fff"' not in (public / "dsa-mark.svg").read_text()
     assert environment["OPENAI_API_KEY"] == "SECRET"
+    assert url is None
 
 
-def test_check_validates_configuration_without_starting_chainlit(
+def test_check_validates_configuration_without_starting_server(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     config_path = write_configuration(tmp_path)
+    monkeypatch.setattr(cli_module, "CHAT_WEB_ROOT", tmp_path / "missing")
 
-    def unexpected(arguments: Sequence[str], environ: Mapping[str, str]) -> int:
-        del arguments, environ
-        raise AssertionError("preflight must not launch Chainlit")
+    def unexpected(arguments: Sequence[str], environ: Mapping[str, str], url: str | None) -> int:
+        raise AssertionError("preflight must not start the server")
 
     assert (
         main(
@@ -135,6 +131,21 @@ def test_check_validates_configuration_without_starting_chainlit(
         "data_source_id": "retail",
         "status": "ready",
     }
+
+    assert main(
+        ["--config", str(config_path)], launcher=unexpected,
+        dependency_available=lambda: True, environ={},
+    ) == 2
+    assert json.loads(capsys.readouterr().out)["code"] == "chat_ui_unavailable"
+
+
+def test_rejects_unsupported_host_before_starting_server(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert main(["--host", "192.0.2.1"], environ={}) == 2
+    result = json.loads(capsys.readouterr().out)
+    assert result["code"] == "chat_host_unsupported"
+    assert "loopback" in result["message"]
 
 
 def test_missing_optional_dependency_is_a_stable_preflight_failure(
@@ -271,17 +282,6 @@ def test_database_card_download_failure_is_safely_classified(
         "stage": "database_card",
         "status": "rejected",
     }
-
-
-def test_chat_styles_widen_layout_and_wrap_code_without_mutating_content() -> None:
-    path = Path(__file__).resolve().parents[2] / "apps/private_data_chat/public/dsa.css"
-    css = path.read_text()
-    assert '[style*="max-width: min(48rem, 100vw)"]' in css
-    assert "max-width: min(60rem, 100vw) !important" in css
-    assert ".message-content pre code" in css
-    assert "white-space: pre-wrap !important" in css
-    assert "overflow-wrap: anywhere" in css
-
 
 
 @pytest.mark.parametrize("legacy_value", ["false", "true"])

@@ -16,6 +16,7 @@ from typing import Literal
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, JsonValue
 from starlette.concurrency import run_in_threadpool
 
@@ -23,12 +24,19 @@ from apps.private_data_chat.broker import BrokerError
 from apps.private_data_chat.chat import ChatStatus, PrivateDataChatSession, ProposalDecision
 from apps.private_data_chat.contracts import AppContract, ProposalRecord, proposal_payload_json
 from apps.private_data_chat.service import load_chat_service, model_display_name, welcome_message
+from apps.private_data_chat.settings import CHAT_WEB_ROOT
 
 SessionFactory = Callable[[str, str], PrivateDataChatSession]
 _COOKIE = "dsa_chat_session"
 _CONVERSATIONS = "/api/conversations"
 _NOTEBOOK_FILENAME = "dsa-derivation.ipynb"
 _LOOPBACK_HOST = re.compile(r"(?:localhost|127\.0\.0\.1|\[::1\])(?::[0-9]{1,5})?", re.IGNORECASE)
+_FINGERPRINTED_ASSET = re.compile(r"/assets/[^/]+-[A-Za-z0-9_-]{8,}\.(?:js|css)")
+_UI_CSP = (
+    "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
+    "img-src 'self' data:; connect-src 'self'; font-src 'self'; "
+    "base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
+)
 _MAX_CONVERSATIONS_PER_BROWSER = 8
 _MAX_CONVERSATIONS = 64
 _MAX_RUNNING_ANALYSES = 2
@@ -157,7 +165,15 @@ def create_app(
             response = JSONResponse({"detail": "invalid_origin"}, status_code=403)
         else:
             response = await call_next(request)
-        response.headers["Cache-Control"] = "no-store"
+        path = request.scope["path"]
+        if response.status_code in {200, 206, 304} and _FINGERPRINTED_ASSET.fullmatch(path):
+            response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+        else:
+            response.headers["Cache-Control"] = "no-store"
+        if path in {"/", "/index.html"} and response.headers.get("Content-Type", "").startswith(
+            "text/html"
+        ):
+            response.headers["Content-Security-Policy"] = _UI_CSP
         response.headers["X-Content-Type-Options"] = "nosniff"
         return response
 
@@ -305,6 +321,13 @@ def create_app(
     app.add_api_route(
         f"{conversation_path}/notebook", get_notebook, methods=["GET"], response_class=Response
     )
+    return app
+
+
+def create_chat_app() -> FastAPI:
+    """Serve the built chat UI and its API from one origin."""
+    app = create_app()
+    app.mount("/", StaticFiles(directory=CHAT_WEB_ROOT, html=True), name="chat")
     return app
 
 

@@ -23,7 +23,6 @@ dsa-run = "dsa.run_cli:main"
 
 [project.optional-dependencies]
 chat = [
-    "chainlit==2.12.0; python_version < '3.14'",
     "fastapi>=0.141.1,<1",
     "huggingface-hub>=1,<2",
     "uvicorn>=0.52.4,<1",
@@ -51,8 +50,13 @@ dev = [
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
+[tool.hatch.build]
+artifacts = ["/apps/private_data_chat/web/**"]
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/dsa", "apps"]
+
+[tool.hatch.build.targets.wheel.hooks.custom]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

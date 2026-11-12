@@ -1,4 +1,4 @@
-"""Host-owned configuration for the Chainlit private-data application."""
+"""Host-owned configuration for the private-data chat application."""
 
 from __future__ import annotations
 
@@ -17,6 +17,8 @@ from apps.private_data_chat.dsa_adapter import DsaRuntimeConfiguration
 from apps.private_data_chat.synthetic_context import HuggingFaceSyntheticContextReference
 from dsa import ModelConfiguration
 from dsa.cli import read_contract
+
+CHAT_WEB_ROOT = Path(__file__).with_name("web")
 
 
 class PrivateDataChatConfiguration(AppContract):
