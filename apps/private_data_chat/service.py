@@ -1,4 +1,4 @@
-"""Host-owned configuration shared by both private-data chat transports."""
+"""Host-owned configuration for private-data chat sessions."""
 
 from dataclasses import dataclass
 
@@ -67,7 +67,7 @@ def welcome_message(
         "the request for the subagent.\n"
         "3. Review the subagent request. If you are happy with it, run the request.\n"
         "4. The agent returns the result. If it succeeds, you receive a structured answer and a "
-        "downloadable Jupyter notebook containing the derivation.\n"
+        "downloadable Jupyter notebook when DSA verifies the derivation.\n"
         "5. To prevent data from leaking to the untrusted model, the session ends after the "
         "result is returned. Start a new session to ask another question.",
         f"## About {title}",

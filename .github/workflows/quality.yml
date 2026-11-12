@@ -39,3 +39,20 @@ jobs:
 
       - name: Test
         run: uv run pytest
+
+      - name: Set up Node for the wheel build
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      - name: Build and verify the wheel
+        shell: bash
+        run: |
+          uv build
+          wheel=(dist/*.whl)
+          uv venv "$RUNNER_TEMP/dsa-wheel-venv" --python 3.12
+          uv export --frozen --no-dev --extra chat --no-emit-project --no-hashes --output-file "$RUNNER_TEMP/dsa-wheel-constraints.txt"
+          uv pip install --python "$RUNNER_TEMP/dsa-wheel-venv/bin/python" --constraint "$RUNNER_TEMP/dsa-wheel-constraints.txt" "${wheel[0]}[chat]"
+          uv run --no-sync python -m tests.private_data_chat.wheel_smoke "$RUNNER_TEMP/dsa-wheel-venv/bin/dsa"

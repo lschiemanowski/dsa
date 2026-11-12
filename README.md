@@ -89,11 +89,14 @@ To run the web UI, you first need to set an OpenRouter API key:
 ```bash
 export OPENROUTER_API_KEY='your-openrouter-api-key'
 ```
-Then run the UI:
+From the source checkout, build the frontend once with Node.js 22.12 or newer, then launch the UI:
 ```bash
+npm --prefix ui ci
+npm --prefix ui run build
 uv run dsa chat --config examples/smard/local/chat.toml --host 127.0.0.1
 ```
-This opens a web browser and shows the UI seen in the video. In this example configuration, DeepSeek V4 Flash through OpenRouter is used for clarification, while local Gemma 4 E4B performs the analysis. Edit `[clarifier]` and `[trusted]`, respectively, in `examples/smard/local/chat.toml` to change these models.
+The launcher opens the assistant-ui app in a browser. The Python wheel already includes the built
+frontend and can run without Node. In this example configuration, DeepSeek V4 Flash through OpenRouter is used for clarification, while local Gemma 4 E4B performs the analysis. Edit `[clarifier]` and `[trusted]`, respectively, in `examples/smard/local/chat.toml` to change these models.
 
 The recorded demo used DeepSeek V4 Flash for analysis of the public database as well. The local Gemma 4 E4B setup above has not yet been tested end to end.
 

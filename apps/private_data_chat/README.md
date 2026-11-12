@@ -15,15 +15,14 @@ either model is called.
 
 ## Implemented demo flow
 
-`chainlit_app.py` implements one deliberately small Chainlit application:
+The chat uses an assistant-ui frontend and a FastAPI server:
 
 1. it rebuilds the untrusted model request from bounded user/assistant text, the operator's
    synthetic `MockDatabaseContext`, and an optional digest-pinned database card;
 2. the clarifier asks questions until it emits a validated quantitative proposal, optionally with
    untrusted analysis guidance when the host enables it;
-3. Chainlit retains the proposal as an ordinary chat message, with request fields in
-   TOML and the answer schema in a separate formatted JSON block, then shows native
-   confirmation actions in a separate transient prompt;
+3. The chat displays the proposal with its scope and output fields, an expandable view of the
+   exact request JSON, and controls to approve or refine it;
 4. exact confirmation invokes the host-owned `DsaAnalysisExecutor` against the real database;
 5. the application returns the structured answer and attaches a notebook download when DSA
    retained a verified derivation; and
@@ -67,24 +66,25 @@ it never starts a second analysis. A concurrent call while execution is in progr
 The single-process lock makes those statements true for `InMemoryProposalStore` during the one
 invocation.
 
-## Chainlit setup
+## Install and launch
 
-The application remains in the separate `apps.private_data_chat` namespace, but the project wheel
-includes it so a cloned checkout does not need a custom `PYTHONPATH`. The product-level `dsa`
-command is only a dispatcher: `dsa chat` enters this application package, while `dsa run` and
-`dsa benchmark` enter their existing core CLI modules. Nothing under `src/dsa` imports the chat
-application or Chainlit.
+The wheel includes the compiled assistant-ui frontend. Install the wheel with the `chat` extra,
+then use `dsa chat`. The installed app runs with Python and opens in a browser.
 
-Chainlit is an exact-pinned optional dependency and is not vendored. Install it from the frozen
-project lockfile:
+```bash
+uv pip install '/path/to/dsa-0.1.0-py3-none-any.whl[chat]'
+```
+
+From a source checkout, install the locked Python dependencies and build the frontend once with
+Node.js 22.12 or newer:
 
 ```bash
 uv sync --python 3.12 --extra chat --frozen
+npm --prefix ui ci
+npm --prefix ui run build
 ```
 
-`dsa chat` uses the application-owned Chainlit configuration and monochrome DSA mark. The demo
-keeps one dark theme, hides the theme control and generic watermark, and disables spontaneous file
-uploads and message editing.
+`uv build` compiles the frontend automatically and includes it in the wheel.
 
 For a portable, non-secret starting point, copy and edit the Online Retail II TOML template:
 
@@ -121,14 +121,15 @@ database card without starting a server or calling either model:
 uv run dsa chat --config private-data-chat.toml --check
 ```
 
-Then launch the application. Chainlit opens the browser by default:
+Then launch the application. The launcher opens the browser by default:
 
 ```bash
 uv run dsa chat --config private-data-chat.toml
 ```
 
-For a remote or already-open browser, add `--headless`; `--host`, `--port`, `--watch`, and `--debug`
-are also available. Run `uv run dsa chat --help` for the exact interface.
+Use `--headless` to open the browser yourself. The default URL is `http://127.0.0.1:8001/`.
+Use `--host` and `--port` to set the listen address, `--watch` to reload after Python edits,
+and `--debug` for verbose server logs. The API accepts loopback browser addresses.
 
 The previous environment-only configuration remains supported. Source and edit
 `online-retail-ii.env.example`, then run `uv run dsa chat` without `--config`.
@@ -163,7 +164,7 @@ Guidance is also rendered separately as wrapped literal text for readability, wi
 punctuation neutralized; the canonical JSON remains beneath it as the exact approved
 representation.
 
-The Chainlit process needs access to the Docker CLI and daemon used for derivation replay. The
+The chat server needs access to the Docker CLI and daemon used for derivation replay. The
 configured database and runs directory must also be visible to that daemon at the same absolute
 paths.
 
@@ -174,9 +175,8 @@ request includes the approved question, answer schema, and—only when enabled a
 approved—clearly labeled untrusted analysis guidance. It never receives the clarification
 conversation.
 
-The notebook is delivered through Chainlit's native `File` element under a fixed download name.
-Before attaching it, the adapter reopens the exact retained file without following symlinks and
-rechecks its byte length and SHA-256 digest. No host path is put in the chat.
+Use **Open notebook** to view and download the verified derivation. For each request, the server
+reopens the retained file without following symlinks and checks its byte length and SHA-256 digest.
 
 `clarification-skill.md` is a host-owned system prompt loaded by the application. It improves the
 clarifier's behavior; the parsed contracts, confirmation digest, and trusted adapter enforce the
@@ -216,9 +216,9 @@ removed after one hour of inactivity. Clarification and analysis in progress are
 finish. Up to two analyses can run at a time. If both slots are occupied, approval returns HTTP
 429 with `analysis_capacity_reached` and the proposal can be approved again while it is valid.
 Sessions are held in memory and are lost on server restart. The API accepts localhost and IPv4
-and IPv6 loopback. `dsa chat` continues to launch the Chainlit UI during this stage of the migration.
+and IPv6 loopback.
 
-## Preview the assistant-ui frontend
+## Develop the assistant-ui frontend
 
 Start the FastAPI server from the repository root using the command above. In a second terminal
 with Node.js 22.12 or newer, run:

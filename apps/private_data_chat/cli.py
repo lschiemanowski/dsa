@@ -1,4 +1,4 @@
-"""Optional Chainlit launcher for the Private Data Chat application."""
+"""FastAPI launcher for the Private Data Chat application."""
 
 from __future__ import annotations
 
@@ -6,19 +6,28 @@ import importlib.util
 import os
 import subprocess
 import sys
+import webbrowser
 from collections.abc import Callable, Mapping, Sequence
+from http.client import HTTPConnection, HTTPException
 from pathlib import Path
+from threading import Thread
+from time import monotonic, sleep
 from typing import cast
+from urllib.parse import urlsplit
 
 from pydantic import ValidationError
 
 from apps.private_data_chat.clarifier import load_mock_context
 from apps.private_data_chat.database_card import load_database_card
-from apps.private_data_chat.settings import LegacyChatReportingError, load_configuration
+from apps.private_data_chat.settings import (
+    CHAT_WEB_ROOT,
+    LegacyChatReportingError,
+    load_configuration,
+)
 from apps.private_data_chat.synthetic_context import validate_context_card
 from dsa.cli import HelpRequested, Parser, emit
 
-Launcher = Callable[[Sequence[str], Mapping[str, str]], int]
+Launcher = Callable[[Sequence[str], Mapping[str, str], str | None], int]
 DependencyCheck = Callable[[], bool]
 _SAFE_CONFIGURATION_FIELDS = frozenset(
     {
@@ -52,7 +61,7 @@ def main(
     dependency_available: DependencyCheck | None = None,
     environ: Mapping[str, str] | None = None,
 ) -> int:
-    """Validate host configuration and start the packaged Chainlit application."""
+    """Validate host configuration and start the packaged chat application."""
     try:
         parsed = _parser(prog).parse_args(argv)
         values = dict(os.environ if environ is None else environ)
@@ -63,7 +72,7 @@ def main(
         _emit_preflight_failure("arguments", error)
         return 2
 
-    check_dependency = dependency_available or _chainlit_available
+    check_dependency = dependency_available or _chat_dependencies_available
     if not check_dependency():
         emit({"code": "chat_dependency_unavailable", "status": "rejected"})
         return 2
@@ -102,24 +111,33 @@ def main(
 
     if config_path is not None:
         values["DSA_CHAT_CONFIG_PATH"] = str(config_path)
-    values["CHAINLIT_APP_ROOT"] = str(Path(__file__).parent)
+    if not (CHAT_WEB_ROOT / "index.html").is_file():
+        emit(
+            {
+                "code": "chat_ui_unavailable",
+                "status": "rejected",
+                "message": "Build the UI with npm ci and npm run build in ui/, "
+                "or install the built DSA wheel.",
+            }
+        )
+        return 2
+
     arguments = [
-        "run",
-        str(Path(__file__).with_name("chainlit_app.py")),
+        "apps.private_data_chat.http_api:create_chat_app",
+        "--factory",
         "--host",
         parsed.host,
         "--port",
         str(parsed.port),
     ]
-    if parsed.headless:
-        arguments.append("--headless")
     if parsed.watch:
-        arguments.append("--watch")
+        arguments.append("--reload")
     if parsed.debug:
-        arguments.append("--debug")
-    start = launcher or _launch_chainlit
+        arguments.extend(("--log-level", "debug"))
+    url = None if parsed.headless else _browser_url(parsed.host, parsed.port)
+    start = launcher or _launch_fastapi
     try:
-        return start(arguments, values)
+        return start(arguments, values, url)
     except KeyboardInterrupt:
         return 130
     except Exception:
@@ -146,17 +164,46 @@ def _port(value: str) -> int:
     return port
 
 
-def _chainlit_available() -> bool:
-    return importlib.util.find_spec("chainlit") is not None
+def _chat_dependencies_available() -> bool:
+    return all(importlib.util.find_spec(name) is not None for name in ("fastapi", "uvicorn"))
 
 
-def _launch_chainlit(arguments: Sequence[str], environ: Mapping[str, str]) -> int:
-    completed = subprocess.run(
-        (sys.executable, "-m", "chainlit", *arguments),
+def _browser_url(host: str, port: int) -> str:
+    host = {"0.0.0.0": "127.0.0.1", "::": "::1"}.get(host, host)
+    address = f"[{host}]" if ":" in host else host
+    return f"http://{address}:{port}/"
+
+
+def _launch_fastapi(
+    arguments: Sequence[str], environ: Mapping[str, str], url: str | None
+) -> int:
+    with subprocess.Popen(
+        (sys.executable, "-m", "uvicorn", *arguments),
         env=dict(environ),
-        check=False,
-    )
-    return completed.returncode
+    ) as process:
+        if url is not None:
+            Thread(target=_open_when_ready, args=(process, url), daemon=True).start()
+        return process.wait()
+
+
+def _open_when_ready(process: subprocess.Popen[bytes], url: str) -> None:
+    address = urlsplit(url)
+    assert address.hostname is not None
+    deadline = monotonic() + 15
+    while process.poll() is None and monotonic() < deadline:
+        connection = HTTPConnection(address.hostname, address.port, timeout=0.5)
+        try:
+            connection.request("GET", "/")
+            response = connection.getresponse()
+            if response.status == 200 and b"<title>Private Data Chat" in response.read(4096):
+                if process.poll() is None:
+                    webbrowser.open(url)
+                return
+        except (OSError, HTTPException, webbrowser.Error):
+            pass
+        finally:
+            connection.close()
+        sleep(0.1)
 
 
 def _emit_preflight_failure(stage: str, error: Exception) -> None:

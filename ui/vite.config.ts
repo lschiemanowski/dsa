@@ -17,6 +17,8 @@ export default defineConfig({
   },
   preview: { host: "127.0.0.1", proxy },
   build: {
+    outDir: "../apps/private_data_chat/web",
+    emptyOutDir: true,
     rolldownOptions: {
       output: {
         codeSplitting: {

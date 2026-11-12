@@ -16,6 +16,7 @@ from typing import Literal
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, JsonValue
 from starlette.concurrency import run_in_threadpool
 
@@ -23,6 +24,7 @@ from apps.private_data_chat.broker import BrokerError
 from apps.private_data_chat.chat import ChatStatus, PrivateDataChatSession, ProposalDecision
 from apps.private_data_chat.contracts import AppContract, ProposalRecord, proposal_payload_json
 from apps.private_data_chat.service import load_chat_service, model_display_name, welcome_message
+from apps.private_data_chat.settings import CHAT_WEB_ROOT
 
 SessionFactory = Callable[[str, str], PrivateDataChatSession]
 _COOKIE = "dsa_chat_session"
@@ -305,6 +307,13 @@ def create_app(
     app.add_api_route(
         f"{conversation_path}/notebook", get_notebook, methods=["GET"], response_class=Response
     )
+    return app
+
+
+def create_chat_app() -> FastAPI:
+    """Serve the built chat UI and its API from one origin."""
+    app = create_app()
+    app.mount("/", StaticFiles(directory=CHAT_WEB_ROOT, html=True), name="chat")
     return app
 
 
