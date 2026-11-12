@@ -578,3 +578,10 @@ td .literal {
     padding-inline: 0.65rem;
   }
 }
+
+.field-key {
+  color: var(--muted);
+  font: 0.82rem var(--mono);
+  overflow-wrap: anywhere;
+  unicode-bidi: isolate;
+}

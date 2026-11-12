@@ -44,6 +44,7 @@ _NOTEBOOK = json.dumps(
                 },
                 "outputs": [
                     {"output_type": "stream", "text": "9007199254740993\n"},
+                    {"output_type": "error", "traceback": ["\x1b[31mValueError: example\x1b[0m"]},
                     {"output_type": "display_data", "data": {"image/png": _PNG}},
                     {"output_type": "display_data", "data": {"text/html": "<b>Active output</b>"}},
                 ],

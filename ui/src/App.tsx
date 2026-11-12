@@ -8,7 +8,6 @@ import {
 } from "@assistant-ui/react";
 import { ArrowUp, LoaderCircle, Plus } from "lucide-react";
 import { useMemo, useRef, useState } from "react";
-import mark from "../../apps/private_data_chat/public/dsa-mark.svg";
 import { ProposalCard, ResultCard } from "./AnalysisCards";
 import type { Conversation } from "./api";
 import { NotebookPane } from "./NotebookPane";
@@ -114,14 +113,15 @@ function Chat({
                 if (!entry) return null;
                 const proposal = entry.proposal;
                 if (result && message.id === resultId) {
-                  const schema = conversation?.messages.find(
-                    ({ proposal }) => proposal?.id === result.proposal_id,
-                  )?.proposal?.payload.answer_schema;
+                  const approvedProposal =
+                    conversation?.messages.find(
+                      ({ proposal }) => proposal?.id === result.proposal_id,
+                    )?.proposal ?? undefined;
                   return (
                     <MessagePrimitive.Root className="message assistant">
                       <ResultCard
                         result={result}
-                        schema={schema}
+                        proposal={approvedProposal}
                         notebookOpen={notebookOpen}
                         toggleNotebook={toggleNotebook}
                         notebookButton={notebookButton}
@@ -163,9 +163,20 @@ function Chat({
         </ThreadPrimitive.Viewport>
         <div className="composer-area">
           {error && (
-            <p className="error" role="alert">
-              {error}
-            </p>
+            <>
+              <p className="error" role="alert">
+                {error}
+              </p>
+              {!conversation && (
+                <button
+                  type="button"
+                  className="button secondary"
+                  onClick={session.retryRestore}
+                >
+                  Retry connection
+                </button>
+              )}
+            </>
           )}
           {statusText && (
             <div className="status" role="status">
@@ -215,13 +226,17 @@ export function App() {
     <div className="app">
       <header className="topbar">
         <div className="brand">
-          <img src={mark} alt="" />
+          <img src="/dsa-mark.svg" alt="" />
           <h1>Private Data Chat</h1>
         </div>
         <button
           type="button"
           className="button secondary new-conversation"
-          disabled={busy || (!expired && isWorking(conversation?.status))}
+          disabled={
+            busy ||
+            !conversation ||
+            (!expired && isWorking(conversation.status))
+          }
           onClick={() =>
             void session.start().then((started) => {
               if (started) setNotebookOpen(false);

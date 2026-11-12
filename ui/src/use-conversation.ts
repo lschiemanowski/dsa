@@ -45,6 +45,7 @@ export function useConversation() {
   const [pendingText, setPendingText] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [expired, setExpired] = useState(false);
+  const [restoreAttempt, setRestoreAttempt] = useState(0);
   const inFlight = useRef(true);
 
   useEffect(() => {
@@ -78,7 +79,7 @@ export function useConversation() {
     }
     void restore();
     return () => controller.abort();
-  }, []);
+  }, [restoreAttempt]);
 
   const id = conversation?.id;
   const status = conversation?.status;
@@ -111,15 +112,22 @@ export function useConversation() {
     };
   }, [id, status, expired]);
 
+  function retryRestore() {
+    if (inFlight.current) return;
+    inFlight.current = true;
+    setBusy(true);
+    setError(null);
+    setRestoreAttempt((attempt) => attempt + 1);
+  }
+
   async function update(
     action: () => Promise<Conversation>,
-    text?: string,
-    refresh = true,
+    options?: { text?: string; accepted: (state: Conversation) => boolean },
   ) {
     if (inFlight.current) return false;
     inFlight.current = true;
     setBusy(true);
-    setPendingText(text ?? null);
+    setPendingText(options?.text ?? null);
     setError(null);
     try {
       const state = await action();
@@ -128,32 +136,26 @@ export function useConversation() {
       setExpired(false);
       return true;
     } catch (error) {
-      setError(explainError(error));
-      if (wasRemoved(error)) {
-        rememberConversation(null);
-        setExpired(true);
-      } else if (id && refresh) {
+      let problem = error;
+      if (!wasRemoved(error) && id && options) {
         // A lost response may still have been accepted by the server.
         try {
           const state = await readConversation(id);
           setConversation(state);
-          const firstNew = state.messages[conversation?.messages.length ?? 0];
-          if (
-            text !== undefined &&
-            firstNew?.role === "user" &&
-            firstNew.text === text
-          ) {
-            setError(null);
-            return true;
-          }
+          const ambiguous =
+            !(error instanceof ApiError) ||
+            error.status >= 500 ||
+            error.code === "invalid_response";
+          if (ambiguous && options.accepted(state)) return true;
         } catch (refreshError) {
-          if (wasRemoved(refreshError)) {
-            rememberConversation(null);
-            setExpired(true);
-            setError(explainError(refreshError));
-          }
+          if (wasRemoved(refreshError)) problem = refreshError;
         }
       }
+      if (wasRemoved(problem)) {
+        rememberConversation(null);
+        setExpired(true);
+      }
+      setError(explainError(problem));
       return false;
     } finally {
       inFlight.current = false;
@@ -168,10 +170,35 @@ export function useConversation() {
     pendingText,
     error,
     expired,
-    start: () => update(() => createConversation(), undefined, false),
+    retryRestore,
+    start: () => update(() => createConversation()),
     send: (text: string) =>
-      id ? update(() => sendMessage(id, text), text) : Promise.resolve(false),
+      id
+        ? update(() => sendMessage(id, text), {
+            text,
+            accepted: (state) => {
+              const message =
+                state.messages[conversation?.messages.length ?? 0];
+              return message?.role === "user" && message.text === text;
+            },
+          })
+        : Promise.resolve(false),
     decide: (proposal: Proposal, choice: Decision) =>
-      id ? update(() => decide(id, proposal, choice)) : Promise.resolve(false),
+      id
+        ? update(() => decide(id, proposal, choice), {
+            accepted: (state) => {
+              if (choice === "revise") {
+                return (
+                  state.status === "open" && state.pending_proposal_id === null
+                );
+              }
+              return state.result
+                ? state.result.proposal_id === proposal.id
+                : (state.status === "running" || state.status === "failed") &&
+                    state.messages.filter((message) => message.proposal).at(-1)
+                      ?.proposal?.id === proposal.id;
+            },
+          })
+        : Promise.resolve(false),
   };
 }

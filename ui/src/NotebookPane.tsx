@@ -50,7 +50,10 @@ function Output({
   }
   const plain = text(output.text) || text(data?.["text/plain"]);
   const trace = Array.isArray(output.traceback)
-    ? output.traceback.map(text).join("\n")
+    ? output.traceback
+        .map(text)
+        .join("\n")
+        .replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, "")
     : "";
   return plain || trace ? (
     <pre className="cell-output">{plain || trace}</pre>

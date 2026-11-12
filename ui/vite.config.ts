@@ -1,5 +1,4 @@
 import react from "@vitejs/plugin-react";
-import { fileURLToPath } from "node:url";
 import { defineConfig } from "vite";
 
 const proxy = {
@@ -15,17 +14,6 @@ export default defineConfig({
   server: {
     host: "127.0.0.1",
     proxy,
-    fs: {
-      allow: [
-        fileURLToPath(new URL(".", import.meta.url)),
-        fileURLToPath(
-          new URL(
-            "../apps/private_data_chat/public/dsa-mark.svg",
-            import.meta.url,
-          ),
-        ),
-      ],
-    },
   },
   preview: { host: "127.0.0.1", proxy },
   build: {

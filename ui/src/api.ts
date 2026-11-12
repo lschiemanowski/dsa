@@ -6,14 +6,6 @@ export type ChatStatus =
   | "succeeded"
   | "failed";
 
-export interface AnswerSchema {
-  type: string;
-  title?: string;
-  description?: string;
-  properties?: Record<string, AnswerSchema>;
-  items?: AnswerSchema;
-}
-
 export interface Proposal {
   id: string;
   digest: string;
@@ -29,7 +21,6 @@ export interface Proposal {
       time_window: string | null;
       units: string | null;
     };
-    answer_schema: AnswerSchema;
     analysis_guidance?: string;
     allow_plots?: boolean;
   };
@@ -92,7 +83,14 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
       typeof error?.detail === "string" ? error.detail : "request_failed",
     );
   }
-  return response.json();
+  try {
+    return await response.json();
+  } catch (error) {
+    if (error instanceof SyntaxError) {
+      throw new ApiError(response.status, "invalid_response");
+    }
+    throw error;
+  }
 }
 
 function post<T>(path: string, body: unknown) {
@@ -150,9 +148,19 @@ export function explainError(error: unknown): string {
         return "The clarifier is already working on a question.";
       case "conversation_closed":
         return "This conversation is complete. Start a new conversation to ask another question.";
+      case "invalid_origin":
+      case "invalid_host":
+        return "The chat API rejected this address. Open the chat using the configured local URL.";
+      case "proposal_digest_mismatch":
+        return "The proposal no longer matches the server’s copy. Reload the conversation before approving.";
+      case "invalid_response":
+        return "The chat server returned an unreadable response. Try again.";
       case "invalid_request":
         return "The server could not accept this input. Check its length and try again.";
     }
+    return error.status >= 500
+      ? "The chat server could not complete the request. Try again."
+      : "The chat server rejected the request (HTTP " + error.status + ").";
   }
   return "Could not reach the chat API. Check that it is running and try again.";
 }

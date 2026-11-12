@@ -7,7 +7,7 @@ import {
 } from "lucide-react";
 import { isLosslessNumber, parse, type LosslessNumber } from "lossless-json";
 import { useMemo, type Ref } from "react";
-import type { AnswerSchema, Decision, Proposal, Result } from "./api";
+import type { Decision, Proposal, Result } from "./api";
 
 type Scalar = string | boolean | LosslessNumber | number | null;
 type Json = Scalar | Json[] | JsonObject;
@@ -15,9 +15,12 @@ interface JsonObject {
   [key: string]: Json;
 }
 
-type Schema = Omit<AnswerSchema, "properties" | "items"> & {
-  properties?: Record<string, Schema>;
-  items?: Schema;
+interface AnswerSchema {
+  type: string;
+  title?: string;
+  description?: string;
+  properties?: Record<string, AnswerSchema>;
+  items?: AnswerSchema;
   enum?: Json[];
   const?: Json;
   minimum?: Scalar;
@@ -30,15 +33,32 @@ type Schema = Omit<AnswerSchema, "properties" | "items"> & {
   minLength?: Scalar;
   maxLength?: Scalar;
   uniqueItems?: boolean;
-};
+}
 
-function label(key: string, schema?: AnswerSchema) {
-  const words = key.replace(/[_-]+/g, " ").trim();
+function useAnswerSchema(proposal?: Proposal) {
+  const json = proposal?.request_json;
+  return useMemo(
+    () =>
+      json === undefined
+        ? undefined
+        : (parse(json) as { answer_schema: AnswerSchema }).answer_schema,
+    [json],
+  );
+}
+
+function FieldLabel({ name, schema }: { name: string; schema?: AnswerSchema }) {
+  const title = schema?.title?.trim();
   return (
-    schema?.title?.trim() ||
-    (words
-      ? words.charAt(0).toUpperCase() + words.slice(1)
-      : key.trim() || "Unnamed field")
+    <>
+      {title && (
+        <>
+          <bdi>{title}</bdi>{" "}
+        </>
+      )}
+      <code className="field-key" dir="ltr">
+        {JSON.stringify(name)}
+      </code>
+    </>
   );
 }
 
@@ -47,13 +67,13 @@ function jsonText(value: Json): string {
   if (Array.isArray(value)) return value.map(jsonText).join(", ");
   if (value !== null && typeof value === "object") {
     return Object.entries(value)
-      .map(([key, item]) => label(key) + " = " + jsonText(item))
+      .map(([key, item]) => JSON.stringify(key) + " = " + jsonText(item))
       .join(", ");
   }
   return value === null ? "Null" : String(value);
 }
 
-function restrictions(schema: Schema) {
+function restrictions(schema: AnswerSchema) {
   const limits = [
     ["At least", schema.minimum],
     ["At most", schema.maximum],
@@ -100,13 +120,15 @@ function fieldType(schema: AnswerSchema) {
   }
 }
 
-function OutputFields({ schema }: { schema: Schema }) {
+function OutputFields({ schema }: { schema: AnswerSchema }) {
   if (!schema.properties) return null;
   return (
     <ul className="output-fields">
       {Object.entries(schema.properties).map(([key, field]) => (
         <li key={key}>
-          <strong>{label(key, field)}</strong>{" "}
+          <strong>
+            <FieldLabel name={key} schema={field} />
+          </strong>{" "}
           <span className="field-type">{fieldType(field)}</span>
           <SchemaDetails schema={field} />
         </li>
@@ -115,7 +137,7 @@ function OutputFields({ schema }: { schema: Schema }) {
   );
 }
 
-function SchemaDetails({ schema }: { schema: Schema }) {
+function SchemaDetails({ schema }: { schema: AnswerSchema }) {
   const limits = restrictions(schema);
   return (
     <>
@@ -165,11 +187,7 @@ export function ProposalCard({
 }) {
   const { payload } = proposal;
   const { interpretation: scope } = payload;
-  const schema = useMemo(
-    () =>
-      (parse(proposal.request_json) as { answer_schema: Schema }).answer_schema,
-    [proposal.request_json],
-  );
+  const schema = useAnswerSchema(proposal);
   const fields: [string, string | string[] | null][] = [
     ["Measure", scope.measure],
     ["Population", scope.population],
@@ -208,7 +226,7 @@ export function ProposalCard({
         </dl>
         <div className="card-section">
           <h3>Requested outputs</h3>
-          <SchemaDetails schema={schema} />
+          {schema && <SchemaDetails schema={schema} />}
           {payload.allow_plots && (
             <p className="field-note">Plots may be included.</p>
           )}
@@ -290,7 +308,9 @@ function AnswerValue({
       <dl className="answer-fields">
         {Object.entries(value).map(([key, field]) => (
           <div key={key}>
-            <dt>{label(key, schema?.properties?.[key])}</dt>
+            <dt>
+              <FieldLabel name={key} schema={schema?.properties?.[key]} />
+            </dt>
             <dd>
               <AnswerValue value={field} schema={schema?.properties?.[key]} />
             </dd>
@@ -323,7 +343,10 @@ function AnswerValue({
               <tr>
                 {columns.map((key) => (
                   <th key={key} scope="col">
-                    {label(key, schema?.items?.properties?.[key])}
+                    <FieldLabel
+                      name={key}
+                      schema={schema?.items?.properties?.[key]}
+                    />
                   </th>
                 ))}
               </tr>
@@ -357,17 +380,18 @@ function AnswerValue({
 
 export function ResultCard({
   result,
-  schema,
+  proposal,
   notebookOpen,
   toggleNotebook,
   notebookButton,
 }: {
   result: Result;
-  schema?: AnswerSchema;
+  proposal?: Proposal;
   notebookOpen: boolean;
   toggleNotebook: () => void;
   notebookButton: Ref<HTMLButtonElement>;
 }) {
+  const schema = useAnswerSchema(proposal);
   const answer = useMemo(
     () =>
       result.response_json === null
