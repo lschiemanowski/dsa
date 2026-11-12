@@ -50,9 +50,11 @@ dev = [
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
+[tool.hatch.build]
+artifacts = ["/apps/private_data_chat/web/**"]
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/dsa", "apps"]
-artifacts = ["/apps/private_data_chat/web/**"]
 
 [tool.hatch.build.targets.wheel.hooks.custom]
 

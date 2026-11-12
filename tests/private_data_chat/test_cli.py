@@ -96,6 +96,8 @@ def test_launches_packaged_application_with_an_explicit_config(
         "--port",
         "8123",
         "--reload",
+        "--reload-dir",
+        str(Path(cli_module.__file__).resolve().parent),
         "--log-level",
         "debug",
     ]
@@ -135,6 +137,15 @@ def test_check_validates_configuration_without_starting_server(
         dependency_available=lambda: True, environ={},
     ) == 2
     assert json.loads(capsys.readouterr().out)["code"] == "chat_ui_unavailable"
+
+
+def test_rejects_unsupported_host_before_starting_server(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert main(["--host", "192.0.2.1"], environ={}) == 2
+    result = json.loads(capsys.readouterr().out)
+    assert result["code"] == "chat_host_unsupported"
+    assert "loopback" in result["message"]
 
 
 def test_missing_optional_dependency_is_a_stable_preflight_failure(

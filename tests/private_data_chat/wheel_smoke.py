@@ -9,7 +9,7 @@ import signal
 import socket
 import subprocess
 import sys
-from http.client import HTTPConnection
+from http.client import HTTPConnection, HTTPMessage
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from time import monotonic, sleep
@@ -17,12 +17,12 @@ from time import monotonic, sleep
 from tests.private_data_chat.test_cli import write_configuration
 
 
-def request(port: int, method: str, path: str) -> tuple[int, bytes]:
+def request(port: int, method: str, path: str) -> tuple[int, bytes, HTTPMessage]:
     connection = HTTPConnection("127.0.0.1", port, timeout=1)
     try:
         connection.request(method, path)
         response = connection.getresponse()
-        return response.status, response.read()
+        return response.status, response.read(), response.headers
     finally:
         connection.close()
 
@@ -72,7 +72,7 @@ def smoke(dsa: Path, directory: Path) -> None:
             deadline = monotonic() + 10
             while process.poll() is None and monotonic() < deadline:
                 try:
-                    status, page = request(port, "GET", "/")
+                    status, page, headers = request(port, "GET", "/")
                     break
                 except OSError:
                     sleep(0.1)
@@ -80,14 +80,21 @@ def smoke(dsa: Path, directory: Path) -> None:
                 raise AssertionError("dsa chat did not start")
 
             assert status == 200 and b"<title>Private Data Chat" in page
+            assert headers["Cache-Control"] == "no-store"
+            assert "script-src 'self'" in headers["Content-Security-Policy"]
+            assert "img-src 'self' data:" in headers["Content-Security-Policy"]
             assets = re.findall(rb'(?:src|href)="(/assets/[^"]+)"', page)
             assert any(asset.endswith(b".js") for asset in assets)
             assert any(asset.endswith(b".css") for asset in assets)
-            for asset in [*assets, b"/dsa-mark.svg"]:
-                status, body = request(port, "GET", asset.decode())
+            for asset in assets:
+                status, body, headers = request(port, "GET", asset.decode())
                 assert status == 200 and body
-            status, body = request(port, "POST", "/api/conversations")
+                assert headers["Cache-Control"] == "public, max-age=31536000, immutable"
+            status, body, headers = request(port, "GET", "/dsa-mark.svg")
+            assert status == 200 and body and headers["Cache-Control"] == "no-store"
+            status, body, headers = request(port, "POST", "/api/conversations")
             assert status == 201 and json.loads(body)["status"] == "open"
+            assert headers["Cache-Control"] == "no-store"
         finally:
             if process.poll() is None:
                 os.killpg(process.pid, signal.SIGINT)

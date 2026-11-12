@@ -29,6 +29,7 @@ from dsa.cli import HelpRequested, Parser, emit
 
 Launcher = Callable[[Sequence[str], Mapping[str, str], str | None], int]
 DependencyCheck = Callable[[], bool]
+_BIND_HOSTS = ("localhost", "127.0.0.1", "::1", "0.0.0.0", "::")
 _SAFE_CONFIGURATION_FIELDS = frozenset(
     {
         "clarifier",
@@ -70,6 +71,17 @@ def main(
         return 0
     except Exception as error:
         _emit_preflight_failure("arguments", error)
+        return 2
+
+    if parsed.host not in _BIND_HOSTS:
+        emit(
+            {
+                "code": "chat_host_unsupported",
+                "status": "rejected",
+                "message": "Use --host with localhost, 127.0.0.1, ::1, 0.0.0.0, or ::. "
+                "Open the chat through a loopback address.",
+            }
+        )
         return 2
 
     check_dependency = dependency_available or _chat_dependencies_available
@@ -131,7 +143,7 @@ def main(
         str(parsed.port),
     ]
     if parsed.watch:
-        arguments.append("--reload")
+        arguments.extend(("--reload", "--reload-dir", str(Path(__file__).resolve().parent)))
     if parsed.debug:
         arguments.extend(("--log-level", "debug"))
     url = None if parsed.headless else _browser_url(parsed.host, parsed.port)
@@ -189,21 +201,34 @@ def _launch_fastapi(
 def _open_when_ready(process: subprocess.Popen[bytes], url: str) -> None:
     address = urlsplit(url)
     assert address.hostname is not None
-    deadline = monotonic() + 15
-    while process.poll() is None and monotonic() < deadline:
+    notice_at = monotonic() + 15
+    reported_delay = False
+    while process.poll() is None:
+        if not reported_delay and monotonic() >= notice_at:
+            print(
+                f"Chat is still starting. The browser will open when {url} is ready.",
+                file=sys.stderr,
+            )
+            reported_delay = True
         connection = HTTPConnection(address.hostname, address.port, timeout=0.5)
         try:
             connection.request("GET", "/")
             response = connection.getresponse()
             if response.status == 200 and b"<title>Private Data Chat" in response.read(4096):
-                if process.poll() is None:
-                    webbrowser.open(url)
-                return
-        except (OSError, HTTPException, webbrowser.Error):
+                break
+        except (OSError, HTTPException):
             pass
         finally:
             connection.close()
-        sleep(0.1)
+        sleep(0.25)
+    if process.poll() is not None:
+        return
+    try:
+        opened = webbrowser.open(url)
+    except (OSError, webbrowser.Error):
+        opened = False
+    if not opened:
+        print(f"Open {url} in your browser.", file=sys.stderr)
 
 
 def _emit_preflight_failure(stage: str, error: Exception) -> None:

@@ -31,6 +31,12 @@ _COOKIE = "dsa_chat_session"
 _CONVERSATIONS = "/api/conversations"
 _NOTEBOOK_FILENAME = "dsa-derivation.ipynb"
 _LOOPBACK_HOST = re.compile(r"(?:localhost|127\.0\.0\.1|\[::1\])(?::[0-9]{1,5})?", re.IGNORECASE)
+_FINGERPRINTED_ASSET = re.compile(r"/assets/[^/]+-[A-Za-z0-9_-]{8,}\.(?:js|css)")
+_UI_CSP = (
+    "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
+    "img-src 'self' data:; connect-src 'self'; font-src 'self'; "
+    "base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
+)
 _MAX_CONVERSATIONS_PER_BROWSER = 8
 _MAX_CONVERSATIONS = 64
 _MAX_RUNNING_ANALYSES = 2
@@ -159,7 +165,15 @@ def create_app(
             response = JSONResponse({"detail": "invalid_origin"}, status_code=403)
         else:
             response = await call_next(request)
-        response.headers["Cache-Control"] = "no-store"
+        path = request.scope["path"]
+        if response.status_code in {200, 206, 304} and _FINGERPRINTED_ASSET.fullmatch(path):
+            response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+        else:
+            response.headers["Cache-Control"] = "no-store"
+        if path in {"/", "/index.html"} and response.headers.get("Content-Type", "").startswith(
+            "text/html"
+        ):
+            response.headers["Content-Security-Policy"] = _UI_CSP
         response.headers["X-Content-Type-Options"] = "nosniff"
         return response
 

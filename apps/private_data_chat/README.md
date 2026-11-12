@@ -84,7 +84,11 @@ npm --prefix ui ci
 npm --prefix ui run build
 ```
 
-`uv build` compiles the frontend automatically and includes it in the wheel.
+The source and wheel builds include an existing frontend build when present. Set
+`DSA_BUILD_CHAT_UI=1 uv build` to compile the frontend as part of a release wheel build if the assets
+are missing. A source install with no built frontend supports `dsa run`, `dsa benchmark`, and
+`dsa chat --check` without Node. To launch the chat, build the frontend in the checkout or install
+a wheel that includes it.
 
 For a portable, non-secret starting point, copy and edit the Online Retail II TOML template:
 
@@ -128,8 +132,9 @@ uv run dsa chat --config private-data-chat.toml
 ```
 
 Use `--headless` to open the browser yourself. The default URL is `http://127.0.0.1:8001/`.
-Use `--host` and `--port` to set the listen address, `--watch` to reload after Python edits,
-and `--debug` for verbose server logs. The API accepts loopback browser addresses.
+Use `--host` and `--port` to set the listen address, `--watch` to reload after Python edits in the
+chat package, and `--debug` for verbose server logs. The launcher accepts `localhost`, `127.0.0.1`,
+`::1`, `0.0.0.0`, and `::` as bind addresses. Open the UI through a loopback address.
 
 The previous environment-only configuration remains supported. Source and edit
 `online-retail-ii.env.example`, then run `uv run dsa chat` without `--config`.
